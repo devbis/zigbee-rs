@@ -1,0 +1,16 @@
+[package]
+name = "zigbee-bdb"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Zigbee PRO R22 BDB layer — Base Device Behavior commissioning (v3.0.1)"
+repository = "https://github.com/zigbee-rs/zigbee-rs"
+
+[dependencies]
+heapless = "0.9"
+zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
+zigbee-mac  = { version = "0.1.0", path = "../zigbee-mac" }
+zigbee-nwk  = { version = "0.1.0", path = "../zigbee-nwk" }
+zigbee-aps  = { version = "0.1.0", path = "../zigbee-aps" }
+zigbee-zdo  = { version = "0.1.0", path = "../zigbee-zdo" }
+log = "0.4"
