@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "zigbee-types",
+    "zigbee-mac",
+    "zigbee-nwk",
+    "zigbee-aps",
+    "zigbee-zdo",
+    "zigbee-bdb",
+    "zigbee-zcl",
+    "zigbee-runtime",
+    "zigbee",
+    "examples/mock-sensor",
+    "examples/mock-coordinator",
+    "examples/mock-light",
+    "examples/mock-sleepy-sensor",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zigbee-rs/zigbee-rs"
+
+[workspace.dependencies]
+heapless = "0.9"
+log = "0.4"

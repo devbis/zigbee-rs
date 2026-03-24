@@ -1,0 +1,17 @@
+[package]
+name = "mock-sensor"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mock-sensor"
+path = "src/main.rs"
+
+[dependencies]
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-zcl = { path = "../../zigbee-zcl" }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee = { path = "../../zigbee" }
+pollster = "0.4"
