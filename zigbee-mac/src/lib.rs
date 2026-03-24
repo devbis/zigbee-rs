@@ -50,7 +50,7 @@ pub mod mock;
 pub use pib::{PibAttribute, PibValue};
 pub use primitives::*;
 
-use zigbee_types::{ChannelMask, IeeeAddress, MacAddress, PanId, ShortAddress, TxPower};
+use zigbee_types::TxPower;
 
 // ── Error types ─────────────────────────────────────────────────
 

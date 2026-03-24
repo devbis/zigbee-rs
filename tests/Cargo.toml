@@ -1,0 +1,19 @@
+[package]
+name = "zigbee-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+zigbee-types = { path = "../zigbee-types" }
+zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }
+zigbee-nwk = { path = "../zigbee-nwk" }
+zigbee-aps = { path = "../zigbee-aps" }
+zigbee-zdo = { path = "../zigbee-zdo" }
+zigbee-bdb = { path = "../zigbee-bdb" }
+zigbee-zcl = { path = "../zigbee-zcl" }
+zigbee-runtime = { path = "../zigbee-runtime" }
+zigbee = { path = "../zigbee" }
+heapless = "0.9"
+tokio = { version = "1", features = ["macros", "rt"] }
+pollster = "0.4"

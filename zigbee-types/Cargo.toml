@@ -1,0 +1,10 @@
+[package]
+name = "zigbee-types"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Core types for zigbee-rs: addresses, channels, PAN IDs"
+repository = "https://github.com/zigbee-rs/zigbee-rs"
+
+[dependencies]
+# no_std by default, zero dependencies

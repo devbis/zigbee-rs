@@ -1,0 +1,14 @@
+[package]
+name = "zigbee-aps"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Zigbee PRO R22 APS layer — binding, group, data service, key management"
+repository = "https://github.com/zigbee-rs/zigbee-rs"
+
+[dependencies]
+heapless = "0.9"
+zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
+zigbee-nwk = { version = "0.1.0", path = "../zigbee-nwk" }
+zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }
+log = "0.4"

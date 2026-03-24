@@ -1,0 +1,14 @@
+[package]
+name = "zigbee-zdo"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Zigbee PRO R22 ZDO/ZDP layer — device object and device profile"
+
+[dependencies]
+heapless = "0.9"
+zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
+zigbee-mac  = { version = "0.1.0", path = "../zigbee-mac" }
+zigbee-nwk  = { version = "0.1.0", path = "../zigbee-nwk" }
+zigbee-aps  = { version = "0.1.0", path = "../zigbee-aps" }
+log = "0.4"

@@ -6,9 +6,7 @@
 //! - Frame relay for routers/coordinators
 
 use crate::frames::{NwkFrameControl, NwkFrameType, NwkHeader};
-use crate::routing::RoutingTable;
 use crate::{DeviceType, NwkLayer, NwkStatus};
-use zigbee_mac::primitives::*;
 use zigbee_mac::{MacDriver, McpsDataRequest, AddressMode, TxOptions};
 use zigbee_types::*;
 
