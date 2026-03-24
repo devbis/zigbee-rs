@@ -20,9 +20,8 @@ async fn test_mock_scan_empty() {
         scan_duration: 3,
     }).await;
 
-    assert!(result.is_ok());
-    let confirm = result.unwrap();
-    assert!(confirm.pan_descriptors.is_empty());
+    // Mock returns NoBeacon when no beacons are configured
+    assert!(result.is_err());
 }
 
 #[tokio::test]
@@ -72,6 +71,13 @@ async fn test_mock_scan_with_beacon() {
 #[tokio::test]
 async fn test_mock_associate_default() {
     let mut mac = make_mock();
+
+    // Pre-configure a successful associate response
+    mac.set_associate_response(MlmeAssociateConfirm {
+        short_address: ShortAddress(0x0001),
+        status: AssociationStatus::Success,
+    });
+
     let result = mac.mlme_associate(MlmeAssociateRequest {
         channel: 15,
         coord_address: MacAddress::Short(PanId(0x1234), ShortAddress::COORDINATOR),

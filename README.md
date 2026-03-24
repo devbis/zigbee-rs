@@ -145,7 +145,7 @@ zigbee-rs-fork/
 
 ## Known Limitations
 
-- **AES-CCM\* encryption** is placeholder (pass-through) — stack logic works, crypto is stubbed
+- **AES-CCM\* encryption** is real (using RustCrypto `aes` + `ccm` crates, `no_std`)
 - **STM32WB55 / EFR32MG24 / CC2652** backends are skeletons (waiting for Rust ecosystem maturity)
 - **No USB serial MAC** — can't bridge host ↔ dongle for real RF from desktop (yet)
 - **Test coverage** is basic — the 4 mock examples exercise more than the test crate

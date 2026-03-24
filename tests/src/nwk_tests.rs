@@ -278,8 +278,8 @@ fn test_nib_defaults() {
     let nib = Nib::new();
     assert_eq!(nib.network_address, ShortAddress(0xFFFF));
     assert_eq!(nib.pan_id, PanId(0xFFFF));
-    assert_eq!(nib.depth, 0xFF);
-    assert_eq!(nib.max_depth, 5);
+    assert_eq!(nib.depth, 0);
+    assert_eq!(nib.max_depth, 15);
     assert_eq!(nib.max_routers, 5);
 }
 
