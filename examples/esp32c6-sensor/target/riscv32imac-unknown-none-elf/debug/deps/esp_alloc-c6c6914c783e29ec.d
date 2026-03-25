@@ -1,0 +1,10 @@
+/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/deps/esp_alloc-c6c6914c783e29ec.d: /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/lib.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/allocators.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/heap/mod.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/heap/llff.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/macros.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/malloc.rs
+
+/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/deps/libesp_alloc-c6c6914c783e29ec.rmeta: /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/lib.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/allocators.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/heap/mod.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/heap/llff.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/macros.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/malloc.rs
+
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/lib.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/allocators.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/heap/mod.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/heap/llff.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/macros.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-alloc-0.9.0/src/malloc.rs:

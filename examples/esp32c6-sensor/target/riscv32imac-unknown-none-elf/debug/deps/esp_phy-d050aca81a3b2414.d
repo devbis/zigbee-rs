@@ -1,0 +1,12 @@
+/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/deps/esp_phy-d050aca81a3b2414.d: /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/lib.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/fmt.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/common_adapter.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/phy_init_data/mod.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/phy_init_data/phy_init_data_esp32c6.rs /Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/build/esp-phy-c8f00c1ff96bbded/out/esp_phy_config_table.md
+
+/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/deps/libesp_phy-d050aca81a3b2414.rmeta: /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/lib.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/fmt.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/common_adapter.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/phy_init_data/mod.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/phy_init_data/phy_init_data_esp32c6.rs /Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/build/esp-phy-c8f00c1ff96bbded/out/esp_phy_config_table.md
+
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/lib.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/fmt.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/common_adapter.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/phy_init_data/mod.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-phy-0.1.1/src/phy_init_data/phy_init_data_esp32c6.rs:
+/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/build/esp-phy-c8f00c1ff96bbded/out/esp_phy_config_table.md:
+
+# env-dep:OUT_DIR=/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/build/esp-phy-c8f00c1ff96bbded/out

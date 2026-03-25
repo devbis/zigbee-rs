@@ -22,8 +22,6 @@ cortex-m-rt = "0.7"
 defmt = "0.3"
 defmt-rtt = "0.4"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
-# I2C sensor driver (BME280 — temperature, humidity, pressure)
-bme280 = { version = "0.5", default-features = false }
 embedded-hal = "1.0"
 
 [profile.release]

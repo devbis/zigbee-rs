@@ -30,6 +30,7 @@ use embassy_futures::select;
 use embassy_time::Timer;
 
 // Embassy nRF radio types (conditionally compiled)
+use embassy_nrf::radio::Instance;
 use embassy_nrf::radio::ieee802154::{Packet, Radio};
 
 /// nRF52840 802.15.4 MAC driver.
@@ -46,8 +47,8 @@ use embassy_nrf::radio::ieee802154::{Packet, Radio};
 /// let mac = NrfMac::new(radio);
 /// let nlme = Nlme::new(storage, mac);
 /// ```
-pub struct NrfMac<'a> {
-    radio: Radio<'a>,
+pub struct NrfMac<'a, T: Instance> {
+    radio: Radio<'a, T>,
     // PIB state
     short_address: ShortAddress,
     pan_id: PanId,
@@ -64,8 +65,8 @@ pub struct NrfMac<'a> {
     tx_power: i8,
 }
 
-impl<'a> NrfMac<'a> {
-    pub fn new(radio: Radio<'a>) -> Self {
+impl<'a, T: Instance> NrfMac<'a, T> {
+    pub fn new(radio: Radio<'a, T>) -> Self {
         Self {
             radio,
             short_address: ShortAddress(0xFFFF),
@@ -124,7 +125,7 @@ impl<'a> NrfMac<'a> {
         // Send beacon request
         let mut pkt = self.beacon_request_frame();
         self.radio
-            .transmit(&mut pkt)
+            .try_send(&mut pkt)
             .await
             .map_err(|_| MacError::RadioError)?;
 
@@ -215,7 +216,7 @@ impl<'a> NrfMac<'a> {
 
 // ── MacDriver implementation ────────────────────────────────────
 
-impl MacDriver for NrfMac<'_> {
+impl<T: Instance> MacDriver for NrfMac<'_, T> {
     async fn mlme_scan(&mut self, req: MlmeScanRequest) -> Result<MlmeScanConfirm, MacError> {
         let mut pan_descriptors = heapless::Vec::new();
         let mut energy_list = heapless::Vec::new();
@@ -279,7 +280,7 @@ impl MacDriver for NrfMac<'_> {
 
         // Transmit
         self.radio
-            .transmit(&mut pkt)
+            .try_send(&mut pkt)
             .await
             .map_err(|_| MacError::RadioError)?;
 
@@ -409,6 +410,7 @@ impl MacDriver for NrfMac<'_> {
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
+        let msdu_handle = req.msdu_handle;
         let mut frame_buf = [0u8; 127];
         let len = build_data_frame(
             &mut frame_buf,
@@ -423,12 +425,12 @@ impl MacDriver for NrfMac<'_> {
         pkt.copy_from_slice(&frame_buf[..len]);
 
         self.radio
-            .transmit(&mut pkt)
+            .try_send(&mut pkt)
             .await
             .map_err(|_| MacError::RadioError)?;
 
         Ok(McpsDataConfirm {
-            msdu_handle: req.msdu_handle,
+            msdu_handle,
             timestamp: None,
         })
     }
@@ -489,7 +491,7 @@ impl MacDriver for NrfMac<'_> {
     }
 }
 
-impl NrfMac<'_> {
+impl<T: Instance> NrfMac<'_, T> {
     async fn wait_assoc_response(
         &mut self,
         pkt: &mut Packet,
@@ -680,7 +682,7 @@ fn build_data_frame(
     buf: &mut [u8; 127],
     seq: u8,
     short_addr: ShortAddress,
-    pan_id: PanId,
+    _pan_id: PanId,
     extended_addr: &IeeeAddress,
     req: McpsDataRequest<'_>,
 ) -> Result<usize, MacError> {

@@ -13,16 +13,10 @@ zigbee-runtime = { path = "../../zigbee-runtime" }
 
 # ESP32-C6 HAL and runtime — versions aligned with zigbee-mac
 esp-hal = { version = "1.0.0", features = ["esp32c6", "unstable"] }
-esp-hal-embassy = { version = "0.7", features = ["esp32c6"] }
 esp-radio = { version = "0.17.0", features = ["esp32c6", "ieee802154", "unstable"] }
 esp-backtrace = { version = "0.14", features = ["esp32c6", "panic-handler", "println"] }
 esp-println = { version = "0.12", features = ["esp32c6"] }
-embassy-executor = { version = "0.7", features = ["task-arena-size-65536"] }
-embassy-time = "0.5"
 static_cell = "2"
-
-# I2C sensor driver (SHT31 — temperature + humidity)
-sht3x = "0.3"
 embedded-hal = "1.0"
 
 [profile.release]

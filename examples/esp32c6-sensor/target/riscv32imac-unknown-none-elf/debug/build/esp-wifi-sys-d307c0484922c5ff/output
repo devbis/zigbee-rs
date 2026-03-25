@@ -1,0 +1,15 @@
+cargo:rustc-link-lib=ble_app
+cargo:rustc-link-lib=btbb
+cargo:rustc-link-lib=coexist
+cargo:rustc-link-lib=core
+cargo:rustc-link-lib=espnow
+cargo:rustc-link-lib=mesh
+cargo:rustc-link-lib=net80211
+cargo:rustc-link-lib=phy
+cargo:rustc-link-lib=pp
+cargo:rustc-link-lib=smartconfig
+cargo:rustc-link-lib=wapi
+cargo:rustc-link-lib=wpa_supplicant
+cargo:rustc-link-lib=printf
+cargo:rustc-link-lib=regulatory
+cargo:rustc-link-search=/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/build/esp-wifi-sys-d307c0484922c5ff/out

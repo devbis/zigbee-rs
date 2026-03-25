@@ -1,0 +1,3 @@
+cargo:rustc-link-search=/Users/afaronov/zigbee-rs/examples/nrf52840-sensor/target/thumbv7em-none-eabihf/debug/build/defmt-96e87a9ae6082223/out
+cargo:rustc-check-cfg=cfg(c_variadic)
+cargo:rustc-check-cfg=cfg(no_cas)

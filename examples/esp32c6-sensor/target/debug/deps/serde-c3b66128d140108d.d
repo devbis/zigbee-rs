@@ -1,0 +1,14 @@
+/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/debug/deps/serde-c3b66128d140108d.d: /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/debug/build/serde-4197de377f2bc79c/out/private.rs
+
+/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/debug/deps/libserde-c3b66128d140108d.rlib: /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/debug/build/serde-4197de377f2bc79c/out/private.rs
+
+/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/debug/deps/libserde-c3b66128d140108d.rmeta: /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/debug/build/serde-4197de377f2bc79c/out/private.rs
+
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/debug/build/serde-4197de377f2bc79c/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/debug/build/serde-4197de377f2bc79c/out

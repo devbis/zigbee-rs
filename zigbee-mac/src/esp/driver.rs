@@ -5,7 +5,7 @@
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use esp_radio::ieee802154::{Config, Ieee802154, Ieee802154Error, ReceivedFrame};
+use esp_radio::ieee802154::{Config, Error, Ieee802154};
 
 static TX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static RX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -39,7 +39,7 @@ impl<'a> Ieee802154Driver<'a> {
     }
 
     /// Transmit a raw 802.15.4 frame. Blocks until TX complete interrupt.
-    pub async fn transmit(&mut self, frame: &[u8]) -> Result<(), Ieee802154Error> {
+    pub async fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
         TX_SIGNAL.reset();
         self.driver.transmit_raw(frame)?;
         TX_SIGNAL.wait().await;
@@ -47,7 +47,7 @@ impl<'a> Ieee802154Driver<'a> {
     }
 
     /// Receive the next 802.15.4 frame. Blocks until RX interrupt fires.
-    pub async fn receive(&mut self) -> Result<RxFrame, Ieee802154Error> {
+    pub async fn receive(&mut self) -> Result<RxFrame, Error> {
         RX_SIGNAL.reset();
         self.driver.start_receive();
 
@@ -58,28 +58,28 @@ impl<'a> Ieee802154Driver<'a> {
             RX_SIGNAL.wait().await;
         };
 
-        // Copy frame data to our owned buffer
+        // Serialize frame back to raw bytes for our owned buffer
         let mut rx = RxFrame {
             data: [0u8; 127],
             len: 0,
-            lqi: 0,
+            lqi: received.lqi,
         };
 
-        let frame_data = received.frame_data();
+        // Use the frame payload as raw data
+        let frame_data = &received.frame.payload;
         let len = frame_data.len().min(127);
         rx.data[..len].copy_from_slice(&frame_data[..len]);
         rx.len = len;
-        rx.lqi = received.rssi().wrapping_add(128) as u8; // Convert RSSI to LQI
 
         Ok(rx)
     }
 }
 
-// Interrupt callbacks — these are called from the radio ISR
-fn rx_callback() {
+// Interrupt callbacks — called from the radio ISR
+fn _rx_callback() {
     RX_SIGNAL.signal(());
 }
 
-fn tx_callback() {
+fn _tx_callback() {
     TX_SIGNAL.signal(());
 }
