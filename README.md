@@ -5,7 +5,7 @@ A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
 Embassy and other embedded async runtimes.
 
 ```text
-22,400+ lines of Rust · 108 source files · 9 crates · 33 ZCL clusters
+30,900+ lines of Rust · 127 source files · 9 crates · 33 ZCL clusters
 ```
 
 ## Architecture
@@ -65,17 +65,29 @@ cargo test    # (tests in progress)
 ### ESP32-C6 / ESP32-H2 firmware
 
 ```bash
-cd examples/esp32c6-sensor
-cargo build --release
+cd examples/esp32c6-sensor   # or esp32h2-sensor
+cargo build --release -Z build-std=core,alloc
 espflash flash target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
 ```
 
-### nRF52840 firmware
+Or flash via the [web flasher](https://faronov.github.io/zigbee-rs/) (no tools needed, just a browser with Web Serial).
+
+### nRF52840 firmware (with debug probe)
 
 ```bash
 cd examples/nrf52840-sensor
 cargo build --release
 probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-sensor
+```
+
+### nRF52840 firmware (nice!nano / ProMicro — UF2 drag-and-drop)
+
+```bash
+cd examples/nrf52840-sensor-uf2
+cargo build --release
+# Convert to UF2 (CI does this automatically):
+# uf2conv.py -c -f 0xADA52840 -b 0x26000 firmware.bin -o firmware.uf2
+# Double-tap RESET → copy .uf2 to the "NICENANO" USB drive
 ```
 
 ## MAC Backends
@@ -85,6 +97,7 @@ probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-
 | **MockMac** | ✅ Complete | Host (macOS/Linux/Windows) |
 | **ESP32-C6/H2/C5** | ✅ Complete | `riscv32imac-unknown-none-elf` |
 | **nRF52840** | ✅ Complete | `thumbv7em-none-eabihf` |
+| **nRF52833** | ✅ Complete | `thumbv7em-none-eabihf` |
 | **BL702** | ✅ FFI to lmac154 | `riscv32imac-unknown-none-elf` |
 | STM32WB55 | 🔲 Skeleton | `thumbv7em-none-eabihf` |
 | EFR32MG24 | 🔲 Skeleton | `thumbv7em-none-eabihf` |
@@ -139,19 +152,24 @@ zigbee-rs-fork/
 │   ├── mock-coordinator/  # Host: coordinator
 │   ├── mock-light/        # Host: dimmable light
 │   ├── mock-sleepy-sensor/# Host: SED demo
-│   ├── esp32c6-sensor/    # ESP32-C6 + SHT31
-│   ├── nrf52840-sensor/   # nRF52840 + BME280
-│   └── bl702-sensor/      # BL702 temp sensor (skeleton)
+│   ├── esp32c6-sensor/    # ESP32-C6 + button join/leave
+│   ├── esp32h2-sensor/    # ESP32-H2 + button join/leave
+│   ├── nrf52840-sensor/   # nRF52840-DK (probe-rs)
+│   ├── nrf52840-sensor-uf2/ # nice!nano / ProMicro (UF2 drag-drop)
+│   ├── nrf52833-sensor/   # nRF52833-DK (probe-rs)
+│   └── bl702-sensor/      # BL702 temp sensor (needs lmac154.a)
+├── docs/flasher/          # ESP web flasher (GitHub Pages)
 └── BUILD.md               # Comprehensive build guide
 ```
 
 ## Known Limitations
 
-- **AES-CCM\* encryption** is real (using RustCrypto `aes` + `ccm` crates, `no_std`)
-- **BL702** backend uses FFI to Bouffalo's `lmac154` C library — requires `liblmac154.a` from BL IoT SDK at link time
+- **BL702** backend compiles but requires `liblmac154.a` from Bouffalo's BL IoT SDK at link time — not included in this repo
 - **STM32WB55 / EFR32MG24 / CC2652** backends are skeletons (waiting for Rust ecosystem maturity)
 - **No USB serial MAC** — can't bridge host ↔ dongle for real RF from desktop (yet)
-- **Test coverage** is basic — the 4 mock examples exercise more than the test crate
+- **Test coverage** is basic — the mock examples exercise more than the test crate
+- **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
+- **OTA** — cluster defined but no actual firmware upgrade flow implemented
 
 ## Documentation
 

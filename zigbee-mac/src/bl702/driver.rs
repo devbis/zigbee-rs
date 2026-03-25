@@ -165,7 +165,7 @@ pub enum Lmac154FrameType {
     Command = 0x08,
 }
 
-extern "C" {
+unsafe extern "C" {
     // ── Initialization ──
     fn lmac154_init();
     fn lmac154_getInterruptHandler() -> Option<unsafe extern "C" fn()>;
@@ -535,7 +535,7 @@ impl Bl702Driver {
 // them and bridge into Embassy async signals.
 
 /// Called from lmac154 ISR when frame transmission completes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn lmac154_txDoneEvent(tx_status: Lmac154TxStatus) {
     TX_SIGNAL.signal(tx_status);
 }
@@ -544,7 +544,7 @@ extern "C" fn lmac154_txDoneEvent(tx_status: Lmac154TxStatus) {
 ///
 /// Copies the frame data from the radio buffer into our static RX_BUF
 /// and signals the async receiver.
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn lmac154_rxDoneEvent(rx_buf: *const u8, rx_len: u8, crc_fail: u8) {
     // Guard against null pointer from C library (e.g., on error conditions)
     if rx_buf.is_null() {
@@ -578,7 +578,7 @@ extern "C" fn lmac154_rxDoneEvent(rx_buf: *const u8, rx_len: u8, crc_fail: u8) {
 /// For frames with AR (Ack Request) bit set, this fires instead of /
 /// after txDoneEvent. We currently handle TX completion in txDoneEvent
 /// and log ACK status here.
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn lmac154_ackEvent(ack_received: u8, frame_pending: u8, seq_num: u8) {
     log::trace!(
         "bl702: ack_event received={} pending={} seq=0x{:02X}",

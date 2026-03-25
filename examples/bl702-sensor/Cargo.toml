@@ -11,9 +11,10 @@ zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 
-# BL702 HAL and PAC
-bl702-pac = "0.1"
-bl702-hal = "0.0.3"
+# BL702 PAC (register-level access for clock/GPIO init)
+# NOTE: bl702-hal is abandoned (pinned to embedded-hal alpha).
+# We use bl702-pac directly for peripheral setup and lmac154 FFI for radio.
+bl702-pac = "0.0.3"
 
 # Embassy async runtime
 embassy-executor = { version = "0.7", features = ["task-arena-size-65536"] }

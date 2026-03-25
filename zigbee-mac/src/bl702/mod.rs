@@ -35,7 +35,7 @@
 
 pub mod driver;
 
-use crate::pib::{self, PibAttribute, PibPayload, PibValue};
+use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError};
 use driver::{Bl702Driver, RadioConfig, RadioError};
@@ -209,7 +209,7 @@ impl Bl702Mac {
         self.driver.update_config(|cfg| cfg.channel = channel);
 
         match self.driver.energy_detect() {
-            Ok((rssi, _busy)) => rssi.wrapping_add(128) as u8, // Convert to unsigned energy level
+            Ok((rssi, _busy)) => (rssi as u8).wrapping_add(128), // Convert to unsigned energy level
             Err(_) => 0,
         }
     }
@@ -315,13 +315,15 @@ impl MacDriver for Bl702Mac {
 
         match req.scan_type {
             ScanType::Active | ScanType::Passive => {
-                let mut descriptors: heapless::Vec<PanDescriptor, 16> = heapless::Vec::new();
+                let mut pan_descriptors: PanDescriptorList = heapless::Vec::new();
 
                 for ch in 11u8..=26 {
-                    if req.channel_mask.contains(ch) {
-                        let beacons = self.scan_channel_active(ch, scan_duration_ms).await;
-                        for desc in beacons {
-                            let _ = descriptors.push(desc);
+                    if let Some(channel) = zigbee_types::Channel::from_number(ch) {
+                        if req.channel_mask.contains(channel) {
+                            let beacons = self.scan_channel_active(ch, scan_duration_ms).await;
+                            for desc in beacons {
+                                let _ = pan_descriptors.push(desc);
+                            }
                         }
                     }
                 }
@@ -329,25 +331,35 @@ impl MacDriver for Bl702Mac {
                 // Restore original channel
                 self.sync_radio_config();
 
-                if descriptors.is_empty() {
+                if pan_descriptors.is_empty() {
                     Err(MacError::NoBeacon)
                 } else {
-                    Ok(MlmeScanConfirm::ActivePassive { descriptors })
+                    Ok(MlmeScanConfirm {
+                        scan_type: req.scan_type,
+                        pan_descriptors,
+                        energy_list: heapless::Vec::new(),
+                    })
                 }
             }
             ScanType::Ed => {
-                let mut energy_levels: heapless::Vec<u8, 16> = heapless::Vec::new();
+                let mut energy_list: EdList = heapless::Vec::new();
 
                 for ch in 11u8..=26 {
-                    if req.channel_mask.contains(ch) {
-                        let energy = self.scan_channel_ed(ch).await;
-                        let _ = energy_levels.push(energy);
+                    if let Some(channel) = zigbee_types::Channel::from_number(ch) {
+                        if req.channel_mask.contains(channel) {
+                            let energy = self.scan_channel_ed(ch).await;
+                            let _ = energy_list.push(EdValue { channel: ch, energy });
+                        }
                     }
                 }
 
                 self.sync_radio_config();
 
-                Ok(MlmeScanConfirm::Ed { energy_levels })
+                Ok(MlmeScanConfirm {
+                    scan_type: req.scan_type,
+                    pan_descriptors: heapless::Vec::new(),
+                    energy_list,
+                })
             }
             ScanType::Orphan => Err(MacError::Unsupported),
         }
@@ -382,6 +394,7 @@ impl MacDriver for Bl702Mac {
                             // Placeholder: would extract actual address from frame
                             return Ok(MlmeAssociateConfirm {
                                 short_address: ShortAddress(0xFFFE),
+                                status: AssociationStatus::Success,
                             });
                         }
                     }
@@ -451,7 +464,7 @@ impl MacDriver for Bl702Mac {
 
     async fn mlme_start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
         self.pan_id = req.pan_id;
-        self.channel = req.logical_channel;
+        self.channel = req.channel;
 
         self.sync_radio_config();
         log::info!(
@@ -464,70 +477,68 @@ impl MacDriver for Bl702Mac {
 
     async fn mlme_get(&self, attr: PibAttribute) -> Result<PibValue, MacError> {
         use PibAttribute::*;
-        use PibValue::*;
 
         match attr {
-            MacShortAddress => Ok(Short(self.short_address.0)),
-            MacPanId => Ok(Short(self.pan_id.0)),
-            MacExtendedAddress => Ok(ExtAddress(self.extended_address)),
-            MacRxOnWhenIdle => Ok(Bool(self.rx_on_when_idle)),
-            MacAssociationPermit => Ok(Bool(self.association_permit)),
-            MacAutoRequest => Ok(Bool(self.auto_request)),
-            MacDsn => Ok(Byte(self.dsn)),
-            MacBsn => Ok(Byte(self.bsn)),
-            MacMaxCsmaBackoffs => Ok(Byte(self.max_csma_backoffs)),
-            MacMinBe => Ok(Byte(self.min_be)),
-            MacMaxBe => Ok(Byte(self.max_be)),
-            MacMaxFrameRetries => Ok(Byte(self.max_frame_retries)),
-            MacPromiscuousMode => Ok(Bool(self.promiscuous)),
-            PhyCurrentChannel => Ok(Byte(self.channel)),
-            PhyTransmitPower => Ok(Byte(self.tx_power as u8)),
-            PhyChannelsSupported => Ok(Word(pib::CHANNELS_2_4GHZ)),
-            PhyCurrentPage => Ok(Byte(0)), // Page 0 = 2.4 GHz
-            MacBeaconPayload => Ok(Payload(self.beacon_payload.clone())),
+            MacShortAddress => Ok(PibValue::ShortAddress(self.short_address)),
+            MacPanId => Ok(PibValue::PanId(self.pan_id)),
+            MacExtendedAddress => Ok(PibValue::ExtendedAddress(self.extended_address)),
+            MacRxOnWhenIdle => Ok(PibValue::Bool(self.rx_on_when_idle)),
+            MacAssociationPermit => Ok(PibValue::Bool(self.association_permit)),
+            MacAutoRequest => Ok(PibValue::Bool(self.auto_request)),
+            MacDsn => Ok(PibValue::U8(self.dsn)),
+            MacBsn => Ok(PibValue::U8(self.bsn)),
+            MacMaxCsmaBackoffs => Ok(PibValue::U8(self.max_csma_backoffs)),
+            MacMinBe => Ok(PibValue::U8(self.min_be)),
+            MacMaxBe => Ok(PibValue::U8(self.max_be)),
+            MacMaxFrameRetries => Ok(PibValue::U8(self.max_frame_retries)),
+            MacPromiscuousMode => Ok(PibValue::Bool(self.promiscuous)),
+            PhyCurrentChannel => Ok(PibValue::U8(self.channel)),
+            PhyTransmitPower => Ok(PibValue::U8(self.tx_power as u8)),
+            PhyChannelsSupported => Ok(PibValue::U32(zigbee_types::ChannelMask::ALL_2_4GHZ.0)),
+            PhyCurrentPage => Ok(PibValue::U8(0)), // Page 0 = 2.4 GHz
+            MacBeaconPayload => Ok(PibValue::Payload(self.beacon_payload.clone())),
             _ => Err(MacError::Unsupported),
         }
     }
 
     async fn mlme_set(&mut self, attr: PibAttribute, value: PibValue) -> Result<(), MacError> {
         use PibAttribute::*;
-        use PibValue::*;
 
         match (attr, value) {
-            (MacShortAddress, Short(v)) => {
-                self.short_address = ShortAddress(v);
+            (MacShortAddress, PibValue::ShortAddress(v)) => {
+                self.short_address = v;
                 self.sync_radio_config();
             }
-            (MacPanId, Short(v)) => {
-                self.pan_id = PanId(v);
+            (MacPanId, PibValue::PanId(v)) => {
+                self.pan_id = v;
                 self.sync_radio_config();
             }
-            (MacExtendedAddress, ExtAddress(v)) => {
+            (MacExtendedAddress, PibValue::ExtendedAddress(v)) => {
                 self.extended_address = v;
                 self.sync_radio_config();
             }
-            (MacRxOnWhenIdle, Bool(v)) => self.rx_on_when_idle = v,
-            (MacAssociationPermit, Bool(v)) => self.association_permit = v,
-            (MacAutoRequest, Bool(v)) => self.auto_request = v,
-            (MacDsn, Byte(v)) => self.dsn = v,
-            (MacBsn, Byte(v)) => self.bsn = v,
-            (MacMaxCsmaBackoffs, Byte(v)) => self.max_csma_backoffs = v,
-            (MacMinBe, Byte(v)) => self.min_be = v,
-            (MacMaxBe, Byte(v)) => self.max_be = v,
-            (MacMaxFrameRetries, Byte(v)) => self.max_frame_retries = v,
-            (MacPromiscuousMode, Bool(v)) => {
+            (MacRxOnWhenIdle, PibValue::Bool(v)) => self.rx_on_when_idle = v,
+            (MacAssociationPermit, PibValue::Bool(v)) => self.association_permit = v,
+            (MacAutoRequest, PibValue::Bool(v)) => self.auto_request = v,
+            (MacDsn, PibValue::U8(v)) => self.dsn = v,
+            (MacBsn, PibValue::U8(v)) => self.bsn = v,
+            (MacMaxCsmaBackoffs, PibValue::U8(v)) => self.max_csma_backoffs = v,
+            (MacMinBe, PibValue::U8(v)) => self.min_be = v,
+            (MacMaxBe, PibValue::U8(v)) => self.max_be = v,
+            (MacMaxFrameRetries, PibValue::U8(v)) => self.max_frame_retries = v,
+            (MacPromiscuousMode, PibValue::Bool(v)) => {
                 self.promiscuous = v;
                 self.sync_radio_config();
             }
-            (PhyCurrentChannel, Byte(v)) => {
+            (PhyCurrentChannel, PibValue::U8(v)) => {
                 self.channel = v;
                 self.sync_radio_config();
             }
-            (PhyTransmitPower, Byte(v)) => {
+            (PhyTransmitPower, PibValue::U8(v)) => {
                 self.tx_power = v as i8;
                 self.sync_radio_config();
             }
-            (MacBeaconPayload, Payload(v)) => self.beacon_payload = v,
+            (MacBeaconPayload, PibValue::Payload(v)) => self.beacon_payload = v,
             _ => return Err(MacError::Unsupported),
         }
 
@@ -547,7 +558,7 @@ impl MacDriver for Bl702Mac {
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
-        let ack_request = req.tx_options.ack_request();
+        let ack_request = req.tx_options.ack_tx;
 
         let frame = self.build_data_frame(&req.dst_address, req.payload, ack_request);
 
@@ -603,8 +614,7 @@ impl MacDriver for Bl702Mac {
                 continue;
             }
 
-            let mut payload = MacPayload::new();
-            let _ = payload.extend_from_slice(&data[header_len..]);
+            let payload = MacFrame::from_slice(&data[header_len..]).unwrap_or_else(MacFrame::new);
 
             return Ok(McpsDataIndication {
                 src_address: MacAddress::Short(self.pan_id, ShortAddress(0x0000)),
