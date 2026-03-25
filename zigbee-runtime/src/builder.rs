@@ -1,9 +1,14 @@
 //! Device builder — fluent API for configuring a Zigbee device.
 
-use crate::{DeviceConfig, EndpointConfig, MAX_CLUSTERS_PER_ENDPOINT, MAX_ENDPOINTS, ZigbeeDevice};
+use crate::power::{PowerManager, PowerMode};
+use crate::{EndpointConfig, MAX_CLUSTERS_PER_ENDPOINT, MAX_ENDPOINTS, ZigbeeDevice};
+use zigbee_aps::ApsLayer;
+use zigbee_bdb::BdbLayer;
 use zigbee_mac::MacDriver;
-use zigbee_nwk::DeviceType;
+use zigbee_nwk::{DeviceType, NwkLayer};
 use zigbee_types::*;
+use zigbee_zcl::foundation::reporting::ReportingEngine;
+use zigbee_zdo::ZdoLayer;
 
 /// Fluent builder for creating a ZigbeeDevice.
 pub struct DeviceBuilder<M: MacDriver> {
@@ -14,6 +19,7 @@ pub struct DeviceBuilder<M: MacDriver> {
     model_identifier: &'static str,
     sw_build_id: &'static str,
     channel_mask: ChannelMask,
+    power_mode: PowerMode,
 }
 
 impl<M: MacDriver> DeviceBuilder<M> {
@@ -26,6 +32,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             model_identifier: "Generic",
             sw_build_id: "0.1.0",
             channel_mask: ChannelMask::ALL_2_4GHZ,
+            power_mode: PowerMode::AlwaysOn,
         }
     }
 
@@ -59,6 +66,12 @@ impl<M: MacDriver> DeviceBuilder<M> {
         self
     }
 
+    /// Set the power mode (AlwaysOn, Sleepy, DeepSleep).
+    pub fn power_mode(mut self, mode: PowerMode) -> Self {
+        self.power_mode = mode;
+        self
+    }
+
     /// Add an endpoint with the given profile, device ID, and cluster configuration.
     pub fn endpoint(
         mut self,
@@ -87,18 +100,25 @@ impl<M: MacDriver> DeviceBuilder<M> {
         self
     }
 
-    /// Build the ZigbeeDevice.
+    /// Build the ZigbeeDevice with the full BDB→ZDO→APS→NWK→MAC stack.
     pub fn build(self) -> ZigbeeDevice<M> {
+        // Construct the layer stack: MAC → NWK → APS → ZDO → BDB
+        let nwk = NwkLayer::new(self.mac, self.device_type);
+        let aps = ApsLayer::new(nwk);
+        let zdo = ZdoLayer::new(aps);
+        let bdb = BdbLayer::new(zdo);
+
         ZigbeeDevice {
-            config: DeviceConfig {
-                mac: self.mac,
-                device_type: self.device_type,
-                endpoints: self.endpoints,
-                manufacturer_name: self.manufacturer_name,
-                model_identifier: self.model_identifier,
-                sw_build_id: self.sw_build_id,
-                channel_mask: self.channel_mask,
-            },
+            bdb,
+            endpoints: self.endpoints,
+            reporting: ReportingEngine::new(),
+            power: PowerManager::new(self.power_mode),
+            pending_action: None,
+            zcl_seq: 0,
+            manufacturer_name: self.manufacturer_name,
+            model_identifier: self.model_identifier,
+            sw_build_id: self.sw_build_id,
+            channel_mask: self.channel_mask,
         }
     }
 }

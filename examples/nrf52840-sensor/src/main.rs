@@ -91,7 +91,7 @@ async fn main(_spawner: Spawner) {
     let mut tick: u32 = 0;
 
     loop {
-        match event_loop::stack_tick(&mut device).await {
+        match event_loop::stack_tick(&mut device, MEASURE_INTERVAL_SECS as u16).await {
             TickResult::Event(StackEvent::Joined { short_address, channel, pan_id }) => {
                 info!(
                     "Joined! addr=0x{:04X} ch={} pan=0x{:04X}",

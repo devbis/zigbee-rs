@@ -22,9 +22,9 @@ fn test_device_builder_basic() {
         .model("TestSensor")
         .build();
 
-    assert_eq!(device.config.device_type, DeviceType::EndDevice);
-    assert_eq!(device.config.manufacturer_name, "TestCo");
-    assert_eq!(device.config.model_identifier, "TestSensor");
+    assert_eq!(device.device_type(), DeviceType::EndDevice);
+    assert_eq!(device.manufacturer_name(), "TestCo");
+    assert_eq!(device.model_identifier(), "TestSensor");
 }
 
 #[test]
@@ -39,10 +39,10 @@ fn test_device_builder_with_endpoints() {
         })
         .build();
 
-    assert_eq!(device.config.endpoints.len(), 2);
-    assert_eq!(device.config.endpoints[0].endpoint, 1);
-    assert_eq!(device.config.endpoints[0].server_clusters.len(), 2);
-    assert_eq!(device.config.endpoints[1].endpoint, 2);
+    assert_eq!(device.endpoints().len(), 2);
+    assert_eq!(device.endpoints()[0].endpoint, 1);
+    assert_eq!(device.endpoints()[0].server_clusters.len(), 2);
+    assert_eq!(device.endpoints()[1].endpoint, 2);
 }
 
 #[test]
@@ -50,7 +50,7 @@ fn test_device_builder_channel_mask() {
     let mask = ChannelMask(1 << 15 | 1 << 20 | 1 << 25);
     let device = ZigbeeDevice::builder(make_mock()).channels(mask).build();
 
-    assert_eq!(device.config.channel_mask, mask);
+    assert_eq!(device.channel_mask(), mask);
 }
 
 // ── Template Tests ───────────────────────────────────
@@ -58,33 +58,33 @@ fn test_device_builder_channel_mask() {
 #[test]
 fn test_temperature_sensor_template() {
     let device = templates::temperature_sensor(make_mock()).build();
-    assert_eq!(device.config.device_type, DeviceType::EndDevice);
-    assert_eq!(device.config.endpoints.len(), 1);
-    assert_eq!(device.config.endpoints[0].endpoint, 1);
-    assert_eq!(device.config.endpoints[0].profile_id, 0x0104);
-    assert_eq!(device.config.endpoints[0].device_id, 0x0302);
-    assert!(device.config.endpoints[0].server_clusters.contains(&0x0402));
+    assert_eq!(device.device_type(), DeviceType::EndDevice);
+    assert_eq!(device.endpoints().len(), 1);
+    assert_eq!(device.endpoints()[0].endpoint, 1);
+    assert_eq!(device.endpoints()[0].profile_id, 0x0104);
+    assert_eq!(device.endpoints()[0].device_id, 0x0302);
+    assert!(device.endpoints()[0].server_clusters.contains(&0x0402));
 }
 
 #[test]
 fn test_on_off_light_template() {
     let device = templates::on_off_light(make_mock()).build();
-    assert_eq!(device.config.device_type, DeviceType::Router);
-    assert!(device.config.endpoints[0].server_clusters.contains(&0x0006));
+    assert_eq!(device.device_type(), DeviceType::Router);
+    assert!(device.endpoints()[0].server_clusters.contains(&0x0006));
 }
 
 #[test]
 fn test_color_temperature_light_template() {
     let device = templates::color_temperature_light(make_mock()).build();
-    assert!(device.config.endpoints[0].server_clusters.contains(&0x0300));
-    assert!(device.config.endpoints[0].server_clusters.contains(&0x0008));
-    assert!(device.config.endpoints[0].server_clusters.contains(&0x0006));
+    assert!(device.endpoints()[0].server_clusters.contains(&0x0300));
+    assert!(device.endpoints()[0].server_clusters.contains(&0x0008));
+    assert!(device.endpoints()[0].server_clusters.contains(&0x0006));
 }
 
 #[test]
 fn test_smart_plug_template() {
     let device = templates::smart_plug(make_mock()).build();
-    assert!(device.config.endpoints[0].server_clusters.contains(&0x0B04));
+    assert!(device.endpoints()[0].server_clusters.contains(&0x0B04));
 }
 
 // ── NV Storage Tests ─────────────────────────────────
