@@ -118,6 +118,31 @@ impl PowerConfigCluster {
             ZclValue::U8(half_percent),
         );
     }
+
+    /// Set battery size (ZCL Enum8: 0=NoBattery, 1=Built-in, 2=Other, 3=AA, 4=AAA, …, 0xFF=Unknown).
+    pub fn set_battery_size(&mut self, size: u8) {
+        let _ = self.store.set_raw(ATTR_BATTERY_SIZE, ZclValue::Enum8(size));
+    }
+
+    /// Set number of battery cells.
+    pub fn set_battery_quantity(&mut self, qty: u8) {
+        let _ = self.store.set_raw(ATTR_BATTERY_QUANTITY, ZclValue::U8(qty));
+    }
+
+    /// Set battery rated voltage (in 100 mV units, e.g. 12 = 1.2 V for NiMH).
+    pub fn set_battery_rated_voltage(&mut self, voltage_100mv: u8) {
+        let _ = self
+            .store
+            .set_raw(ATTR_BATTERY_RATED_VOLTAGE, ZclValue::U8(voltage_100mv));
+    }
+
+    /// Set minimum battery voltage threshold (100 mV units) for alarm.
+    pub fn set_battery_voltage_min_threshold(&mut self, voltage_100mv: u8) {
+        let _ = self.store.set_raw(
+            ATTR_BATTERY_VOLTAGE_MIN_THRESHOLD,
+            ZclValue::U8(voltage_100mv),
+        );
+    }
 }
 
 impl Cluster for PowerConfigCluster {
