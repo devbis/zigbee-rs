@@ -78,6 +78,12 @@ jobs:
       - name: Build nRF52840 sensor (release)
         working-directory: examples/nrf52840-sensor
         run: cargo build --release
+      - name: Upload nRF52840 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: nrf52840-sensor-firmware
+          path: |
+            examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor
 
   build-esp32c6:
     name: Build ESP32-C6 sensor
@@ -94,3 +100,9 @@ jobs:
       - name: Build ESP32-C6 sensor (release)
         working-directory: examples/esp32c6-sensor
         run: cargo build --release -Z build-std=core,alloc
+      - name: Upload ESP32-C6 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32c6-sensor-firmware
+          path: |
+            examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
