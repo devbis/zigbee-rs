@@ -203,6 +203,21 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         self.channel_mask
     }
 
+    /// The software build identifier.
+    pub fn sw_build_id(&self) -> &str {
+        self.sw_build_id
+    }
+
+    /// Access the power manager (for sleep decisions).
+    pub fn power(&self) -> &PowerManager {
+        &self.power
+    }
+
+    /// Access the power manager mutably.
+    pub fn power_mut(&mut self) -> &mut PowerManager {
+        &mut self.power
+    }
+
     // ── MAC proxy ───────────────────────────────────────────
 
     /// Wait for an incoming MAC frame. Blocks until a frame arrives.
@@ -273,7 +288,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         // Route by destination endpoint
         let dst_ep = aps_indication.dst_endpoint;
         let cluster_id = aps_indication.cluster_id;
-        let profile_id = aps_indication.profile_id;
+        let _profile_id = aps_indication.profile_id;
         let src_addr = match aps_indication.src_address {
             ApsAddress::Short(a) => a.0,
             _ => 0,
