@@ -26,6 +26,7 @@ pub mod occupancy;
 pub mod on_off;
 pub mod on_off_switch_config;
 pub mod ota;
+pub mod ota_image;
 pub mod poll_control;
 pub mod power_config;
 pub mod pressure;

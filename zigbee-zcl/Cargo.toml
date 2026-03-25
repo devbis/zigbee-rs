@@ -8,3 +8,7 @@ license = "MIT OR Apache-2.0"
 heapless = "0.9"
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
 log = "0.4"
+
+[features]
+default = []
+ota = []

@@ -71,6 +71,19 @@ pub enum StackEvent {
     PermitJoinChanged { open: bool },
     /// Attribute report was sent successfully.
     ReportSent,
+    /// OTA: New image available from server.
+    OtaImageAvailable {
+        version: u32,
+        size: u32,
+    },
+    /// OTA: Download progress update.
+    OtaProgress {
+        percent: u8,
+    },
+    /// OTA: Upgrade completed successfully — reboot to apply.
+    OtaComplete,
+    /// OTA: Upgrade failed.
+    OtaFailed,
 }
 
 /// Stack tick result — tells the application what to do next.
@@ -138,15 +151,28 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
             return self.handle_action(action).await;
         }
 
-        // Phase 2: Only do reporting/maintenance if joined
+        // Phase 2: Send any queued ZCL responses
+        while let Some(resp) = self.pending_responses.pop() {
+            let _ = self
+                .send_zcl_frame(
+                    resp.dst_addr,
+                    resp.dst_endpoint,
+                    resp.src_endpoint,
+                    resp.cluster_id,
+                    &resp.zcl_data,
+                )
+                .await;
+        }
+
+        // Phase 3: Only do reporting/maintenance if joined
         if !self.is_joined() {
             return TickResult::Idle;
         }
 
-        // Phase 3: Tick the reporting engine timers
+        // Phase 4: Tick the reporting engine timers
         self.reporting.tick(elapsed_secs);
 
-        // Phase 4: Power management
+        // Phase 5: Power management
         // (Currently returns StayAwake for AlwaysOn devices)
 
         TickResult::Idle

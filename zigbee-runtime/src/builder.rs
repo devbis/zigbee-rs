@@ -119,6 +119,7 @@ impl<M: MacDriver> DeviceBuilder<M> {
             model_identifier: self.model_identifier,
             sw_build_id: self.sw_build_id,
             channel_mask: self.channel_mask,
+            pending_responses: heapless::Vec::new(),
         }
     }
 }

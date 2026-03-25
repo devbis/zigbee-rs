@@ -15,3 +15,7 @@ zigbee-zdo = { version = "0.1.0", path = "../zigbee-zdo" }
 zigbee-bdb = { version = "0.1.0", path = "../zigbee-bdb" }
 zigbee-zcl = { version = "0.1.0", path = "../zigbee-zcl" }
 log = "0.4"
+
+[features]
+default = []
+ota = []

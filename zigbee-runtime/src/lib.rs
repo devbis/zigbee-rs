@@ -29,7 +29,10 @@
 
 pub mod builder;
 pub mod event_loop;
+pub mod firmware_writer;
 pub mod nv_storage;
+#[cfg(feature = "ota")]
+pub mod ota;
 pub mod power;
 pub mod templates;
 
@@ -39,8 +42,21 @@ use zigbee_mac::{MacDriver, MacError, McpsDataIndication};
 use zigbee_types::*;
 use zigbee_zcl::foundation::reporting::ReportingEngine;
 use zigbee_zcl::frame::ZclFrame;
+use zigbee_zcl::{ClusterDirection, CommandId, ZclStatus};
 
 use crate::power::PowerManager;
+
+/// A queued ZCL response to be sent in the next tick().
+///
+/// Because `process_incoming()` is sync but sending requires async MAC access,
+/// we queue responses here and drain them in `tick()`.
+struct PendingZclResponse {
+    dst_addr: ShortAddress,
+    dst_endpoint: u8,
+    src_endpoint: u8,
+    cluster_id: u16,
+    zcl_data: heapless::Vec<u8, 128>,
+}
 
 /// Maximum number of endpoints on a device (endpoint 0 is ZDO, 1-240 are application)
 pub const MAX_ENDPOINTS: usize = 8;
@@ -93,6 +109,8 @@ pub struct ZigbeeDevice<M: MacDriver> {
     sw_build_id: &'static str,
     /// Channel mask for network scanning.
     channel_mask: ChannelMask,
+    /// Queued ZCL responses to send in next tick().
+    pending_responses: heapless::Vec<PendingZclResponse, 4>,
 }
 
 impl<M: MacDriver> ZigbeeDevice<M> {
@@ -338,12 +356,97 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         }
 
         // Cluster-specific or other global command
+        // Queue a ZCL Default Response if the sender wants one
+        if !zcl_frame.header.disable_default_response()
+            && zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::ClusterSpecific
+        {
+            self.queue_default_response(
+                ShortAddress(src_addr),
+                aps_indication.src_endpoint,
+                dst_ep,
+                cluster_id,
+                zcl_frame.header.seq_number,
+                ZclStatus::Success,
+            );
+        }
+
         Some(event_loop::StackEvent::CommandReceived {
             src_addr,
             endpoint: dst_ep,
             cluster_id,
             command_id: cmd_id,
         })
+    }
+
+    /// Queue a ZCL Default Response to be sent in next tick().
+    fn queue_default_response(
+        &mut self,
+        dst_addr: ShortAddress,
+        dst_endpoint: u8,
+        src_endpoint: u8,
+        cluster_id: u16,
+        seq: u8,
+        status: ZclStatus,
+    ) {
+        let mut frame = ZclFrame::new_global(
+            seq,
+            CommandId(0x0B), // Default Response
+            ClusterDirection::ServerToClient,
+            true,
+        );
+        let _ = frame.payload.push(0x00); // command that triggered this
+        let _ = frame.payload.push(status as u8);
+
+        let mut zcl_buf = [0u8; 128];
+        if let Ok(len) = frame.serialize(&mut zcl_buf) {
+            let mut data = heapless::Vec::new();
+            for &b in &zcl_buf[..len] {
+                let _ = data.push(b);
+            }
+            let _ = self.pending_responses.push(PendingZclResponse {
+                dst_addr,
+                dst_endpoint,
+                src_endpoint,
+                cluster_id,
+                zcl_data: data,
+            });
+        }
+    }
+
+    /// Send a raw ZCL frame via APS→NWK→MAC.
+    pub async fn send_zcl_frame(
+        &mut self,
+        dst_addr: ShortAddress,
+        dst_endpoint: u8,
+        src_endpoint: u8,
+        cluster_id: u16,
+        zcl_data: &[u8],
+    ) -> Result<(), ()> {
+        if !self.is_joined() {
+            return Err(());
+        }
+
+        let req = zigbee_aps::apsde::ApsdeDataRequest {
+            dst_addr_mode: zigbee_aps::ApsAddressMode::Short,
+            dst_address: ApsAddress::Short(dst_addr),
+            dst_endpoint,
+            profile_id: 0x0104, // Home Automation
+            cluster_id,
+            src_endpoint,
+            payload: zcl_data,
+            tx_options: zigbee_aps::ApsTxOptions::default(),
+            radius: 0,
+            alias_src_addr: None,
+            alias_seq: None,
+        };
+
+        match self.bdb.zdo_mut().aps_mut().apsde_data_request(&req).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                log::warn!("[Runtime] ZCL frame send failed: {:?}", e);
+                Err(())
+            }
+        }
     }
 
     // ── Reporting ───────────────────────────────────────────

@@ -20,3 +20,5 @@ mod types_tests;
 mod zcl_tests;
 #[cfg(test)]
 mod zdo_tests;
+#[cfg(test)]
+mod ota_tests;
