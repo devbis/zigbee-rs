@@ -17,7 +17,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
-      - run: cargo check --workspace -p zigbee-mac --features serial
+      - run: cargo check -p zigbee-mac --features serial
+      - run: cargo check -p zigbee-mac --features mock
 
   test:
     name: Test
@@ -57,3 +58,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps
+
+  # ── Cross-compile hardware examples ──────────────────────────
+  # These are standalone crates (not workspace members) targeting
+  # embedded platforms. We build them to catch regressions in the
+  # platform-specific MAC backends.
+
+  build-nrf52840:
+    name: Build nRF52840 sensor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/nrf52840-sensor
+      - name: Build nRF52840 sensor (release)
+        working-directory: examples/nrf52840-sensor
+        run: cargo build --release
+
+  build-esp32c6:
+    name: Build ESP32-C6 sensor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: riscv32imac-unknown-none-elf
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/esp32c6-sensor
+      - name: Build ESP32-C6 sensor (release)
+        working-directory: examples/esp32c6-sensor
+        run: cargo build --release -Z build-std=core,alloc

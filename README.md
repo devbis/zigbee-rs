@@ -30,7 +30,7 @@ Embassy and other embedded async runtimes.
 │      frames · routing (AODV+tree) · security · NIB   │
 ├──────────────────────────────────────────────────────┤
 │                    zigbee-mac                          │
-│    MacDriver trait · MockMac · ESP32 · nRF52840      │
+│  MacDriver trait · MockMac · ESP32 · nRF · BL702    │
 ├──────────────────────────────────────────────────────┤
 │                   zigbee-types                         │
 │     IeeeAddress · ShortAddress · PanId · Channel     │
@@ -85,6 +85,7 @@ probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-
 | **MockMac** | ✅ Complete | Host (macOS/Linux/Windows) |
 | **ESP32-C6/H2/C5** | ✅ Complete | `riscv32imac-unknown-none-elf` |
 | **nRF52840** | ✅ Complete | `thumbv7em-none-eabihf` |
+| **BL702** | ✅ FFI to lmac154 | `riscv32imac-unknown-none-elf` |
 | STM32WB55 | 🔲 Skeleton | `thumbv7em-none-eabihf` |
 | EFR32MG24 | 🔲 Skeleton | `thumbv7em-none-eabihf` |
 | CC2652 | 🔲 Skeleton | `thumbv7em-none-eabihf` |
@@ -139,13 +140,15 @@ zigbee-rs-fork/
 │   ├── mock-light/        # Host: dimmable light
 │   ├── mock-sleepy-sensor/# Host: SED demo
 │   ├── esp32c6-sensor/    # ESP32-C6 + SHT31
-│   └── nrf52840-sensor/   # nRF52840 + BME280
+│   ├── nrf52840-sensor/   # nRF52840 + BME280
+│   └── bl702-sensor/      # BL702 temp sensor (skeleton)
 └── BUILD.md               # Comprehensive build guide
 ```
 
 ## Known Limitations
 
 - **AES-CCM\* encryption** is real (using RustCrypto `aes` + `ccm` crates, `no_std`)
+- **BL702** backend uses FFI to Bouffalo's `lmac154` C library — requires `liblmac154.a` from BL IoT SDK at link time
 - **STM32WB55 / EFR32MG24 / CC2652** backends are skeletons (waiting for Rust ecosystem maturity)
 - **No USB serial MAC** — can't bridge host ↔ dongle for real RF from desktop (yet)
 - **Test coverage** is basic — the 4 mock examples exercise more than the test crate

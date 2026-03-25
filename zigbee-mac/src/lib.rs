@@ -43,6 +43,9 @@ pub mod efr32;
 #[cfg(feature = "cc2652")]
 pub mod cc26xx;
 
+#[cfg(feature = "bl702")]
+pub mod bl702;
+
 #[cfg(feature = "serial")]
 pub mod serial;
 

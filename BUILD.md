@@ -27,6 +27,7 @@ rustup update nightly
 | **ESP32-C6** | `riscv32imac-unknown-none-elf` | `espflash` |
 | **ESP32-H2** | `riscv32imac-unknown-none-elf` | `espflash` |
 | **ESP32-C5** | `riscv32imac-unknown-none-elf` | `espflash` |
+| **BL702** | `riscv32imac-unknown-none-elf` | `blflash` (community) |
 
 #### nRF52840
 
@@ -45,6 +46,29 @@ cargo install espflash                # flash + serial monitor
 #### Mock (Host)
 
 No additional setup — uses the regular host target for development and testing.
+
+#### BL702 (Bouffalo Lab)
+
+```bash
+rustup target add riscv32imac-unknown-none-elf
+cargo install blflash                 # community flash tool for BL702
+```
+
+The BL702 backend uses FFI bindings to Bouffalo's `lmac154` C library for
+802.15.4 radio access. Your firmware crate must link `liblmac154.a` from
+the [BL IoT SDK](https://github.com/bouffalolab/bl_iot_sdk). Add to your
+`build.rs`:
+
+```rust
+println!("cargo:rustc-link-search=path/to/bl_iot_sdk/components/network/lmac154/lib");
+println!("cargo:rustc-link-lib=static=lmac154");
+```
+
+At startup, register the M154 interrupt handler after creating the MAC:
+```rust
+// bl_irq_register(M154_IRQn, lmac154_getInterruptHandler());
+// bl_irq_enable(M154_IRQn);
+```
 
 ---
 
