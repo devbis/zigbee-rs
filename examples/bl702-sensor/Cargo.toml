@@ -1,7 +1,7 @@
 [package]
 name = "bl702-sensor"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
@@ -12,20 +12,10 @@ zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 
 # BL702 PAC (register-level access for clock/GPIO init)
-# NOTE: bl702-hal is abandoned (pinned to embedded-hal alpha).
-# We use bl702-pac directly for peripheral setup and lmac154 FFI for radio.
 bl702-pac = "0.0.3"
-
-# Embassy async runtime
-embassy-executor = { version = "0.7", features = ["task-arena-size-65536"] }
-embassy-time = "0.4"
-static_cell = "2"
 
 # Panic handler for embedded target
 panic-halt = "1.0"
-
-# Embedded HAL traits (for I2C sensor drivers)
-embedded-hal = "1.0"
 
 [profile.release]
 opt-level = "s"
