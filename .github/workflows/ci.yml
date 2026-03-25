@@ -133,6 +133,46 @@ jobs:
             examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor.bin
             examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release/nrf52833-sensor.hex
 
+  build-nrf52840-uf2:
+    name: Build nRF52840 sensor (UF2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: thumbv7em-none-eabihf
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/nrf52840-sensor-uf2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install UF2 converter
+        run: pip install --quiet intelhex
+      - name: Build nRF52840 UF2 sensor (release)
+        working-directory: examples/nrf52840-sensor-uf2
+        run: cargo build --release
+      - name: Create firmware artifacts (.bin, .hex, .uf2)
+        run: |
+          ELF=examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2
+          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          $OBJCOPY -O binary $ELF ${ELF}.bin
+          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+
+          # Download uf2conv.py from Microsoft's UF2 repo
+          curl -sL https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2conv.py -o uf2conv.py
+          # Convert .bin → .uf2 (family=0xADA52840, base address=0x26000)
+          python uf2conv.py -c -f 0xADA52840 -b 0x26000 ${ELF}.bin -o ${ELF}.uf2
+      - name: Upload nRF52840 UF2 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: nrf52840-sensor-uf2-firmware
+          path: |
+            examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2.bin
+            examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2.hex
+            examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2.uf2
+
   build-esp32c6:
     name: Build ESP32-C6 sensor
     runs-on: ubuntu-latest

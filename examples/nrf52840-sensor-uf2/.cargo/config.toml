@@ -1,0 +1,9 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+# No debug probe needed — flash by copying .uf2 to USB drive.
+# Double-tap reset on nice!nano / ProMicro to enter bootloader mode.
+# The board appears as a USB mass storage device (e.g., "NICENANO").
+
+[env]
+DEFMT_LOG = "info"
