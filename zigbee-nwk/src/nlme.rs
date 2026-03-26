@@ -116,7 +116,10 @@ impl<M: MacDriver> NwkLayer<M> {
                 continue;
             }
             if pd.zigbee_beacon.stack_profile != 2 {
-                log::info!("[NWK] Skipping non-PRO beacon (stack_profile={})", pd.zigbee_beacon.stack_profile);
+                log::info!(
+                    "[NWK] Skipping non-PRO beacon (stack_profile={})",
+                    pd.zigbee_beacon.stack_profile
+                );
                 continue;
             }
             let nd = NetworkDescriptor::from(pd);
@@ -335,8 +338,10 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Add parent to neighbor table
         // Try to get coordinator IEEE from MAC PIB (cached from association)
-        let parent_ieee = if let Ok(PibValue::ExtendedAddress(addr)) =
-            self.mac.mlme_get(PibAttribute::MacCoordExtendedAddress).await
+        let parent_ieee = if let Ok(PibValue::ExtendedAddress(addr)) = self
+            .mac
+            .mlme_get(PibAttribute::MacCoordExtendedAddress)
+            .await
         {
             addr
         } else {
@@ -552,7 +557,10 @@ impl<M: MacDriver> NwkLayer<M> {
             }
         }
 
-        log::warn!("[NWK] Rejoin response not received after {} attempts", MAX_RX_ATTEMPTS);
+        log::warn!(
+            "[NWK] Rejoin response not received after {} attempts",
+            MAX_RX_ATTEMPTS
+        );
         Err(NwkStatus::NoNetworks)
     }
 
@@ -610,12 +618,10 @@ impl<M: MacDriver> NwkLayer<M> {
             let aad_len = hdr_len + sec_hdr_len;
 
             if let Some(key_entry) = self.security.active_key() {
-                if let Some(encrypted) = self.security.encrypt(
-                    &buf[..aad_len],
-                    &payload,
-                    &key_entry.key,
-                    &sec_hdr,
-                ) {
+                if let Some(encrypted) =
+                    self.security
+                        .encrypt(&buf[..aad_len], &payload, &key_entry.key, &sec_hdr)
+                {
                     if aad_len + encrypted.len() > buf.len() {
                         return Err(NwkStatus::FrameTooLong);
                     }

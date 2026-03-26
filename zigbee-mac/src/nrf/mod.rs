@@ -252,16 +252,14 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         for channel in req.channel_mask.iter() {
             let ch = channel.number();
             match req.scan_type {
-                ScanType::Active => {
-                    match self.scan_channel_active(ch, req.scan_duration).await {
-                        Ok(pds) => {
-                            for pd in pds {
-                                let _ = pan_descriptors.push(pd);
-                            }
+                ScanType::Active => match self.scan_channel_active(ch, req.scan_duration).await {
+                    Ok(pds) => {
+                        for pd in pds {
+                            let _ = pan_descriptors.push(pd);
                         }
-                        Err(e) => log::error!("[nRF MLME-SCAN] ch {ch}: {e:?}"),
                     }
-                }
+                    Err(e) => log::error!("[nRF MLME-SCAN] ch {ch}: {e:?}"),
+                },
                 ScanType::Passive => {
                     // Fix 4: Use passive scan for Passive scan type
                     match self.scan_channel_passive(ch, req.scan_duration).await {
@@ -327,11 +325,8 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         Timer::after_millis(100).await; // Brief wait for coordinator to process
 
         // Send Data Request to poll for indirect Association Response
-        let data_req = build_data_request(
-            self.next_dsn(),
-            &req.coord_address,
-            &self.extended_address,
-        );
+        let data_req =
+            build_data_request(self.next_dsn(), &req.coord_address, &self.extended_address);
         let mut dreq_pkt = Packet::new();
         dreq_pkt.copy_from_slice(&data_req);
         let _ = self.radio.try_send(&mut dreq_pkt).await;
@@ -466,11 +461,7 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
         // Build and send MAC Data Request to parent (coordinator)
         let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
-        let data_req = build_data_request(
-            self.next_dsn(),
-            &parent,
-            &self.extended_address,
-        );
+        let data_req = build_data_request(self.next_dsn(), &parent, &self.extended_address);
         let mut pkt = Packet::new();
         pkt.copy_from_slice(&data_req);
 
@@ -483,11 +474,8 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         // Wait for response — parent may reply with data or empty ACK
         // Use a short timeout since this is a poll
         let mut rx_pkt = Packet::new();
-        let result = select::select(
-            Timer::after_millis(500),
-            self.radio.receive(&mut rx_pkt),
-        )
-        .await;
+        let result =
+            select::select(Timer::after_millis(500), self.radio.receive(&mut rx_pkt)).await;
 
         match result {
             select::Either::Second(Ok(())) => {
@@ -542,8 +530,8 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
 
         // Fix 6: Unslotted CSMA-CA (IEEE 802.15.4-2011 §5.1.1.4)
         let max_backoffs: u8 = 4; // macMaxCsmaBackoffs
-        let min_be: u8 = 3;       // macMinBE
-        let max_be: u8 = 5;       // macMaxBE
+        let min_be: u8 = 3; // macMinBE
+        let max_be: u8 = 5; // macMaxBE
         let mut be = min_be;
         let mut nb: u8 = 0;
         let symbol_period_us: u64 = 16; // 2.4 GHz = 62.5 ksym/s = 16μs/symbol
@@ -553,7 +541,9 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             // Random backoff: 0 to 2^BE - 1 unit backoff periods
             let max_val = (1u32 << be) - 1;
             // Simple PRNG: use dsn as seed (not cryptographic, but adequate for CSMA)
-            let random = (self.dsn as u32).wrapping_mul(1103515245).wrapping_add(12345);
+            let random = (self.dsn as u32)
+                .wrapping_mul(1103515245)
+                .wrapping_add(12345);
             let backoff = (random % (max_val + 1)) as u64;
             let delay_us = backoff * unit_backoff_symbols * symbol_period_us;
             if delay_us > 0 {
@@ -577,32 +567,35 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             let ack_wait_us: u64 = 864; // macAckWaitDuration = 54 symbols * 16μs
             let mut retries = 0u8;
             let max_retries = self.max_frame_retries;
-            
+
             loop {
                 // Listen for ACK
                 let mut ack_pkt = Packet::new();
                 let got_ack = match select::select(
                     Timer::after_micros(ack_wait_us),
                     self.radio.receive(&mut ack_pkt),
-                ).await {
+                )
+                .await
+                {
                     select::Either::Second(Ok(())) => {
                         let ack_data = ack_pkt.as_ref();
                         // ACK frame: FC(2) + Seq(1), frame_type = 2, seq must match
-                        ack_data.len() >= 3 && (ack_data[0] & 0x07) == 0x02 
+                        ack_data.len() >= 3
+                            && (ack_data[0] & 0x07) == 0x02
                             && ack_data[2] == frame_buf[2] // seq number match
                     }
                     _ => false,
                 };
-                
+
                 if got_ack {
                     break;
                 }
-                
+
                 retries += 1;
                 if retries > max_retries {
                     return Err(MacError::NoAck);
                 }
-                
+
                 // Retransmit (with CSMA-CA again)
                 pkt.copy_from_slice(&frame_buf[..len]);
                 // Simple retry — single CCA attempt for retransmission

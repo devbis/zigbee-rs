@@ -97,7 +97,10 @@ impl<M: MacDriver> NwkLayer<M> {
             // Build NWK security auxiliary header
             let sec_hdr = crate::security::NwkSecurityHeader {
                 security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
-                frame_counter: self.nib.next_frame_counter().ok_or(NwkStatus::InvalidRequest)?,
+                frame_counter: self
+                    .nib
+                    .next_frame_counter()
+                    .ok_or(NwkStatus::InvalidRequest)?,
                 source_address: self.nib.ieee_address,
                 key_seq_number: self.nib.active_key_seq_number,
             };
@@ -212,10 +215,8 @@ impl<M: MacDriver> NwkLayer<M> {
                 match plaintext {
                     Some(pt) => {
                         // Step 3: MIC verified — NOW commit frame counter
-                        self.security.commit_frame_counter(
-                            &sec_hdr.source_address,
-                            sec_hdr.frame_counter,
-                        );
+                        self.security
+                            .commit_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter);
 
                         log::debug!(
                             "[NWK] Decrypted frame from 0x{:04X} ({} bytes)",

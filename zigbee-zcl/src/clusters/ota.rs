@@ -626,7 +626,10 @@ impl OtaCluster {
     fn handle_query_response(&mut self, payload: &[u8]) -> OtaAction {
         // State guard: only accept query response when we're waiting for one
         if self.state != OtaState::QuerySent {
-            log::warn!("[OTA] Query Response in wrong state {:?}, ignoring", self.state);
+            log::warn!(
+                "[OTA] Query Response in wrong state {:?}, ignoring",
+                self.state
+            );
             return OtaAction::None;
         }
 
@@ -678,7 +681,10 @@ impl OtaCluster {
         match self.state {
             OtaState::Downloading { .. } | OtaState::WaitForData { .. } => {}
             _ => {
-                log::warn!("[OTA] Block Response in wrong state {:?}, ignoring", self.state);
+                log::warn!(
+                    "[OTA] Block Response in wrong state {:?}, ignoring",
+                    self.state
+                );
                 return OtaAction::None;
             }
         }

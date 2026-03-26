@@ -83,7 +83,8 @@ impl<M: MacDriver> ZdoLayer<M> {
             annce.capability,
         );
         // Update NWK neighbor table with the announced short/IEEE address mapping
-        self.nwk_mut().update_neighbor_address(annce.nwk_addr, annce.ieee_addr);
+        self.nwk_mut()
+            .update_neighbor_address(annce.nwk_addr, annce.ieee_addr);
         Ok(annce)
     }
 }

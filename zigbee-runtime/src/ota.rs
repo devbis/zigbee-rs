@@ -189,7 +189,11 @@ impl<F: FirmwareWriter> OtaManager<F> {
                 let fw_size = self.download_ctx.firmware_size;
                 self.cluster.mark_download_complete();
                 // Verify using actual firmware bytes written, not OTA file size
-                let verify_size = if fw_size > 0 { fw_size } else { self.download_ctx.firmware_written };
+                let verify_size = if fw_size > 0 {
+                    fw_size
+                } else {
+                    self.download_ctx.firmware_written
+                };
                 match self.writer.verify(verify_size, None) {
                     Ok(()) => {
                         let action = self.cluster.mark_verified();
@@ -267,22 +271,20 @@ impl<F: FirmwareWriter> OtaManager<F> {
                 }
                 None
             }
-            OtaAction::WriteBlock { offset, data } => {
-                match self.write_ota_block(offset, &data) {
-                    Ok(()) => {
-                        self.need_next_block = true;
-                        let progress = self.cluster.progress_percent();
-                        Some(StackEvent::OtaProgress { percent: progress })
-                    }
-                    Err(e) => {
-                        log::warn!("[OTA] Write failed at offset {}: {:?}", offset, e);
-                        let _ = self.writer.abort();
-                        let fail_action = self.cluster.mark_failed();
-                        self.process_action(fail_action);
-                        Some(StackEvent::OtaFailed)
-                    }
+            OtaAction::WriteBlock { offset, data } => match self.write_ota_block(offset, &data) {
+                Ok(()) => {
+                    self.need_next_block = true;
+                    let progress = self.cluster.progress_percent();
+                    Some(StackEvent::OtaProgress { percent: progress })
                 }
-            }
+                Err(e) => {
+                    log::warn!("[OTA] Write failed at offset {}: {:?}", offset, e);
+                    let _ = self.writer.abort();
+                    let fail_action = self.cluster.mark_failed();
+                    self.process_action(fail_action);
+                    Some(StackEvent::OtaFailed)
+                }
+            },
             OtaAction::SendEndRequest(req) => {
                 self.build_and_queue_end_request(&req);
                 None

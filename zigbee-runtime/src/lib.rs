@@ -360,10 +360,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 ) {
                     Some(plaintext) => {
                         // MIC verified — NOW commit frame counter
-                        nwk.security_mut().commit_frame_counter(
-                            &sec_hdr.source_address,
-                            sec_hdr.frame_counter,
-                        );
+                        nwk.security_mut()
+                            .commit_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter);
                         len = plaintext.len().min(128);
                         buf[..len].copy_from_slice(&plaintext[..len]);
                     }
@@ -426,7 +424,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             // After ZDO processes Mgmt_Leave_req, execute the actual leave
             if cluster_id == 0x0034 {
                 log::info!("[Runtime] Executing NLME-LEAVE after Mgmt_Leave response sent");
-                let _ = self.bdb.zdo_mut().aps_mut().nwk_mut().nlme_leave(false).await;
+                let _ = self
+                    .bdb
+                    .zdo_mut()
+                    .aps_mut()
+                    .nwk_mut()
+                    .nlme_leave(false)
+                    .await;
                 return Some(event_loop::StackEvent::Left);
             }
 
@@ -501,26 +505,31 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 };
                 // Find matching cluster to validate attribute existence
                 let cluster_ref = clusters.iter().find(|c| {
-                    c.endpoint == dst_ep && c.cluster.cluster_id() == zigbee_zcl::ClusterId(cluster_id)
+                    c.endpoint == dst_ep
+                        && c.cluster.cluster_id() == zigbee_zcl::ClusterId(cluster_id)
                 });
                 for cfg in &req.configs {
                     // Validate attribute exists in the cluster before configuring
                     let attr_def = cluster_ref
                         .as_ref()
                         .and_then(|c| c.cluster.attributes().find(cfg.attribute_id));
-                    let status = if attr_def.is_none() {
-                        ZclStatus::UnsupportedAttribute
-                    } else if cfg.direction == zigbee_zcl::foundation::reporting::ReportDirection::Send
-                        && !attr_def.unwrap().access.is_reportable()
-                    {
-                        ZclStatus::UnreportableAttribute
-                    } else {
-                        match self.reporting
-                            .configure_for_cluster(dst_ep, cluster_id, cfg.clone())
+                    let status = if let Some(def) = attr_def {
+                        if cfg.direction == zigbee_zcl::foundation::reporting::ReportDirection::Send
+                            && !def.access.is_reportable()
                         {
-                            Ok(()) => ZclStatus::Success,
-                            Err(s) => s,
+                            ZclStatus::UnreportableAttribute
+                        } else {
+                            match self.reporting.configure_for_cluster(
+                                dst_ep,
+                                cluster_id,
+                                cfg.clone(),
+                            ) {
+                                Ok(()) => ZclStatus::Success,
+                                Err(s) => s,
+                            }
                         }
+                    } else {
+                        ZclStatus::UnsupportedAttribute
                     };
                     let _ = response.records.push(ConfigureReportingStatusRecord {
                         status,
@@ -574,7 +583,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         rec.direction,
                         rec.attribute_id,
                     ) {
-                        if rec.direction == zigbee_zcl::foundation::reporting::ReportDirection::Send {
+                        if rec.direction == zigbee_zcl::foundation::reporting::ReportDirection::Send
+                        {
                             let _ = response.records.push(ReadReportingConfigResponseRecord {
                                 status: ZclStatus::Success,
                                 direction: rec.direction,
@@ -919,13 +929,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     for &b in &zcl_buf[..len] {
                         let _ = data.push(b);
                     }
-                    if self.pending_responses.push(PendingZclResponse {
-                        dst_addr: ShortAddress(src_addr),
-                        dst_endpoint: aps_indication.src_endpoint,
-                        src_endpoint: dst_ep,
-                        cluster_id,
-                        zcl_data: data,
-                    }).is_err() {
+                    if self
+                        .pending_responses
+                        .push(PendingZclResponse {
+                            dst_addr: ShortAddress(src_addr),
+                            dst_endpoint: aps_indication.src_endpoint,
+                            src_endpoint: dst_ep,
+                            cluster_id,
+                            zcl_data: data,
+                        })
+                        .is_err()
+                    {
                         log::warn!("[ZCL] Response queue full");
                     }
                 }
@@ -984,6 +998,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     }
 
     /// Queue a ZCL Default Response to be sent in next tick().
+    #[allow(clippy::too_many_arguments)]
     fn queue_default_response(
         &mut self,
         dst_addr: ShortAddress,
@@ -1009,13 +1024,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             for &b in &zcl_buf[..len] {
                 let _ = data.push(b);
             }
-            if self.pending_responses.push(PendingZclResponse {
-                dst_addr,
-                dst_endpoint,
-                src_endpoint,
-                cluster_id,
-                zcl_data: data,
-            }).is_err() {
+            if self
+                .pending_responses
+                .push(PendingZclResponse {
+                    dst_addr,
+                    dst_endpoint,
+                    src_endpoint,
+                    cluster_id,
+                    zcl_data: data,
+                })
+                .is_err()
+            {
                 log::warn!("[ZCL] Response queue full");
             }
         }
@@ -1045,13 +1064,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             for &b in &zcl_buf[..len] {
                 let _ = data.push(b);
             }
-            if self.pending_responses.push(PendingZclResponse {
-                dst_addr,
-                dst_endpoint,
-                src_endpoint,
-                cluster_id,
-                zcl_data: data,
-            }).is_err() {
+            if self
+                .pending_responses
+                .push(PendingZclResponse {
+                    dst_addr,
+                    dst_endpoint,
+                    src_endpoint,
+                    cluster_id,
+                    zcl_data: data,
+                })
+                .is_err()
+            {
                 log::warn!("[ZCL] Response queue full");
             }
         }
@@ -1081,13 +1104,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             for &b in &zcl_buf[..len] {
                 let _ = data.push(b);
             }
-            if self.pending_responses.push(PendingZclResponse {
-                dst_addr,
-                dst_endpoint,
-                src_endpoint,
-                cluster_id,
-                zcl_data: data,
-            }).is_err() {
+            if self
+                .pending_responses
+                .push(PendingZclResponse {
+                    dst_addr,
+                    dst_endpoint,
+                    src_endpoint,
+                    cluster_id,
+                    zcl_data: data,
+                })
+                .is_err()
+            {
                 log::warn!("[ZCL] Response queue full");
             }
         }
@@ -1215,13 +1242,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             for &b in &zcl_buf[..len] {
                 let _ = data.push(b);
             }
-            if self.pending_responses.push(PendingZclResponse {
-                dst_addr: ShortAddress(dst_addr),
-                dst_endpoint,
-                src_endpoint,
-                cluster_id,
-                zcl_data: data,
-            }).is_err() {
+            if self
+                .pending_responses
+                .push(PendingZclResponse {
+                    dst_addr: ShortAddress(dst_addr),
+                    dst_endpoint,
+                    src_endpoint,
+                    cluster_id,
+                    zcl_data: data,
+                })
+                .is_err()
+            {
                 log::warn!("[ZCL] Response queue full");
             }
         }

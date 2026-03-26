@@ -139,7 +139,14 @@ impl<M: MacDriver> BdbLayer<M> {
                 for _attempt in 0..MAX_KEY_WAIT_ATTEMPTS {
                     // Small delay between polls (~100ms worth of iterations)
                     // Try to receive a MAC frame
-                    match self.zdo.aps_mut().nwk_mut().mac_mut().mcps_data_indication().await {
+                    match self
+                        .zdo
+                        .aps_mut()
+                        .nwk_mut()
+                        .mac_mut()
+                        .mcps_data_indication()
+                        .await
+                    {
                         Ok(mac_ind) => {
                             let mac_payload = mac_ind.payload.as_slice();
                             // Parse NWK header
@@ -155,15 +162,23 @@ impl<M: MacDriver> BdbLayer<M> {
                                     if let Some((sec_hdr, sec_consumed)) =
                                         zigbee_nwk::security::NwkSecurityHeader::parse(after_nwk)
                                     {
-                                        if let Some(key_entry) = self.zdo.aps().nwk().security().key_by_seq(sec_hdr.key_seq_number) {
+                                        if let Some(key_entry) = self
+                                            .zdo
+                                            .aps()
+                                            .nwk()
+                                            .security()
+                                            .key_by_seq(sec_hdr.key_seq_number)
+                                        {
                                             let key = key_entry.key;
                                             let aad_len = nwk_consumed + sec_consumed;
-                                            if let Some(pt) = self.zdo.aps().nwk().security().decrypt(
-                                                &mac_payload[..aad_len],
-                                                &after_nwk[sec_consumed..],
-                                                &key,
-                                                &sec_hdr,
-                                            ) {
+                                            if let Some(pt) =
+                                                self.zdo.aps().nwk().security().decrypt(
+                                                    &mac_payload[..aad_len],
+                                                    &after_nwk[sec_consumed..],
+                                                    &key,
+                                                    &sec_hdr,
+                                                )
+                                            {
                                                 let len = pt.len().min(128);
                                                 buf[..len].copy_from_slice(&pt[..len]);
                                                 payload_data = Some((buf, len));

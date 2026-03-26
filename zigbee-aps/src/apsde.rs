@@ -286,8 +286,7 @@ impl<M: MacDriver> ApsLayer<M> {
         // If APS-secured, we need to decrypt before processing
         let (effective_payload, _aps_sec_overhead) = if aps_secured {
             // Parse APS security auxiliary header
-            let (sec_hdr, sec_consumed) =
-                crate::security::ApsSecurityHeader::parse(after_header)?;
+            let (sec_hdr, sec_consumed) = crate::security::ApsSecurityHeader::parse(after_header)?;
 
             let ciphertext = &after_header[sec_consumed..];
 
@@ -297,7 +296,8 @@ impl<M: MacDriver> ApsLayer<M> {
 
             // Determine the decryption key:
             // For key_id=0 (Data Key / Link Key), use TC link key
-            let key_id = crate::security::ApsSecurityHeader::key_identifier(sec_hdr.security_control);
+            let key_id =
+                crate::security::ApsSecurityHeader::key_identifier(sec_hdr.security_control);
             let key = if key_id == crate::security::KEY_ID_DATA_KEY {
                 // Try partner-specific key first, then default TC link key
                 if let Some(addr) = &sec_hdr.source_address {
@@ -352,7 +352,11 @@ impl<M: MacDriver> ApsLayer<M> {
             ApsFrameType::Data => {
                 // APS duplicate rejection — drop duplicate data frames
                 if self.is_aps_duplicate(nwk_src.0, header.aps_counter) {
-                    log::debug!("APS duplicate rejected: src=0x{:04X} counter={}", nwk_src.0, header.aps_counter);
+                    log::debug!(
+                        "APS duplicate rejected: src=0x{:04X} counter={}",
+                        nwk_src.0,
+                        header.aps_counter
+                    );
                     return None;
                 }
             }
@@ -455,7 +459,11 @@ impl<M: MacDriver> ApsLayer<M> {
             return;
         }
         let key_seq = data[0];
-        log::info!("[APS] Switch-Key: activate key seq={} from 0x{:04X}", key_seq, src.0);
+        log::info!(
+            "[APS] Switch-Key: activate key seq={} from 0x{:04X}",
+            key_seq,
+            src.0
+        );
         // The NWK security layer already has both keys; just update the active seq
         self.nwk_mut().nib_mut().active_key_seq_number = key_seq;
     }
@@ -539,7 +547,11 @@ impl<M: MacDriver> ApsLayer<M> {
             .nlde_data_request(ack_info.dst_addr, 1, &buf[..hdr_len], true, false)
             .await;
 
-        log::debug!("[APS] Sent ACK (counter={}) to 0x{:04X}", aps_counter, ack_info.dst_addr.0);
+        log::debug!(
+            "[APS] Sent ACK (counter={}) to 0x{:04X}",
+            aps_counter,
+            ack_info.dst_addr.0
+        );
         Ok(())
     }
 
