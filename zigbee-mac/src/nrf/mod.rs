@@ -515,6 +515,7 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
         let msdu_handle = req.msdu_handle;
+        let ack_requested = req.tx_options.ack_tx;
         let mut frame_buf = [0u8; 127];
         let len = build_data_frame(
             &mut frame_buf,
@@ -563,7 +564,7 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         }
 
         // Fix 7: If ACK requested, wait for it and retry on failure
-        if req.tx_options.ack_tx {
+        if ack_requested {
             let ack_wait_us: u64 = 864; // macAckWaitDuration = 54 symbols * 16μs
             let mut retries = 0u8;
             let max_retries = self.max_frame_retries;
