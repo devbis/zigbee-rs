@@ -386,10 +386,7 @@ impl<M: MacDriver> ApsLayer<M> {
             }
             0x03 => {
                 // Trust Center Link Key
-                log::info!(
-                    "[APS] Transport-Key: TC Link Key from 0x{:04X}",
-                    src.0,
-                );
+                log::info!("[APS] Transport-Key: TC Link Key from 0x{:04X}", src.0,);
                 let entry = crate::security::ApsLinkKeyEntry {
                     partner_address: [0u8; 8], // TC address
                     key,
@@ -401,16 +398,10 @@ impl<M: MacDriver> ApsLayer<M> {
             }
             0x04 => {
                 // Application Link Key
-                log::info!(
-                    "[APS] Transport-Key: App Link Key from 0x{:04X}",
-                    src.0,
-                );
+                log::info!("[APS] Transport-Key: App Link Key from 0x{:04X}", src.0,);
             }
             _ => {
-                log::debug!(
-                    "[APS] Transport-Key: unknown key_type=0x{:02X}",
-                    key_type,
-                );
+                log::debug!("[APS] Transport-Key: unknown key_type=0x{:02X}", key_type,);
             }
         }
     }

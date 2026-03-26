@@ -141,11 +141,14 @@ impl<M: MacDriver> DeviceBuilder<M> {
         // For now, leave as default; it will be updated after join.
 
         // Set node/power descriptors based on device type
-        let mut node_desc = zigbee_zdo::descriptors::NodeDescriptor::default();
-        node_desc.logical_type = match self.device_type {
+        let logical_type = match self.device_type {
             DeviceType::Coordinator => zigbee_zdo::descriptors::LogicalType::Coordinator,
             DeviceType::Router => zigbee_zdo::descriptors::LogicalType::Router,
             DeviceType::EndDevice => zigbee_zdo::descriptors::LogicalType::EndDevice,
+        };
+        let node_desc = zigbee_zdo::descriptors::NodeDescriptor {
+            logical_type,
+            ..Default::default()
         };
         zdo.set_node_descriptor(node_desc);
         zdo.set_power_descriptor(zigbee_zdo::descriptors::PowerDescriptor::default());

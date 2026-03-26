@@ -163,9 +163,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         log::info!("[Runtime] Joined network as 0x{:04X}", addr);
 
         // Sync addresses into ZDO so interview responses are correct
-        self.bdb
-            .zdo_mut()
-            .set_local_nwk_addr(ShortAddress(addr));
+        self.bdb.zdo_mut().set_local_nwk_addr(ShortAddress(addr));
         self.bdb.zdo_mut().set_local_ieee_addr(ieee);
 
         Ok(addr)
@@ -335,19 +333,16 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 let key = match nwk.security().key_by_seq(sec_hdr.key_seq_number) {
                     Some(k) => k.key,
                     None => {
-                        log::warn!(
-                            "[NWK] No key for seq {}",
-                            sec_hdr.key_seq_number
-                        );
+                        log::warn!("[NWK] No key for seq {}", sec_hdr.key_seq_number);
                         return None;
                     }
                 };
 
                 // Replay protection
-                if !nwk.security_mut().check_frame_counter(
-                    &sec_hdr.source_address,
-                    sec_hdr.frame_counter,
-                ) {
+                if !nwk
+                    .security_mut()
+                    .check_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter)
+                {
                     log::warn!("[NWK] Frame counter replay detected");
                     return None;
                 }
@@ -411,10 +406,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 aps_indication.payload.len(),
             );
             match self.bdb.zdo_mut().handle_indication(&aps_indication).await {
-                Ok(()) => log::debug!(
-                    "[Runtime] ZDO handled cluster 0x{:04X} OK",
-                    cluster_id,
-                ),
+                Ok(()) => log::debug!("[Runtime] ZDO handled cluster 0x{:04X} OK", cluster_id,),
                 Err(e) => log::warn!(
                     "[Runtime] ZDO error on cluster 0x{:04X}: {:?}",
                     cluster_id,
@@ -499,7 +491,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 cluster_id,
                 command_id: cmd_id,
                 seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice()).unwrap_or_default(),
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
+                    .unwrap_or_default(),
             });
         }
 
@@ -554,7 +547,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 cluster_id,
                 command_id: cmd_id,
                 seq_number: zcl_frame.header.seq_number,
-                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice()).unwrap_or_default(),
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
+                    .unwrap_or_default(),
             });
         }
 
@@ -562,11 +556,9 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
             && cmd_id == 0x00
         {
-            if let Some(req) =
-                zigbee_zcl::foundation::read_attributes::ReadAttributesRequest::parse(
-                    zcl_frame.payload.as_slice(),
-                )
-            {
+            if let Some(req) = zigbee_zcl::foundation::read_attributes::ReadAttributesRequest::parse(
+                zcl_frame.payload.as_slice(),
+            ) {
                 // Find the cluster's attribute store
                 if let Some(cr) = clusters
                     .iter()
@@ -608,27 +600,25 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 zigbee_zcl::foundation::write_attributes::WriteAttributesRequest::parse(
                     zcl_frame.payload.as_slice(),
                 )
-            {
-                if let Some(cr) = clusters
+                && let Some(cr) = clusters
                     .iter_mut()
                     .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
-                {
-                    let response = zigbee_zcl::foundation::write_attributes::process_write_dyn(
-                        cr.cluster.attributes_mut(),
-                        &req,
-                    );
-                    let mut payload_buf = [0u8; 128];
-                    let payload_len = response.serialize(&mut payload_buf);
-                    self.queue_global_response(
-                        src_addr,
-                        aps_indication.src_endpoint,
-                        dst_ep,
-                        cluster_id,
-                        zcl_frame.header.seq_number,
-                        0x04, // Write Attributes Response
-                        &payload_buf[..payload_len],
-                    );
-                }
+            {
+                let response = zigbee_zcl::foundation::write_attributes::process_write_dyn(
+                    cr.cluster.attributes_mut(),
+                    &req,
+                );
+                let mut payload_buf = [0u8; 128];
+                let payload_len = response.serialize(&mut payload_buf);
+                self.queue_global_response(
+                    src_addr,
+                    aps_indication.src_endpoint,
+                    dst_ep,
+                    cluster_id,
+                    zcl_frame.header.seq_number,
+                    0x04, // Write Attributes Response
+                    &payload_buf[..payload_len],
+                );
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
@@ -649,17 +639,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 zigbee_zcl::foundation::write_attributes::WriteAttributesRequest::parse(
                     zcl_frame.payload.as_slice(),
                 )
-            {
-                if let Some(cr) = clusters
+                && let Some(cr) = clusters
                     .iter_mut()
                     .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
-                {
-                    let _ = zigbee_zcl::foundation::write_attributes::process_write_dyn(
-                        cr.cluster.attributes_mut(),
-                        &req,
-                    );
-                    // No response sent for 0x05
-                }
+            {
+                let _ = zigbee_zcl::foundation::write_attributes::process_write_dyn(
+                    cr.cluster.attributes_mut(),
+                    &req,
+                );
+                // No response sent for 0x05
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
@@ -678,27 +666,25 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         {
             if let Some(req) = zigbee_zcl::foundation::discover::DiscoverAttributesRequest::parse(
                 zcl_frame.payload.as_slice(),
-            ) {
-                if let Some(cr) = clusters
-                    .iter()
-                    .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
-                {
-                    let response = zigbee_zcl::foundation::discover::process_discover_dyn(
-                        cr.cluster.attributes(),
-                        &req,
-                    );
-                    let mut payload_buf = [0u8; 128];
-                    let payload_len = response.serialize(&mut payload_buf);
-                    self.queue_global_response(
-                        src_addr,
-                        aps_indication.src_endpoint,
-                        dst_ep,
-                        cluster_id,
-                        zcl_frame.header.seq_number,
-                        0x0D, // Discover Attributes Response
-                        &payload_buf[..payload_len],
-                    );
-                }
+            ) && let Some(cr) = clusters
+                .iter()
+                .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
+            {
+                let response = zigbee_zcl::foundation::discover::process_discover_dyn(
+                    cr.cluster.attributes(),
+                    &req,
+                );
+                let mut payload_buf = [0u8; 128];
+                let payload_len = response.serialize(&mut payload_buf);
+                self.queue_global_response(
+                    src_addr,
+                    aps_indication.src_endpoint,
+                    dst_ep,
+                    cluster_id,
+                    zcl_frame.header.seq_number,
+                    0x0D, // Discover Attributes Response
+                    &payload_buf[..payload_len],
+                );
             }
             return Some(event_loop::StackEvent::CommandReceived {
                 src_addr,
@@ -720,7 +706,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 .iter_mut()
                 .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
             {
-                match cr.cluster.handle_command(CommandId(cmd_id), zcl_frame.payload.as_slice()) {
+                match cr
+                    .cluster
+                    .handle_command(CommandId(cmd_id), zcl_frame.payload.as_slice())
+                {
                     Ok(resp) => {
                         response_payload = if resp.is_empty() { None } else { Some(resp) };
                     }
@@ -735,37 +724,27 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     // Can't use GroupsCluster::take_action() through trait object,
                     // so we infer the action from the ZCL command directly.
                     match cmd_id {
-                        0x00 => {
+                        0x00 if zcl_frame.payload.len() >= 2 => {
                             // Add Group — group_id is first 2 bytes of payload
-                            if zcl_frame.payload.len() >= 2 {
-                                let gid = u16::from_le_bytes([
-                                    zcl_frame.payload[0],
-                                    zcl_frame.payload[1],
-                                ]);
-                                let _ = self
-                                    .bdb
-                                    .zdo_mut()
-                                    .aps_mut()
-                                    .apsme_add_group(&zigbee_aps::apsme::ApsmeAddGroupRequest {
-                                        group_address: gid,
-                                        endpoint: dst_ep,
-                                    });
-                            }
+                            let gid =
+                                u16::from_le_bytes([zcl_frame.payload[0], zcl_frame.payload[1]]);
+                            let _ = self.bdb.zdo_mut().aps_mut().apsme_add_group(
+                                &zigbee_aps::apsme::ApsmeAddGroupRequest {
+                                    group_address: gid,
+                                    endpoint: dst_ep,
+                                },
+                            );
                         }
-                        0x03 => {
+                        0x03 if zcl_frame.payload.len() >= 2 => {
                             // Remove Group — group_id is first 2 bytes
-                            if zcl_frame.payload.len() >= 2 {
-                                let gid = u16::from_le_bytes([
-                                    zcl_frame.payload[0],
-                                    zcl_frame.payload[1],
-                                ]);
-                                let _ = self.bdb.zdo_mut().aps_mut().apsme_remove_group(
-                                    &zigbee_aps::apsme::ApsmeRemoveGroupRequest {
-                                        group_address: gid,
-                                        endpoint: dst_ep,
-                                    },
-                                );
-                            }
+                            let gid =
+                                u16::from_le_bytes([zcl_frame.payload[0], zcl_frame.payload[1]]);
+                            let _ = self.bdb.zdo_mut().aps_mut().apsme_remove_group(
+                                &zigbee_aps::apsme::ApsmeRemoveGroupRequest {
+                                    group_address: gid,
+                                    endpoint: dst_ep,
+                                },
+                            );
                         }
                         0x04 => {
                             // Remove All Groups
@@ -1037,6 +1016,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     ///
     /// Used by applications to respond to Read Attributes (0x00→0x01),
     /// Write Attributes (0x02→0x04), and Discover Attributes (0x0C→0x0D).
+    #[allow(clippy::too_many_arguments)]
     pub fn queue_global_response(
         &mut self,
         dst_addr: u16,

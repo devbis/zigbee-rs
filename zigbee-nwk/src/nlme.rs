@@ -417,8 +417,7 @@ impl<M: MacDriver> NwkLayer<M> {
                     if aad_len + encrypted.len() > nwk_frame_buf.len() {
                         return Err(NwkStatus::FrameTooLong);
                     }
-                    nwk_frame_buf[aad_len..aad_len + encrypted.len()]
-                        .copy_from_slice(&encrypted);
+                    nwk_frame_buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
                     total_len = aad_len + encrypted.len();
                 } else {
                     return Err(NwkStatus::InvalidRequest);

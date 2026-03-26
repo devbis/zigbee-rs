@@ -1,6 +1,5 @@
 //! Read Attributes command (0x00) and Read Attributes Response (0x01).
 
-use crate::attribute::AttributeStore;
 use crate::data_types::{ZclDataType, ZclValue};
 use crate::{AttributeId, ZclStatus};
 

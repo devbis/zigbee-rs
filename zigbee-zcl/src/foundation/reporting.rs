@@ -286,15 +286,15 @@ impl ReportingEngine {
             }
 
             // Filter by endpoint/cluster if specified
-            if let Some(ep) = filter_ep {
-                if state.endpoint != ep {
-                    continue;
-                }
+            if let Some(ep) = filter_ep
+                && state.endpoint != ep
+            {
+                continue;
             }
-            if let Some(cl) = filter_cluster {
-                if state.cluster_id != cl {
-                    continue;
-                }
+            if let Some(cl) = filter_cluster
+                && state.cluster_id != cl
+            {
+                continue;
             }
 
             let current = store.get(state.config.attribute_id);

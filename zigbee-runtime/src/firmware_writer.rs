@@ -43,8 +43,11 @@ pub trait FirmwareWriter {
     ///
     /// Checks that `expected_size` bytes were written. If `expected_hash` is
     /// provided, verifies the image hash matches.
-    fn verify(&mut self, expected_size: u32, expected_hash: Option<&[u8]>)
-    -> Result<(), FirmwareError>;
+    fn verify(
+        &mut self,
+        expected_size: u32,
+        expected_hash: Option<&[u8]>,
+    ) -> Result<(), FirmwareError>;
 
     /// Mark the new image as pending activation.
     ///

@@ -99,8 +99,7 @@ impl<M: MacDriver> NwkLayer<M> {
                     if aad_len + encrypted.len() > nwk_buf.len() {
                         return Err(NwkStatus::FrameTooLong);
                     }
-                    nwk_buf[aad_len..aad_len + encrypted.len()]
-                        .copy_from_slice(&encrypted);
+                    nwk_buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
                     total_len = aad_len + encrypted.len();
                 } else {
                     log::warn!("[NWK] Encryption failed");
@@ -173,10 +172,10 @@ impl<M: MacDriver> NwkLayer<M> {
                 let key = self.security.key_by_seq(sec_hdr.key_seq_number)?.key;
 
                 // Replay protection
-                if !self.security.check_frame_counter(
-                    &sec_hdr.source_address,
-                    sec_hdr.frame_counter,
-                ) {
+                if !self
+                    .security
+                    .check_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter)
+                {
                     log::warn!("[NWK] Frame counter replay");
                     return None;
                 }
