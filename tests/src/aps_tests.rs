@@ -217,7 +217,7 @@ fn test_command_frame_round_trip() {
         group_address: None,
         cluster_id: None,
         profile_id: None,
-        src_endpoint: Some(0x00),
+        src_endpoint: None, // Command frames don't have endpoints per Zigbee spec §2.2.5.1
         aps_counter: 200,
         extended_header: None,
     };
@@ -231,7 +231,7 @@ fn test_command_frame_round_trip() {
     assert!(parsed.frame_control.security);
     assert!(parsed.cluster_id.is_none());
     assert!(parsed.profile_id.is_none());
-    assert_eq!(parsed.src_endpoint, Some(0x00));
+    assert_eq!(parsed.src_endpoint, None); // Command frames have no endpoints
     assert_eq!(parsed.aps_counter, 200);
 }
 

@@ -126,15 +126,99 @@ impl<M: MacDriver> BdbLayer<M> {
                 }
 
                 // Step 5b: TC link key exchange
-                // Zigbee 3.0: coordinator sends APS Transport-Key command
-                // containing the network key after we join. This is handled
-                // automatically by process_incoming_aps_frame() which parses
-                // Transport-Key commands and installs the NWK key into
-                // NwkSecurity. The well-known TC link key (ZigBeeAlliance09)
-                // is pre-installed in ApsSecurity.
-                //
-                // For Install Code devices, APSME-REQUEST-KEY would be needed.
-                log::debug!("[BDB:Steering] Awaiting Transport-Key from coordinator");
+                // After joining, the coordinator sends Transport-Key (with NWK key)
+                // encrypted with the well-known TC link key (ZigBeeAlliance09).
+                // We must receive and process it before declaring success.
+                // Then send APSME-REQUEST-KEY(0x04) so Z2M establishes a unique TC link key.
+                log::info!("[BDB:Steering] Waiting for Transport-Key from TC...");
+
+                let mut key_received = false;
+                // Poll for incoming frames for up to ~5 seconds
+                for _attempt in 0..50 {
+                    // Small delay between polls (~100ms worth of iterations)
+                    // Try to receive a MAC frame
+                    match self.zdo.aps_mut().nwk_mut().mac_mut().mcps_data_indication().await {
+                        Ok(mac_ind) => {
+                            let mac_payload = mac_ind.payload.as_slice();
+                            // Parse NWK header
+                            if let Some((nwk_hdr, nwk_consumed)) =
+                                zigbee_nwk::frames::NwkHeader::parse(mac_payload)
+                            {
+                                let after_nwk = &mac_payload[nwk_consumed..];
+                                let mut buf = [0u8; 128];
+                                let payload_data;
+
+                                if nwk_hdr.frame_control.security {
+                                    // Parse NWK security header
+                                    if let Some((sec_hdr, sec_consumed)) =
+                                        zigbee_nwk::security::NwkSecurityHeader::parse(after_nwk)
+                                    {
+                                        if let Some(key_entry) = self.zdo.aps().nwk().security().key_by_seq(sec_hdr.key_seq_number) {
+                                            let key = key_entry.key;
+                                            let aad_len = nwk_consumed + sec_consumed;
+                                            if let Some(pt) = self.zdo.aps().nwk().security().decrypt(
+                                                &mac_payload[..aad_len],
+                                                &after_nwk[sec_consumed..],
+                                                &key,
+                                                &sec_hdr,
+                                            ) {
+                                                let len = pt.len().min(128);
+                                                buf[..len].copy_from_slice(&pt[..len]);
+                                                payload_data = Some((buf, len));
+                                            } else {
+                                                payload_data = None;
+                                            }
+                                        } else {
+                                            payload_data = None;
+                                        }
+                                    } else {
+                                        payload_data = None;
+                                    }
+                                } else {
+                                    let len = after_nwk.len().min(128);
+                                    buf[..len].copy_from_slice(&after_nwk[..len]);
+                                    payload_data = Some((buf, len));
+                                }
+
+                                if let Some((data, len)) = payload_data {
+                                    // Try to parse as APS frame
+                                    let mut aps_buf = zigbee_aps::apsde::ApsFrameBuffer::new();
+                                    let _ = self.zdo.aps_mut().process_incoming_aps_frame(
+                                        &data[..len],
+                                        nwk_hdr.src_addr,
+                                        nwk_hdr.dst_addr,
+                                        mac_ind.lqi,
+                                        nwk_hdr.frame_control.security,
+                                        &mut aps_buf,
+                                    );
+
+                                    // Check if NWK key was installed
+                                    if self.zdo.aps().nwk().security().active_key().is_some() {
+                                        log::info!("[BDB:Steering] NWK key received from TC!");
+                                        key_received = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // No frame available — short wait then retry
+                        }
+                    }
+                }
+
+                if !key_received {
+                    log::warn!("[BDB:Steering] Transport-Key not received within timeout");
+                    // Continue anyway — the key might arrive later
+                }
+
+                // Step 5c: Send APSME-REQUEST-KEY to TC for unique link key
+                // Z2M requires this within ~10s of joining
+                let tc_addr = zigbee_types::ShortAddress::COORDINATOR;
+                if let Err(e) = self.zdo.aps_mut().send_request_key(tc_addr).await {
+                    log::warn!("[BDB:Steering] Request-Key failed: {:?}", e);
+                    // Non-fatal — some coordinators don't require this
+                }
 
                 // Success!
                 self.attributes.node_is_on_a_network = true;

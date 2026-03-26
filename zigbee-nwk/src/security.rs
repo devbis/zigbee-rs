@@ -41,8 +41,10 @@ pub struct NwkSecurityHeader {
 
 impl NwkSecurityHeader {
     /// Security control field value for standard Zigbee:
-    /// Security Level = 5 (ENC-MIC-32), Key Identifier = 1 (Network Key)
-    pub const ZIGBEE_DEFAULT: u8 = 0x05 | (0x01 << 3); // level=5, key_id=1
+    /// Security Level = 5 (ENC-MIC-32), Key Identifier = 1 (Network Key),
+    /// Extended Nonce = 1 (source address present in aux header)
+    /// Per Zigbee PRO R22 §4.5.1.1: extended nonce SHALL be set to 1.
+    pub const ZIGBEE_DEFAULT: u8 = 0x05 | (0x01 << 3) | (1 << 5); // 0x2D
 
     pub fn parse(data: &[u8]) -> Option<(Self, usize)> {
         if data.len() < 14 {
@@ -118,29 +120,41 @@ impl NwkSecurity {
         self.keys.iter().flatten().find(|k| k.seq_number == seq)
     }
 
-    /// Check and update incoming frame counter (replay protection).
+    /// Check incoming frame counter (replay protection) WITHOUT committing.
     /// Returns true if the frame counter is valid (newer than last seen).
-    pub fn check_frame_counter(&mut self, source: &IeeeAddress, counter: u32) -> bool {
+    /// Call `commit_frame_counter()` AFTER successful MIC verification.
+    pub fn check_frame_counter(&self, source: &IeeeAddress, counter: u32) -> bool {
+        if let Some(entry) = self
+            .frame_counter_table
+            .iter()
+            .find(|e| e.source == *source)
+        {
+            counter > entry.counter
+        } else {
+            // First frame from this source — accept if table has room
+            if self.frame_counter_table.is_full() {
+                log::warn!("[NWK] Replay table full — rejecting frame from new source");
+                return false;
+            }
+            true
+        }
+    }
+
+    /// Commit frame counter after successful MIC verification.
+    /// Must only be called after decrypt/verify succeeds.
+    pub fn commit_frame_counter(&mut self, source: &IeeeAddress, counter: u32) {
         if let Some(entry) = self
             .frame_counter_table
             .iter_mut()
             .find(|e| e.source == *source)
         {
-            if counter > entry.counter {
-                entry.counter = counter;
-                true
-            } else {
-                false // Replay attack or duplicate
-            }
+            entry.counter = counter;
         } else {
-            // First frame from this source
-            if self.frame_counter_table.push(FrameCounterEntry {
+            // New source — add to table (already checked not full in check_frame_counter)
+            let _ = self.frame_counter_table.push(FrameCounterEntry {
                 source: *source,
                 counter,
-            }).is_err() {
-                log::warn!("[NWK] Replay table full, cannot track new source");
-            }
-            true
+            });
         }
     }
 

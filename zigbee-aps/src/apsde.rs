@@ -8,7 +8,7 @@
 //! - `APSDE-DATA.indication`: received data delivered to upper layer
 
 use crate::frames::{ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader};
-use crate::{ApsAddress, ApsAddressMode, ApsLayer, ApsStatus, ApsTxOptions};
+use crate::{ApsAddress, ApsAddressMode, ApsLayer, ApsStatus, ApsTxOptions, PendingApsAck};
 use zigbee_mac::MacDriver;
 use zigbee_nwk::NwkStatus;
 use zigbee_types::ShortAddress;
@@ -263,6 +263,9 @@ impl<M: MacDriver> ApsLayer<M> {
     ///
     /// Parses the APS header from the NWK payload and returns an
     /// `ApsdeDataIndication` for the upper layer.
+    ///
+    /// For APS-secured frames (Transport Key, etc.), this decrypts using
+    /// the appropriate link key before processing commands.
     pub fn process_incoming_aps_frame<'a>(
         &mut self,
         nwk_payload: &'a [u8],
@@ -270,8 +273,78 @@ impl<M: MacDriver> ApsLayer<M> {
         nwk_dst: ShortAddress,
         lqi: u8,
         nwk_security: bool,
+        decrypted_buf: &'a mut ApsFrameBuffer,
     ) -> Option<ApsdeDataIndication<'a>> {
         let (header, consumed) = ApsHeader::parse(nwk_payload)?;
+
+        // Determine if APS security is applied
+        let aps_secured = header.frame_control.security;
+
+        // Get the payload after the APS header
+        let after_header = &nwk_payload[consumed..];
+
+        // If APS-secured, we need to decrypt before processing
+        let (effective_payload, _aps_sec_overhead) = if aps_secured {
+            // Parse APS security auxiliary header
+            let (sec_hdr, sec_consumed) =
+                crate::security::ApsSecurityHeader::parse(after_header)?;
+
+            let ciphertext = &after_header[sec_consumed..];
+
+            // Build AAD = APS header bytes || APS security header bytes
+            let aad_end = consumed + sec_consumed;
+            let aad = &nwk_payload[..aad_end];
+
+            // Determine the decryption key:
+            // For key_id=0 (Data Key / Link Key), use TC link key
+            let key_id = crate::security::ApsSecurityHeader::key_identifier(sec_hdr.security_control);
+            let key = if key_id == crate::security::KEY_ID_DATA_KEY {
+                // Try partner-specific key first, then default TC link key
+                if let Some(addr) = &sec_hdr.source_address {
+                    if let Some(entry) = self.security.find_any_key(addr) {
+                        entry.key
+                    } else {
+                        *self.security.default_tc_link_key()
+                    }
+                } else {
+                    *self.security.default_tc_link_key()
+                }
+            } else if key_id == crate::security::KEY_ID_KEY_TRANSPORT {
+                // Key-transport key: derive from TC link key via hash
+                // For simplicity, use the default TC link key directly
+                // (Zigbee 3.0 uses well-known key for initial transport)
+                *self.security.default_tc_link_key()
+            } else {
+                log::warn!("[APS] Unsupported key_id={} in APS security", key_id);
+                return None;
+            };
+
+            // Decrypt
+            match self.security.decrypt(aad, ciphertext, &key, &sec_hdr) {
+                Some(plaintext) => {
+                    // Copy to owned buffer
+                    let pt_len = plaintext.len().min(decrypted_buf.data.len());
+                    decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
+                    decrypted_buf.len = pt_len;
+                    log::debug!(
+                        "[APS] Decrypted APS frame ({} bytes) from 0x{:04X}",
+                        pt_len,
+                        nwk_src.0
+                    );
+                    (decrypted_buf.payload(), sec_consumed)
+                }
+                None => {
+                    log::warn!(
+                        "[APS] APS decryption failed from 0x{:04X} (key_id={})",
+                        nwk_src.0,
+                        key_id
+                    );
+                    return None;
+                }
+            }
+        } else {
+            (after_header, 0)
+        };
 
         // Only deliver Data frames to the upper layer
         let ft = crate::frames::ApsFrameType::from_u8(header.frame_control.frame_type)?;
@@ -284,16 +357,18 @@ impl<M: MacDriver> ApsLayer<M> {
             }
             ApsFrameType::Command => {
                 // APS command frame — parse command ID and handle key management
-                let cmd_payload = &nwk_payload[consumed..];
-                if cmd_payload.is_empty() {
+                if effective_payload.is_empty() {
                     log::warn!("APS command frame with empty payload");
                     return None;
                 }
-                let cmd_id = cmd_payload[0];
-                let cmd_data = &cmd_payload[1..];
+                let cmd_id = effective_payload[0];
+                let cmd_data = &effective_payload[1..];
                 match crate::frames::ApsCommandId::from_u8(cmd_id) {
                     Some(crate::frames::ApsCommandId::TransportKey) => {
                         self.handle_transport_key(cmd_data, nwk_src);
+                    }
+                    Some(crate::frames::ApsCommandId::SwitchKey) => {
+                        self.handle_switch_key(cmd_data, nwk_src);
                     }
                     Some(crate::frames::ApsCommandId::VerifyKey) => {
                         log::debug!("APS Verify-Key from 0x{:04X}", nwk_src.0);
@@ -316,6 +391,18 @@ impl<M: MacDriver> ApsLayer<M> {
             }
         }
 
+        // Generate APS ACK if requested
+        if header.frame_control.ack_request {
+            self.pending_aps_ack = Some(PendingApsAck {
+                dst_addr: nwk_src,
+                dst_endpoint: header.src_endpoint.unwrap_or(0),
+                src_endpoint: header.dst_endpoint.unwrap_or(0),
+                cluster_id: header.cluster_id.unwrap_or(0),
+                profile_id: header.profile_id.unwrap_or(0),
+                aps_counter: header.aps_counter,
+            });
+        }
+
         // Determine addressing
         let dm = crate::frames::ApsDeliveryMode::from_u8(header.frame_control.delivery_mode)?;
         let (dst_addr_mode, dst_address, dst_ep) = match dm {
@@ -335,7 +422,7 @@ impl<M: MacDriver> ApsLayer<M> {
             ),
         };
 
-        let payload = &nwk_payload[consumed..];
+        let payload = effective_payload;
 
         Some(ApsdeDataIndication {
             dst_addr_mode,
@@ -348,9 +435,106 @@ impl<M: MacDriver> ApsLayer<M> {
             cluster_id: header.cluster_id.unwrap_or(0),
             payload,
             aps_counter: header.aps_counter,
-            security_status: header.frame_control.security || nwk_security,
+            security_status: aps_secured || nwk_security,
             lqi,
         })
+    }
+
+    /// Handle an incoming APS Switch-Key command.
+    ///
+    /// Activates the network key with the specified sequence number.
+    fn handle_switch_key(&mut self, data: &[u8], src: ShortAddress) {
+        if data.is_empty() {
+            log::warn!("[APS] Switch-Key too short");
+            return;
+        }
+        let key_seq = data[0];
+        log::info!("[APS] Switch-Key: activate key seq={} from 0x{:04X}", key_seq, src.0);
+        // The NWK security layer already has both keys; just update the active seq
+        self.nwk_mut().nib_mut().active_key_seq_number = key_seq;
+    }
+
+    /// Build and send an APSME-REQUEST-KEY to the Trust Center.
+    ///
+    /// After receiving the NWK key via Transport-Key, the device must request
+    /// a unique TC link key. Z2M requires this within ~10s of joining.
+    pub async fn send_request_key(&mut self, tc_addr: ShortAddress) -> Result<(), ApsStatus> {
+        // Request-Key frame: APS command with key_type=0x04 (TC Link Key)
+        let aps_counter = self.next_aps_counter();
+
+        // APS command header: frame_type=Command, no endpoints, no cluster/profile
+        let aps_header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Command as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false, // Request-Key is sent without APS security
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: None,
+            group_address: None,
+            cluster_id: None,
+            profile_id: None,
+            src_endpoint: None,
+            aps_counter,
+            extended_header: None,
+        };
+
+        let mut buf = [0u8; 32];
+        let hdr_len = aps_header.serialize(&mut buf);
+
+        // APS command payload: cmd_id(1) + key_type(1)
+        buf[hdr_len] = crate::frames::ApsCommandId::RequestKey as u8; // 0x08
+        buf[hdr_len + 1] = 0x04; // key_type = TC Link Key
+        let total = hdr_len + 2;
+
+        log::info!("[APS] Sending APSME-REQUEST-KEY to TC 0x{:04X}", tc_addr.0);
+
+        self.nwk
+            .nlde_data_request(tc_addr, 1, &buf[..total], true, false)
+            .await
+            .map_err(|_| ApsStatus::NoAck)?;
+
+        Ok(())
+    }
+
+    /// Send a pending APS ACK if one is queued.
+    pub async fn send_pending_aps_ack(&mut self) -> Result<(), ApsStatus> {
+        let ack_info = match self.pending_aps_ack.take() {
+            Some(info) => info,
+            None => return Ok(()),
+        };
+
+        let aps_counter = ack_info.aps_counter;
+        let aps_header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Ack as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: Some(ack_info.dst_endpoint),
+            group_address: None,
+            cluster_id: Some(ack_info.cluster_id),
+            profile_id: Some(ack_info.profile_id),
+            src_endpoint: Some(ack_info.src_endpoint),
+            aps_counter,
+            extended_header: None,
+        };
+
+        let mut buf = [0u8; 16];
+        let hdr_len = aps_header.serialize(&mut buf);
+
+        let _ = self
+            .nwk
+            .nlde_data_request(ack_info.dst_addr, 1, &buf[..hdr_len], true, false)
+            .await;
+
+        log::debug!("[APS] Sent ACK (counter={}) to 0x{:04X}", aps_counter, ack_info.dst_addr.0);
+        Ok(())
     }
 
     /// Handle an incoming APS Transport-Key command.

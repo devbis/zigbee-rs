@@ -75,7 +75,7 @@ impl Default for NodeDescriptor {
             user_desc_available: false,
             aps_flags: 0,
             frequency_band: 0x08, // 2.4 GHz
-            mac_capabilities: 0,
+            mac_capabilities: 0x88, // AllocateAddress(bit7) | RxOnWhenIdle(bit3)
             manufacturer_code: 0,
             max_buffer_size: 127,
             max_incoming_transfer: 127,

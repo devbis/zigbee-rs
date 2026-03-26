@@ -274,11 +274,18 @@ fn test_frame_counter_replay_protection() {
     let mut sec = NwkSecurity::new();
     let source = [1u8; 8];
 
-    assert!(sec.check_frame_counter(&source, 1)); // First frame
-    assert!(sec.check_frame_counter(&source, 2)); // Newer
-    assert!(!sec.check_frame_counter(&source, 2)); // Replay
-    assert!(!sec.check_frame_counter(&source, 1)); // Old frame
-    assert!(sec.check_frame_counter(&source, 3)); // Newer again
+    // check_frame_counter is now check-only (no commit)
+    assert!(sec.check_frame_counter(&source, 1)); // First frame — OK
+    sec.commit_frame_counter(&source, 1); // Commit after successful MIC verify
+
+    assert!(sec.check_frame_counter(&source, 2)); // Newer — OK
+    sec.commit_frame_counter(&source, 2); // Commit
+
+    assert!(!sec.check_frame_counter(&source, 2)); // Replay — reject
+    assert!(!sec.check_frame_counter(&source, 1)); // Old frame — reject
+
+    assert!(sec.check_frame_counter(&source, 3)); // Newer — OK
+    sec.commit_frame_counter(&source, 3); // Commit
 }
 
 // ── NIB Tests ────────────────────────────────────────

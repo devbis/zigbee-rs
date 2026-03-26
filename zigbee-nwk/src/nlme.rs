@@ -256,7 +256,7 @@ impl<M: MacDriver> NwkLayer<M> {
         let cap = CapabilityInfo {
             device_type_ffd: self.device_type != DeviceType::EndDevice,
             mains_powered: self.device_type != DeviceType::EndDevice,
-            rx_on_when_idle: self.device_type != DeviceType::EndDevice,
+            rx_on_when_idle: self.rx_on_when_idle,
             security_capable: false,
             allocate_address: true,
         };
@@ -408,7 +408,7 @@ impl<M: MacDriver> NwkLayer<M> {
             // Encrypt rejoin request with network key
             let sec_hdr = crate::security::NwkSecurityHeader {
                 security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
-                frame_counter: self.nib.next_frame_counter(),
+                frame_counter: self.nib.next_frame_counter().unwrap_or(0),
                 source_address: self.nib.ieee_address,
                 key_seq_number: self.nib.active_key_seq_number,
             };
@@ -539,7 +539,7 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Send NWK Leave command
         let seq = self.nib.next_seq();
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; 128];
         let header = NwkHeader {
             frame_control: NwkFrameControl {
                 frame_type: NwkFrameType::Command as u8,
@@ -563,21 +563,55 @@ impl<M: MacDriver> NwkLayer<M> {
         };
         let hdr_len = header.serialize(&mut buf);
 
-        // Leave command payload
+        // Leave command payload: command ID + options byte
         let leave_cmd = crate::frames::LeaveCommand {
             remove_children: false,
             rejoin,
         };
-        buf[hdr_len] = 0x04; // Leave command ID
-        buf[hdr_len + 1] = leave_cmd.serialize();
-        let total = hdr_len + 2;
+        let payload = [0x04u8, leave_cmd.serialize()]; // cmd_id=Leave, options
+
+        let total_len;
+        if self.nib.security_enabled {
+            // Apply NWK security — same path as rejoin and data frames
+            let sec_hdr = crate::security::NwkSecurityHeader {
+                security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
+                frame_counter: self.nib.next_frame_counter().unwrap_or(0),
+                source_address: self.nib.ieee_address,
+                key_seq_number: self.nib.active_key_seq_number,
+            };
+            let sec_hdr_len = sec_hdr.serialize(&mut buf[hdr_len..]);
+            let aad_len = hdr_len + sec_hdr_len;
+
+            if let Some(key_entry) = self.security.active_key() {
+                if let Some(encrypted) = self.security.encrypt(
+                    &buf[..aad_len],
+                    &payload,
+                    &key_entry.key,
+                    &sec_hdr,
+                ) {
+                    if aad_len + encrypted.len() > buf.len() {
+                        return Err(NwkStatus::FrameTooLong);
+                    }
+                    buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+                    total_len = aad_len + encrypted.len();
+                } else {
+                    return Err(NwkStatus::BadCcmOutput);
+                }
+            } else {
+                return Err(NwkStatus::NoKey);
+            }
+        } else {
+            // No security — send plaintext
+            buf[hdr_len..hdr_len + 2].copy_from_slice(&payload);
+            total_len = hdr_len + 2;
+        }
 
         let _ = self
             .mac
             .mcps_data(zigbee_mac::McpsDataRequest {
                 src_addr_mode: zigbee_mac::AddressMode::Short,
                 dst_address: MacAddress::Short(self.nib.pan_id, self.nib.parent_address),
-                payload: &buf[..total],
+                payload: &buf[..total_len],
                 msdu_handle: seq,
                 tx_options: zigbee_mac::TxOptions {
                     ack_tx: true,

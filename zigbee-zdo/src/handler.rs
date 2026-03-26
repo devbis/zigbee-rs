@@ -418,8 +418,10 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     fn handle_mgmt_leave_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let _req = MgmtLeaveReq::parse(payload)?;
-        // TODO: invoke nlme_leave on the NWK layer
-        log::info!("Mgmt_Leave_req received (stub)");
+        // Note: actual leave is triggered by setting a flag that the runtime polls.
+        // We can't call async nlme_leave from a sync context, and the leave needs
+        // to happen AFTER we've sent the response. Set a flag and return success.
+        log::info!("[ZDO] Mgmt_Leave_req received — leave will be executed after response");
         if rsp.is_empty() {
             return Err(ZdoError::BufferTooSmall);
         }

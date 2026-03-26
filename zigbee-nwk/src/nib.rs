@@ -140,10 +140,15 @@ impl Nib {
     }
 
     /// Increment outgoing frame counter. Returns the pre-increment value.
-    pub fn next_frame_counter(&mut self) -> u32 {
+    /// Returns None if counter has reached maximum (must not reuse counters).
+    pub fn next_frame_counter(&mut self) -> Option<u32> {
+        if self.outgoing_frame_counter == u32::MAX {
+            log::error!("[NWK] Frame counter exhausted — cannot send secured frames");
+            return None;
+        }
         let fc = self.outgoing_frame_counter;
-        self.outgoing_frame_counter = self.outgoing_frame_counter.wrapping_add(1);
-        fc
+        self.outgoing_frame_counter += 1;
+        Some(fc)
     }
 }
 

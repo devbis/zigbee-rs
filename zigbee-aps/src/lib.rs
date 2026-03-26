@@ -173,6 +173,17 @@ pub struct ApsTxOptions {
 
 // ── The APS Layer ───────────────────────────────────────────────
 
+/// Pending APS ACK to be sent (queued during receive processing).
+#[derive(Debug, Clone)]
+pub struct PendingApsAck {
+    pub dst_addr: zigbee_types::ShortAddress,
+    pub dst_endpoint: u8,
+    pub src_endpoint: u8,
+    pub cluster_id: u16,
+    pub profile_id: u16,
+    pub aps_counter: u8,
+}
+
 /// The APS layer — owns the NWK layer and all APS state.
 ///
 /// Generic over `M: MacDriver` (the hardware abstraction).
@@ -189,6 +200,8 @@ pub struct ApsLayer<M: MacDriver> {
     security: security::ApsSecurity,
     /// APS frame counter (outgoing)
     aps_counter: u8,
+    /// Pending APS ACK to send after processing incoming frame
+    pending_aps_ack: Option<PendingApsAck>,
 }
 
 impl<M: MacDriver> ApsLayer<M> {
@@ -201,6 +214,7 @@ impl<M: MacDriver> ApsLayer<M> {
             group_table: group::GroupTable::new(),
             security: security::ApsSecurity::new(),
             aps_counter: 0,
+            pending_aps_ack: None,
         }
     }
 

@@ -102,11 +102,17 @@ pub struct NwkLayer<M: MacDriver> {
     security: security::NwkSecurity,
     device_type: DeviceType,
     joined: bool,
+    /// Whether this device listens when idle.
+    /// true = non-sleepy (RFD/FFD that stays awake)
+    /// false = sleepy end device (polls parent for data)
+    rx_on_when_idle: bool,
 }
 
 impl<M: MacDriver> NwkLayer<M> {
     /// Create a new NWK layer with the given MAC driver.
     pub fn new(mac: M, device_type: DeviceType) -> Self {
+        // Default: FFD/Router always rx_on, EndDevice defaults to true (non-sleepy)
+        let rx_on_when_idle = true;
         Self {
             mac,
             nib: nib::Nib::new(),
@@ -115,7 +121,20 @@ impl<M: MacDriver> NwkLayer<M> {
             security: security::NwkSecurity::new(),
             device_type,
             joined: false,
+            rx_on_when_idle,
         }
+    }
+
+    /// Set rx_on_when_idle (call before joining).
+    /// false = sleepy end device (must poll parent for indirect frames).
+    /// true = device listens continuously (default for Efekta sensor).
+    pub fn set_rx_on_when_idle(&mut self, rx_on: bool) {
+        self.rx_on_when_idle = rx_on;
+    }
+
+    /// Get rx_on_when_idle setting.
+    pub fn rx_on_when_idle(&self) -> bool {
+        self.rx_on_when_idle
     }
 
     /// Get reference to the NIB.

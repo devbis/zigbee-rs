@@ -253,10 +253,10 @@ impl ApsHeader {
             _ => None,
         };
 
-        // Source endpoint: present for all except InterPan
-        // For group delivery in data frames, src_endpoint is also present
+        // Source endpoint: present for Data and Ack frames only.
+        // Per Zigbee spec §2.2.5.1, Command frames (frame_type=1) do NOT have endpoints.
         let src_endpoint = match frame_type {
-            ApsFrameType::Data | ApsFrameType::Ack | ApsFrameType::Command => {
+            ApsFrameType::Data | ApsFrameType::Ack => {
                 if data.len() <= offset {
                     return None;
                 }
@@ -264,7 +264,7 @@ impl ApsHeader {
                 offset += 1;
                 Some(ep)
             }
-            ApsFrameType::InterPan => None,
+            ApsFrameType::Command | ApsFrameType::InterPan => None,
         };
 
         // APS counter: always present

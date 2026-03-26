@@ -20,6 +20,25 @@ pub struct NldeDataIndication<'a> {
     pub security_use: bool,
 }
 
+/// Owned NWK data indication — for decrypted frames where payload is owned.
+#[derive(Debug)]
+pub struct NldeDataIndicationOwned {
+    pub dst_addr: ShortAddress,
+    pub src_addr: ShortAddress,
+    pub payload: heapless::Vec<u8, 128>,
+    pub lqi: u8,
+    pub security_use: bool,
+}
+
+/// Result of processing an incoming NWK frame.
+#[derive(Debug)]
+pub enum NwkIndication<'a> {
+    /// Unsecured frame — payload borrows from MAC buffer
+    Borrowed(NldeDataIndication<'a>),
+    /// Decrypted frame — payload is owned
+    Owned(NldeDataIndicationOwned),
+}
+
 /// NWK data confirm — result of NLDE-DATA.request.
 #[derive(Debug)]
 pub struct NldeDataConfirm {
@@ -78,7 +97,7 @@ impl<M: MacDriver> NwkLayer<M> {
             // Build NWK security auxiliary header
             let sec_hdr = crate::security::NwkSecurityHeader {
                 security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
-                frame_counter: self.nib.next_frame_counter(),
+                frame_counter: self.nib.next_frame_counter().ok_or(NwkStatus::InvalidRequest)?,
                 source_address: self.nib.ieee_address,
                 key_seq_number: self.nib.active_key_seq_number,
             };
@@ -129,7 +148,8 @@ impl<M: MacDriver> NwkLayer<M> {
                 payload: &nwk_buf[..total_len],
                 msdu_handle: seq,
                 tx_options: TxOptions {
-                    ack_tx: true,
+                    // Fix 9: No MAC ACK for broadcast
+                    ack_tx: next_hop.0 != 0xFFFF,
                     ..Default::default()
                 },
             })
@@ -151,7 +171,7 @@ impl<M: MacDriver> NwkLayer<M> {
         &mut self,
         mac_payload: &'a [u8],
         lqi: u8,
-    ) -> Option<NldeDataIndication<'a>> {
+    ) -> Option<NwkIndication<'a>> {
         // Parse NWK header
         let (header, consumed) = NwkHeader::parse(mac_payload)?;
 
@@ -171,46 +191,63 @@ impl<M: MacDriver> NwkLayer<M> {
                 // Look up key
                 let key = self.security.key_by_seq(sec_hdr.key_seq_number)?.key;
 
-                // Replay protection
+                // Step 1: Check frame counter WITHOUT committing (replay protection)
                 if !self
                     .security
                     .check_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter)
                 {
-                    log::warn!("[NWK] Frame counter replay");
+                    log::warn!("[NWK] Frame counter replay from 0x{:04X}", src.0);
                     return None;
                 }
 
-                // Decrypt
+                // Step 2: Decrypt and verify MIC
                 let aad_len = consumed + sec_consumed;
                 let plaintext = self.security.decrypt(
                     &mac_payload[..aad_len],
                     &after_header[sec_consumed..],
                     &key,
                     &sec_hdr,
-                )?;
-
-                // Return decrypted indication
-                // Note: we can't return a slice into the decrypted Vec directly
-                // since it's a local. For now, log and return None — the runtime
-                // path handles decryption with its own owned buffer.
-                log::debug!(
-                    "[NWK] Decrypted frame from 0x{:04X} ({} bytes)",
-                    src.0,
-                    plaintext.len()
                 );
-                // TODO: return decrypted payload once we refactor to owned buffer
-                return None;
+
+                match plaintext {
+                    Some(pt) => {
+                        // Step 3: MIC verified — NOW commit frame counter
+                        self.security.commit_frame_counter(
+                            &sec_hdr.source_address,
+                            sec_hdr.frame_counter,
+                        );
+
+                        log::debug!(
+                            "[NWK] Decrypted frame from 0x{:04X} ({} bytes)",
+                            src.0,
+                            pt.len()
+                        );
+
+                        return Some(NwkIndication::Owned(NldeDataIndicationOwned {
+                            dst_addr: dst,
+                            src_addr: src,
+                            payload: pt,
+                            lqi,
+                            security_use: true,
+                        }));
+                    }
+                    None => {
+                        log::warn!("[NWK] Decrypt/MIC failed from 0x{:04X}", src.0);
+                        // Do NOT commit frame counter — frame is forged/corrupted
+                        return None;
+                    }
+                }
             }
 
             // Unsecured frame — deliver directly
             let payload = &mac_payload[consumed..];
-            return Some(NldeDataIndication {
+            return Some(NwkIndication::Borrowed(NldeDataIndication {
                 dst_addr: dst,
                 src_addr: src,
                 payload,
                 lqi,
                 security_use: false,
-            });
+            }));
         }
 
         // Not for us — relay if router/coordinator
@@ -254,7 +291,8 @@ impl<M: MacDriver> NwkLayer<M> {
                 payload: &relay_buf[..total],
                 msdu_handle: self.nib.next_seq(),
                 tx_options: TxOptions {
-                    ack_tx: true,
+                    // Fix 9: No MAC ACK for broadcast
+                    ack_tx: next_hop.0 != 0xFFFF,
                     ..Default::default()
                 },
             })

@@ -118,7 +118,8 @@ impl<'a, T: Instance> NrfMac<'a, T> {
     fn beacon_request_frame(&mut self) -> Packet {
         let seq = self.next_dsn();
         let mut pkt = Packet::new();
-        let frame: [u8; 10] = [0x03, 0x08, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00, 0x00];
+        // Fix 2: Beacon request is 8 bytes: FC(2) + Seq(1) + DstPAN(2) + DstAddr(2) + CmdID(1)
+        let frame: [u8; 8] = [0x03, 0x08, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07];
         pkt.copy_from_slice(&frame);
         pkt
     }
@@ -146,6 +147,21 @@ impl<'a, T: Instance> NrfMac<'a, T> {
         let rx_fut = self.collect_beacons(channel, &mut descriptors);
         let _ = select::select(timer_fut, rx_fut).await;
 
+        Ok(descriptors)
+    }
+
+    /// Fix 4: Scan a single channel passively (listen-only, no beacon request).
+    async fn scan_channel_passive(
+        &mut self,
+        channel: u8,
+        duration: u8,
+    ) -> Result<heapless::Vec<PanDescriptor, MAX_PAN_DESCRIPTORS>, MacError> {
+        self.set_channel(channel);
+        let delay_us = pib::scan_duration_us(duration);
+        let mut descriptors = heapless::Vec::new();
+        let timer_fut = Timer::after_micros(delay_us);
+        let rx_fut = self.collect_beacons(channel, &mut descriptors);
+        let _ = select::select(timer_fut, rx_fut).await;
         Ok(descriptors)
     }
 
@@ -233,8 +249,19 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         for channel in req.channel_mask.iter() {
             let ch = channel.number();
             match req.scan_type {
-                ScanType::Active | ScanType::Passive => {
+                ScanType::Active => {
                     match self.scan_channel_active(ch, req.scan_duration).await {
+                        Ok(pds) => {
+                            for pd in pds {
+                                let _ = pan_descriptors.push(pd);
+                            }
+                        }
+                        Err(e) => log::error!("[nRF MLME-SCAN] ch {ch}: {e:?}"),
+                    }
+                }
+                ScanType::Passive => {
+                    // Fix 4: Use passive scan for Passive scan type
+                    match self.scan_channel_passive(ch, req.scan_duration).await {
                         Ok(pds) => {
                             for pd in pds {
                                 let _ = pan_descriptors.push(pd);
@@ -293,9 +320,21 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
             .await
             .map_err(|_| MacError::RadioError)?;
 
-        // Wait for Association Response with timeout
-        let timeout_us = (pib::A_BASE_SUPERFRAME_DURATION as u64) * 32 * 1_000_000
-            / pib::SYMBOL_RATE_2_4GHZ as u64;
+        // Fix 11: Per IEEE 802.15.4 §5.3.2.1: wait, then poll with Data Request
+        Timer::after_millis(100).await; // Brief wait for coordinator to process
+
+        // Send Data Request to poll for indirect Association Response
+        let data_req = build_data_request(
+            self.next_dsn(),
+            &req.coord_address,
+            &self.extended_address,
+        );
+        let mut dreq_pkt = Packet::new();
+        dreq_pkt.copy_from_slice(&data_req);
+        let _ = self.radio.try_send(&mut dreq_pkt).await;
+
+        // Fix 10: Wait for Association Response with generous timeout
+        let timeout_us: u64 = 2_000_000; // 2 seconds
 
         let mut rx_pkt = Packet::new();
         let result = select::select(
@@ -434,10 +473,77 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         let mut pkt = Packet::new();
         pkt.copy_from_slice(&frame_buf[..len]);
 
-        self.radio
-            .try_send(&mut pkt)
-            .await
-            .map_err(|_| MacError::RadioError)?;
+        // Fix 6: Unslotted CSMA-CA (IEEE 802.15.4-2011 §5.1.1.4)
+        let max_backoffs: u8 = 4; // macMaxCsmaBackoffs
+        let min_be: u8 = 3;       // macMinBE
+        let max_be: u8 = 5;       // macMaxBE
+        let mut be = min_be;
+        let mut nb: u8 = 0;
+        let symbol_period_us: u64 = 16; // 2.4 GHz = 62.5 ksym/s = 16μs/symbol
+        let unit_backoff_symbols: u64 = 20; // aUnitBackoffPeriod
+
+        loop {
+            // Random backoff: 0 to 2^BE - 1 unit backoff periods
+            let max_val = (1u32 << be) - 1;
+            // Simple PRNG: use dsn as seed (not cryptographic, but adequate for CSMA)
+            let random = (self.dsn as u32).wrapping_mul(1103515245).wrapping_add(12345);
+            let backoff = (random % (max_val + 1)) as u64;
+            let delay_us = backoff * unit_backoff_symbols * symbol_period_us;
+            if delay_us > 0 {
+                Timer::after_micros(delay_us).await;
+            }
+
+            match self.radio.try_send(&mut pkt).await {
+                Ok(()) => break,
+                Err(_) => {
+                    nb += 1;
+                    be = core::cmp::min(be + 1, max_be);
+                    if nb > max_backoffs {
+                        return Err(MacError::ChannelAccessFailure);
+                    }
+                }
+            }
+        }
+
+        // Fix 7: If ACK requested, wait for it and retry on failure
+        if req.tx_options.ack_tx {
+            let ack_wait_us: u64 = 864; // macAckWaitDuration = 54 symbols * 16μs
+            let mut retries = 0u8;
+            let max_retries = self.max_frame_retries;
+            
+            loop {
+                // Listen for ACK
+                let mut ack_pkt = Packet::new();
+                let got_ack = match select::select(
+                    Timer::after_micros(ack_wait_us),
+                    self.radio.receive(&mut ack_pkt),
+                ).await {
+                    select::Either::Second(Ok(())) => {
+                        let ack_data = ack_pkt.as_ref();
+                        // ACK frame: FC(2) + Seq(1), frame_type = 2, seq must match
+                        ack_data.len() >= 3 && (ack_data[0] & 0x07) == 0x02 
+                            && ack_data[2] == frame_buf[2] // seq number match
+                    }
+                    _ => false,
+                };
+                
+                if got_ack {
+                    break;
+                }
+                
+                retries += 1;
+                if retries > max_retries {
+                    return Err(MacError::NoAck);
+                }
+                
+                // Retransmit (with CSMA-CA again)
+                pkt.copy_from_slice(&frame_buf[..len]);
+                // Simple retry — single CCA attempt for retransmission
+                if self.radio.try_send(&mut pkt).await.is_err() {
+                    continue; // channel busy, try again
+                }
+            }
+        }
 
         Ok(McpsDataConfirm {
             msdu_handle,
@@ -448,10 +554,10 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
         let mut rx_pkt = Packet::new();
         loop {
-            self.radio
-                .receive(&mut rx_pkt)
-                .await
-                .map_err(|_| MacError::RadioError)?;
+            // Fix 1: CRC failure should not kill receive loop
+            if self.radio.receive(&mut rx_pkt).await.is_err() {
+                continue; // CRC failure or radio error — discard and keep listening
+            }
 
             let data = rx_pkt.as_ref();
             if data.len() < 5 {
@@ -466,6 +572,17 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                 continue;
             }
 
+            // Fix 8: Generate ACK if requested (bit 5 of FC)
+            let ack_requested = (fc >> 5) & 1 != 0;
+            if ack_requested {
+                let seq = data[2];
+                let mut ack_pkt = Packet::new();
+                // ACK frame: FC=0x0002 (type=2, no fields), seq number
+                ack_pkt.copy_from_slice(&[0x02, 0x00, seq]);
+                // Best-effort ACK — don't fail the receive if ACK TX fails
+                let _ = self.radio.try_send(&mut ack_pkt).await;
+            }
+
             let header_len = 3 + addressing_size(fc);
             if data.len() <= header_len {
                 continue;
@@ -475,6 +592,27 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                 .unwrap_or(MacAddress::Short(PanId(0), ShortAddress(0)));
             let dst = parse_dest_address(data, fc)
                 .unwrap_or(MacAddress::Short(PanId(0), ShortAddress(0)));
+
+            // Fix 5: Software address filtering — only accept frames for us
+            if !self.promiscuous {
+                match &dst {
+                    MacAddress::Short(pan, addr) => {
+                        // Accept: our PAN or broadcast PAN, AND our address or broadcast
+                        let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
+                        let addr_ok = addr.0 == self.short_address.0 || addr.0 == 0xFFFF;
+                        if !pan_ok || !addr_ok {
+                            continue;
+                        }
+                    }
+                    MacAddress::Extended(pan, addr) => {
+                        let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
+                        let addr_ok = *addr == self.extended_address;
+                        if !pan_ok || !addr_ok {
+                            continue;
+                        }
+                    }
+                }
+            }
 
             let payload_data = &data[header_len..];
             if let Some(mac_frame) = MacFrame::from_slice(payload_data) {
@@ -662,6 +800,7 @@ fn parse_zigbee_beacon(data: &[u8]) -> ZigbeeBeaconPayload {
 }
 
 /// Build an Association Request MAC command frame.
+/// Fix 3: Use PAN ID compression to avoid missing Source PAN ID field
 fn build_association_request(
     seq: u8,
     coord: &MacAddress,
@@ -670,7 +809,8 @@ fn build_association_request(
 ) -> heapless::Vec<u8, 32> {
     let mut frame = heapless::Vec::new();
     // FC: MAC command, ack req, PAN ID compress, dst=short, src=extended
-    let _ = frame.extend_from_slice(&[0x23, 0xC8, seq]);
+    // 0xC863: type=3(cmd), ack_req=1, pan_compress=1, dst_mode=2(short), src_mode=3(ext)
+    let _ = frame.extend_from_slice(&[0x63, 0xC8, seq]);
     let dst_pan = coord.pan_id();
     let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
     match coord {
@@ -684,6 +824,30 @@ fn build_association_request(
     let _ = frame.extend_from_slice(own_extended);
     let _ = frame.push(0x01); // Association Request command ID
     let _ = frame.push(cap.to_byte());
+    frame
+}
+
+/// Fix 11: Build a MAC Data Request command frame for indirect frame retrieval.
+fn build_data_request(
+    seq: u8,
+    coord: &MacAddress,
+    own_extended: &IeeeAddress,
+) -> heapless::Vec<u8, 24> {
+    let mut frame = heapless::Vec::new();
+    // FC: MAC command, ack req, PAN compress, dst=short, src=extended
+    let _ = frame.extend_from_slice(&[0x63, 0xC8, seq]);
+    let dst_pan = coord.pan_id();
+    let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
+    match coord {
+        MacAddress::Short(_, addr) => {
+            let _ = frame.extend_from_slice(&addr.0.to_le_bytes());
+        }
+        MacAddress::Extended(_, addr) => {
+            let _ = frame.extend_from_slice(addr);
+        }
+    }
+    let _ = frame.extend_from_slice(own_extended);
+    let _ = frame.push(0x04); // Data Request command ID
     frame
 }
 

@@ -338,9 +338,9 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     }
                 };
 
-                // Replay protection
+                // Replay protection — check BEFORE decrypt (don't commit yet)
                 if !nwk
-                    .security_mut()
+                    .security()
                     .check_frame_counter(&sec_hdr.source_address, sec_hdr.frame_counter)
                 {
                     log::warn!("[NWK] Frame counter replay detected");
@@ -359,6 +359,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     &sec_hdr,
                 ) {
                     Some(plaintext) => {
+                        // MIC verified — NOW commit frame counter
+                        nwk.security_mut().commit_frame_counter(
+                            &sec_hdr.source_address,
+                            sec_hdr.frame_counter,
+                        );
                         len = plaintext.len().min(128);
                         buf[..len].copy_from_slice(&plaintext[..len]);
                     }
@@ -378,6 +383,9 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
         let (dst, src, nwk_security, buf, len) = nwk_indication;
 
+        // APS decryption buffer (for APS-secured frames like Transport Key)
+        let mut aps_decrypt_buf = zigbee_aps::apsde::ApsFrameBuffer::new();
+
         // APS layer: parse APS header
         let aps_indication = self.bdb.zdo_mut().aps_mut().process_incoming_aps_frame(
             &buf[..len],
@@ -385,6 +393,7 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             dst,
             indication.lqi,
             nwk_security,
+            &mut aps_decrypt_buf,
         )?;
 
         // Route by destination endpoint
@@ -413,6 +422,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     e,
                 ),
             }
+
+            // After ZDO processes Mgmt_Leave_req, execute the actual leave
+            if cluster_id == 0x0034 {
+                log::info!("[Runtime] Executing NLME-LEAVE after Mgmt_Leave response sent");
+                let _ = self.bdb.zdo_mut().aps_mut().nwk_mut().nlme_leave(false).await;
+                return Some(event_loop::StackEvent::Left);
+            }
+
+            // Send pending APS ACK if any (ZDO frames may have ack_request set)
+            let _ = self.bdb.zdo_mut().aps_mut().send_pending_aps_ack().await;
+
             return None;
         }
 
@@ -604,8 +624,8 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         cr.cluster.attributes(),
                         &req,
                     );
-                    let mut payload_buf = [0u8; 200];
-                    let payload_len = response.serialize(&mut payload_buf);
+                    let mut payload_buf = [0u8; 220];
+                    let payload_len = response.serialize(&mut payload_buf).min(payload_buf.len());
                     self.queue_global_response(
                         src_addr,
                         aps_indication.src_endpoint,
@@ -851,9 +871,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
             // Send cluster-specific response if the cluster produced one
             if let Some(resp) = response_payload {
+                // Determine the response command ID.
+                // For most clusters, the response uses the same cmd_id.
+                // Exceptions per ZCL spec:
+                // - Identify Query (0x01) → IdentifyQueryResponse (0x00)
+                let response_cmd_id = match (cluster_id, cmd_id) {
+                    (0x0003, 0x01) => 0x00, // Identify Query → IdentifyQueryResponse
+                    _ => cmd_id,
+                };
                 let mut frame = ZclFrame::new_cluster_specific(
                     zcl_frame.header.seq_number,
-                    CommandId(cmd_id),
+                    CommandId(response_cmd_id),
                     ClusterDirection::ServerToClient,
                     true,
                 );
