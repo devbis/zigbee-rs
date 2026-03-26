@@ -392,37 +392,70 @@ impl Default for ApsSecurity {
     }
 }
 
-// ── AES-128-CCM* implementation (placeholder) ───────────────────
+// ── AES-128-CCM* implementation ──────────────────────────────────
+// Uses RustCrypto `aes` + `ccm` crates — pure Rust, #![no_std], no alloc.
+// APS uses Security Level 5: ENC-MIC-32 (M=4 byte MIC, L=2).
+
+use aes::Aes128;
+use ccm::aead::AeadInPlace;
+use ccm::aead::generic_array::GenericArray;
+use ccm::consts::{U4, U13};
+use ccm::{Ccm, KeyInit};
+
+type ApsCcm = Ccm<Aes128, U4, U13>;
 
 /// AES-128-CCM* encrypt for APS frames (M=4, 4-byte MIC).
 fn aps_aes_ccm_encrypt(
-    _key: &AesKey,
-    _nonce: &[u8; 13],
-    _aad: &[u8],
+    key: &AesKey,
+    nonce: &[u8; 13],
+    aad: &[u8],
     plaintext: &[u8],
 ) -> Option<heapless::Vec<u8, 128>> {
-    // TODO: implement using `aes` + `ccm` crates
-    // For now, pass-through (no encryption) to enable stack testing
+    let cipher = ApsCcm::new(GenericArray::from_slice(key));
+    let nonce = GenericArray::from_slice(nonce);
+
+    let mut buf = [0u8; 120];
+    if plaintext.len() > buf.len() {
+        return None;
+    }
+    buf[..plaintext.len()].copy_from_slice(plaintext);
+
+    let tag = cipher
+        .encrypt_in_place_detached(nonce, aad, &mut buf[..plaintext.len()])
+        .ok()?;
+
     let mut out = heapless::Vec::new();
-    out.extend_from_slice(plaintext).ok()?;
-    // Append placeholder 4-byte MIC
-    out.extend_from_slice(&[0u8; 4]).ok()?;
+    out.extend_from_slice(&buf[..plaintext.len()]).ok()?;
+    out.extend_from_slice(tag.as_slice()).ok()?;
     Some(out)
 }
 
 /// AES-128-CCM* decrypt for APS frames (M=4).
 fn aps_aes_ccm_decrypt(
-    _key: &AesKey,
-    _nonce: &[u8; 13],
-    _aad: &[u8],
-    ciphertext: &[u8],
+    key: &AesKey,
+    nonce: &[u8; 13],
+    aad: &[u8],
+    ciphertext_and_mic: &[u8],
 ) -> Option<heapless::Vec<u8, 128>> {
-    // TODO: implement using `aes` + `ccm` crates
-    if ciphertext.len() < 4 {
+    if ciphertext_and_mic.len() < 4 {
         return None;
     }
-    let mut out = heapless::Vec::new();
-    out.extend_from_slice(&ciphertext[..ciphertext.len() - 4])
+    let cipher = ApsCcm::new(GenericArray::from_slice(key));
+    let nonce = GenericArray::from_slice(nonce);
+
+    let mic_start = ciphertext_and_mic.len() - 4;
+    let mut buf = [0u8; 120];
+    if mic_start > buf.len() {
+        return None;
+    }
+    buf[..mic_start].copy_from_slice(&ciphertext_and_mic[..mic_start]);
+    let tag = GenericArray::from_slice(&ciphertext_and_mic[mic_start..]);
+
+    cipher
+        .decrypt_in_place_detached(nonce, aad, &mut buf[..mic_start], tag)
         .ok()?;
+
+    let mut out = heapless::Vec::new();
+    out.extend_from_slice(&buf[..mic_start]).ok()?;
     Some(out)
 }

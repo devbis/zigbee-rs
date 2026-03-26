@@ -12,3 +12,5 @@ zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
 zigbee-nwk = { version = "0.1.0", path = "../zigbee-nwk" }
 zigbee-mac = { version = "0.1.0", path = "../zigbee-mac" }
 log = "0.4"
+aes = { version = "0.8", default-features = false }
+ccm = { version = "0.5", default-features = false }

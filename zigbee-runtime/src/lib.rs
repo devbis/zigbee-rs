@@ -821,6 +821,17 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                                 },
                             );
                         }
+                        0x05 if zcl_frame.payload.len() >= 2 => {
+                            // Add Group If Identifying — sync APS table
+                            let gid =
+                                u16::from_le_bytes([zcl_frame.payload[0], zcl_frame.payload[1]]);
+                            let _ = self.bdb.zdo_mut().aps_mut().apsme_add_group(
+                                &zigbee_aps::apsme::ApsmeAddGroupRequest {
+                                    group_address: gid,
+                                    endpoint: dst_ep,
+                                },
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -843,13 +854,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     for &b in &zcl_buf[..len] {
                         let _ = data.push(b);
                     }
-                    let _ = self.pending_responses.push(PendingZclResponse {
+                    if self.pending_responses.push(PendingZclResponse {
                         dst_addr: ShortAddress(src_addr),
                         dst_endpoint: aps_indication.src_endpoint,
                         src_endpoint: dst_ep,
                         cluster_id,
                         zcl_data: data,
-                    });
+                    }).is_err() {
+                        log::warn!("[ZCL] Response queue full");
+                    }
                 }
             } else if cluster_found && !zcl_frame.header.disable_default_response() {
                 // Only send Default Response for clusters we handle in ClusterRef.
@@ -864,6 +877,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     cmd_id,
                     cmd_status,
                 );
+            }
+
+            // Basic cluster factory reset → distinct event
+            if cluster_id == 0x0000 && cmd_id == 0x00 {
+                return Some(event_loop::StackEvent::FactoryResetRequested);
             }
 
             return Some(event_loop::StackEvent::CommandReceived {
@@ -914,13 +932,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             for &b in &zcl_buf[..len] {
                 let _ = data.push(b);
             }
-            let _ = self.pending_responses.push(PendingZclResponse {
+            if self.pending_responses.push(PendingZclResponse {
                 dst_addr,
                 dst_endpoint,
                 src_endpoint,
                 cluster_id,
                 zcl_data: data,
-            });
+            }).is_err() {
+                log::warn!("[ZCL] Response queue full");
+            }
         }
     }
 
@@ -948,13 +968,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             for &b in &zcl_buf[..len] {
                 let _ = data.push(b);
             }
-            let _ = self.pending_responses.push(PendingZclResponse {
+            if self.pending_responses.push(PendingZclResponse {
                 dst_addr,
                 dst_endpoint,
                 src_endpoint,
                 cluster_id,
                 zcl_data: data,
-            });
+            }).is_err() {
+                log::warn!("[ZCL] Response queue full");
+            }
         }
     }
 
@@ -982,13 +1004,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             for &b in &zcl_buf[..len] {
                 let _ = data.push(b);
             }
-            let _ = self.pending_responses.push(PendingZclResponse {
+            if self.pending_responses.push(PendingZclResponse {
                 dst_addr,
                 dst_endpoint,
                 src_endpoint,
                 cluster_id,
                 zcl_data: data,
-            });
+            }).is_err() {
+                log::warn!("[ZCL] Response queue full");
+            }
         }
     }
 
@@ -1114,13 +1138,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             for &b in &zcl_buf[..len] {
                 let _ = data.push(b);
             }
-            let _ = self.pending_responses.push(PendingZclResponse {
+            if self.pending_responses.push(PendingZclResponse {
                 dst_addr: ShortAddress(dst_addr),
                 dst_endpoint,
                 src_endpoint,
                 cluster_id,
                 zcl_data: data,
-            });
+            }).is_err() {
+                log::warn!("[ZCL] Response queue full");
+            }
         }
     }
 

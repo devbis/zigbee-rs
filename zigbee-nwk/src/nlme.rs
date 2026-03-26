@@ -442,15 +442,83 @@ impl<M: MacDriver> NwkLayer<M> {
             })
             .await;
 
-        // Wait for Rejoin Response
-        // TODO: implement proper timeout and response parsing
-        // For now, return the existing address
-        if self.nib.network_address.0 != 0xFFFF {
-            self.joined = true;
-            Ok(self.nib.network_address)
-        } else {
-            Err(NwkStatus::NoNetworks)
+        // Wait for Rejoin Response (NWK command 0x07).
+        // Try receiving up to MAX_RX_ATTEMPTS frames; give up if none is
+        // the expected rejoin response. This avoids embassy_time dependency.
+        const MAX_RX_ATTEMPTS: usize = 16;
+
+        for _ in 0..MAX_RX_ATTEMPTS {
+            let indication = match self.mac.mcps_data_indication().await {
+                Ok(ind) => ind,
+                Err(_) => continue,
+            };
+
+            let data = indication.payload.as_slice();
+            let (hdr, consumed) = match NwkHeader::parse(data) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            // Must be a NWK Command frame
+            if hdr.frame_control.frame_type != NwkFrameType::Command as u8 {
+                continue;
+            }
+
+            // Get command payload — may need NWK decryption
+            let cmd_data = if hdr.frame_control.security {
+                let after_hdr = &data[consumed..];
+                let (sec_hdr, sec_consumed) =
+                    match crate::security::NwkSecurityHeader::parse(after_hdr) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                let key = match self.security.key_by_seq(sec_hdr.key_seq_number) {
+                    Some(k) => k.key,
+                    None => continue,
+                };
+                let aad_len = consumed + sec_consumed;
+                match self.security.decrypt(
+                    &data[..aad_len],
+                    &after_hdr[sec_consumed..],
+                    &key,
+                    &sec_hdr,
+                ) {
+                    Some(v) => v,
+                    None => continue,
+                }
+            } else {
+                let payload = &data[consumed..];
+                let mut v = heapless::Vec::<u8, 128>::new();
+                let _ = v.extend_from_slice(payload);
+                v
+            };
+
+            // Rejoin Response: cmd_id(0x07) + new_short_addr(2) + rejoin_status(1)
+            if cmd_data.len() >= 4 && cmd_data[0] == 0x07 {
+                let new_addr = u16::from_le_bytes([cmd_data[1], cmd_data[2]]);
+                let rejoin_status = cmd_data[3];
+
+                if rejoin_status == 0x00 {
+                    log::info!("[NWK] Rejoin accepted, new addr=0x{:04X}", new_addr);
+                    self.nib.network_address = ShortAddress(new_addr);
+                    let _ = self
+                        .mac
+                        .mlme_set(
+                            PibAttribute::MacShortAddress,
+                            PibValue::ShortAddress(ShortAddress(new_addr)),
+                        )
+                        .await;
+                    self.joined = true;
+                    return Ok(ShortAddress(new_addr));
+                } else {
+                    log::warn!("[NWK] Rejoin rejected (status=0x{:02X})", rejoin_status);
+                    return Err(NwkStatus::NotPermitted);
+                }
+            }
         }
+
+        log::warn!("[NWK] Rejoin response not received after {} attempts", MAX_RX_ATTEMPTS);
+        Err(NwkStatus::NoNetworks)
     }
 
     // ── NLME-LEAVE ──────────────────────────────────────────

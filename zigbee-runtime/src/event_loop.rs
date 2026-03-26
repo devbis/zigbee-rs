@@ -92,6 +92,8 @@ pub enum StackEvent {
     OtaComplete,
     /// OTA: Upgrade failed.
     OtaFailed,
+    /// Basic cluster: factory reset requested by coordinator.
+    FactoryResetRequested,
 }
 
 /// Stack tick result — tells the application what to do next.

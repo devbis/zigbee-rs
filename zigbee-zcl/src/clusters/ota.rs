@@ -177,7 +177,8 @@ impl QueryNextImageResponse {
                 image_size: None,
             });
         }
-        if data.len() < 11 {
+        // Success response: status(1) + mfg(2) + type(2) + version(4) + size(4) = 13
+        if data.len() < 13 {
             return None;
         }
         Some(Self {
