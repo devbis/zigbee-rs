@@ -40,6 +40,7 @@ use zigbee_aps::ApsAddress;
 use zigbee_bdb::BdbLayer;
 use zigbee_mac::{MacDriver, MacError, McpsDataIndication};
 use zigbee_types::*;
+use zigbee_zcl::clusters::Cluster;
 use zigbee_zcl::foundation::reporting::ReportingEngine;
 use zigbee_zcl::frame::ZclFrame;
 use zigbee_zcl::{ClusterDirection, CommandId, ZclStatus};
@@ -72,6 +73,15 @@ pub struct EndpointConfig {
     pub device_version: u8,
     pub server_clusters: heapless::Vec<u16, MAX_CLUSTERS_PER_ENDPOINT>,
     pub client_clusters: heapless::Vec<u16, MAX_CLUSTERS_PER_ENDPOINT>,
+}
+
+/// A reference to a cluster instance, tagged with its endpoint.
+///
+/// Pass a slice of these to `tick()` and `process_incoming()` so the runtime
+/// can dispatch commands, read/write attributes, and send reports automatically.
+pub struct ClusterRef<'a> {
+    pub endpoint: u8,
+    pub cluster: &'a mut dyn Cluster,
 }
 
 /// User-initiated actions, triggered by button presses or application logic.
@@ -149,7 +159,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             .map_err(|_| event_loop::StartError::CommissioningFailed)?;
 
         let addr = self.bdb.zdo().nwk().nib().network_address.0;
+        let ieee = self.bdb.zdo().nwk().nib().ieee_address;
         log::info!("[Runtime] Joined network as 0x{:04X}", addr);
+
+        // Sync addresses into ZDO so interview responses are correct
+        self.bdb
+            .zdo_mut()
+            .set_local_nwk_addr(ShortAddress(addr));
+        self.bdb.zdo_mut().set_local_ieee_addr(ieee);
+
         Ok(addr)
     }
 
@@ -269,9 +287,15 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     ///
     /// MAC → NWK → APS → ZDO (endpoint 0) or ZCL (app endpoints).
     /// Async because ZDO handling sends responses directly through the stack.
+    ///
+    /// Pass registered cluster instances so the runtime can automatically:
+    /// - Handle Read/Write/Discover Attributes using cluster attribute stores
+    /// - Dispatch cluster-specific commands to `Cluster::handle_command()`
+    /// - Sync Groups cluster actions to the APS group table
     pub async fn process_incoming(
         &mut self,
         indication: &McpsDataIndication,
+        clusters: &mut [ClusterRef<'_>],
     ) -> Option<event_loop::StackEvent> {
         let mac_payload = indication.payload.as_slice();
 
@@ -534,21 +558,277 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             });
         }
 
-        // Cluster-specific or other global command
-        // Queue a ZCL Default Response if the sender wants one
-        if !zcl_frame.header.disable_default_response()
-            && zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::ClusterSpecific
+        // ── Read Attributes (0x00) ──────────────────────────────
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && cmd_id == 0x00
         {
-            self.queue_default_response(
-                ShortAddress(src_addr),
-                aps_indication.src_endpoint,
-                dst_ep,
+            if let Some(req) =
+                zigbee_zcl::foundation::read_attributes::ReadAttributesRequest::parse(
+                    zcl_frame.payload.as_slice(),
+                )
+            {
+                // Find the cluster's attribute store
+                if let Some(cr) = clusters
+                    .iter()
+                    .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
+                {
+                    let response = zigbee_zcl::foundation::read_attributes::process_read_dyn(
+                        cr.cluster.attributes(),
+                        &req,
+                    );
+                    let mut payload_buf = [0u8; 200];
+                    let payload_len = response.serialize(&mut payload_buf);
+                    self.queue_global_response(
+                        src_addr,
+                        aps_indication.src_endpoint,
+                        dst_ep,
+                        cluster_id,
+                        zcl_frame.header.seq_number,
+                        0x01, // Read Attributes Response
+                        &payload_buf[..payload_len],
+                    );
+                }
+            }
+            return Some(event_loop::StackEvent::CommandReceived {
+                src_addr,
+                endpoint: dst_ep,
                 cluster_id,
-                zcl_frame.header.seq_number,
-                ZclStatus::Success,
-            );
+                command_id: cmd_id,
+                seq_number: zcl_frame.header.seq_number,
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
+                    .unwrap_or_default(),
+            });
         }
 
+        // ── Write Attributes (0x02) ─────────────────────────────
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && cmd_id == 0x02
+        {
+            if let Some(req) =
+                zigbee_zcl::foundation::write_attributes::WriteAttributesRequest::parse(
+                    zcl_frame.payload.as_slice(),
+                )
+            {
+                if let Some(cr) = clusters
+                    .iter_mut()
+                    .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
+                {
+                    let response = zigbee_zcl::foundation::write_attributes::process_write_dyn(
+                        cr.cluster.attributes_mut(),
+                        &req,
+                    );
+                    let mut payload_buf = [0u8; 128];
+                    let payload_len = response.serialize(&mut payload_buf);
+                    self.queue_global_response(
+                        src_addr,
+                        aps_indication.src_endpoint,
+                        dst_ep,
+                        cluster_id,
+                        zcl_frame.header.seq_number,
+                        0x04, // Write Attributes Response
+                        &payload_buf[..payload_len],
+                    );
+                }
+            }
+            return Some(event_loop::StackEvent::CommandReceived {
+                src_addr,
+                endpoint: dst_ep,
+                cluster_id,
+                command_id: cmd_id,
+                seq_number: zcl_frame.header.seq_number,
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
+                    .unwrap_or_default(),
+            });
+        }
+
+        // ── Write Attributes No Response (0x05) ─────────────────
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && cmd_id == 0x05
+        {
+            if let Some(req) =
+                zigbee_zcl::foundation::write_attributes::WriteAttributesRequest::parse(
+                    zcl_frame.payload.as_slice(),
+                )
+            {
+                if let Some(cr) = clusters
+                    .iter_mut()
+                    .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
+                {
+                    let _ = zigbee_zcl::foundation::write_attributes::process_write_dyn(
+                        cr.cluster.attributes_mut(),
+                        &req,
+                    );
+                    // No response sent for 0x05
+                }
+            }
+            return Some(event_loop::StackEvent::CommandReceived {
+                src_addr,
+                endpoint: dst_ep,
+                cluster_id,
+                command_id: cmd_id,
+                seq_number: zcl_frame.header.seq_number,
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
+                    .unwrap_or_default(),
+            });
+        }
+
+        // ── Discover Attributes (0x0C) ──────────────────────────
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && cmd_id == 0x0C
+        {
+            if let Some(req) = zigbee_zcl::foundation::discover::DiscoverAttributesRequest::parse(
+                zcl_frame.payload.as_slice(),
+            ) {
+                if let Some(cr) = clusters
+                    .iter()
+                    .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
+                {
+                    let response = zigbee_zcl::foundation::discover::process_discover_dyn(
+                        cr.cluster.attributes(),
+                        &req,
+                    );
+                    let mut payload_buf = [0u8; 128];
+                    let payload_len = response.serialize(&mut payload_buf);
+                    self.queue_global_response(
+                        src_addr,
+                        aps_indication.src_endpoint,
+                        dst_ep,
+                        cluster_id,
+                        zcl_frame.header.seq_number,
+                        0x0D, // Discover Attributes Response
+                        &payload_buf[..payload_len],
+                    );
+                }
+            }
+            return Some(event_loop::StackEvent::CommandReceived {
+                src_addr,
+                endpoint: dst_ep,
+                cluster_id,
+                command_id: cmd_id,
+                seq_number: zcl_frame.header.seq_number,
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
+                    .unwrap_or_default(),
+            });
+        }
+
+        // ── Cluster-specific command dispatch ────────────────────
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::ClusterSpecific {
+            let mut cmd_status = ZclStatus::Success;
+            let mut response_payload: Option<heapless::Vec<u8, 64>> = None;
+
+            if let Some(cr) = clusters
+                .iter_mut()
+                .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
+            {
+                match cr.cluster.handle_command(CommandId(cmd_id), zcl_frame.payload.as_slice()) {
+                    Ok(resp) => {
+                        response_payload = if resp.is_empty() { None } else { Some(resp) };
+                    }
+                    Err(status) => {
+                        cmd_status = status;
+                    }
+                }
+
+                // Groups cluster → APS group table bridge
+                if cluster_id == 0x0004 {
+                    // Parse group action from command ID and sync to APS table.
+                    // Can't use GroupsCluster::take_action() through trait object,
+                    // so we infer the action from the ZCL command directly.
+                    match cmd_id {
+                        0x00 => {
+                            // Add Group — group_id is first 2 bytes of payload
+                            if zcl_frame.payload.len() >= 2 {
+                                let gid = u16::from_le_bytes([
+                                    zcl_frame.payload[0],
+                                    zcl_frame.payload[1],
+                                ]);
+                                let _ = self
+                                    .bdb
+                                    .zdo_mut()
+                                    .aps_mut()
+                                    .apsme_add_group(&zigbee_aps::apsme::ApsmeAddGroupRequest {
+                                        group_address: gid,
+                                        endpoint: dst_ep,
+                                    });
+                            }
+                        }
+                        0x03 => {
+                            // Remove Group — group_id is first 2 bytes
+                            if zcl_frame.payload.len() >= 2 {
+                                let gid = u16::from_le_bytes([
+                                    zcl_frame.payload[0],
+                                    zcl_frame.payload[1],
+                                ]);
+                                let _ = self.bdb.zdo_mut().aps_mut().apsme_remove_group(
+                                    &zigbee_aps::apsme::ApsmeRemoveGroupRequest {
+                                        group_address: gid,
+                                        endpoint: dst_ep,
+                                    },
+                                );
+                            }
+                        }
+                        0x04 => {
+                            // Remove All Groups
+                            let _ = self.bdb.zdo_mut().aps_mut().apsme_remove_all_groups(
+                                &zigbee_aps::apsme::ApsmeRemoveAllGroupsRequest {
+                                    endpoint: dst_ep,
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Send cluster-specific response if the cluster produced one
+            if let Some(resp) = response_payload {
+                let mut frame = ZclFrame::new_cluster_specific(
+                    zcl_frame.header.seq_number,
+                    CommandId(cmd_id),
+                    ClusterDirection::ServerToClient,
+                    true,
+                );
+                for &b in resp.as_slice() {
+                    let _ = frame.payload.push(b);
+                }
+                let mut zcl_buf = [0u8; 128];
+                if let Ok(len) = frame.serialize(&mut zcl_buf) {
+                    let mut data = heapless::Vec::new();
+                    for &b in &zcl_buf[..len] {
+                        let _ = data.push(b);
+                    }
+                    let _ = self.pending_responses.push(PendingZclResponse {
+                        dst_addr: ShortAddress(src_addr),
+                        dst_endpoint: aps_indication.src_endpoint,
+                        src_endpoint: dst_ep,
+                        cluster_id,
+                        zcl_data: data,
+                    });
+                }
+            } else if !zcl_frame.header.disable_default_response() {
+                // Send default response with the command status
+                self.queue_default_response(
+                    ShortAddress(src_addr),
+                    aps_indication.src_endpoint,
+                    dst_ep,
+                    cluster_id,
+                    zcl_frame.header.seq_number,
+                    cmd_status,
+                );
+            }
+
+            return Some(event_loop::StackEvent::CommandReceived {
+                src_addr,
+                endpoint: dst_ep,
+                cluster_id,
+                command_id: cmd_id,
+                seq_number: zcl_frame.header.seq_number,
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
+                    .unwrap_or_default(),
+            });
+        }
+
+        // Other global commands — pass through as event
         Some(event_loop::StackEvent::CommandReceived {
             src_addr,
             endpoint: dst_ep,

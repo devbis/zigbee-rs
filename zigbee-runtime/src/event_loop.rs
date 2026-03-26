@@ -114,36 +114,26 @@ pub enum StartError {
 /// The `elapsed_secs` parameter tells the reporting engine how much time
 /// has passed since the last tick. Use the actual timer interval.
 ///
-/// For Embassy integration:
-/// ```rust,no_run,ignore
-/// #[embassy_executor::task]
-/// async fn zigbee_task(/* ... */) {
-///     loop {
-///         // Use select to multiplex receive + periodic tick
-///         match select(device.receive(), Timer::after(Duration::from_secs(10))).await {
-///             Either::First(Ok(frame)) => {
-///                 device.process_incoming(&frame);
-///             }
-///             Either::Second(_) => {
-///                 device.tick(10).await;
-///             }
-///             _ => {}
-///         }
-///     }
-/// }
-/// ```
+/// Pass registered cluster instances so the runtime can automatically
+/// send attribute reports when they are due.
 pub async fn stack_tick<M: MacDriver>(
     device: &mut crate::ZigbeeDevice<M>,
     elapsed_secs: u16,
+    clusters: &mut [crate::ClusterRef<'_>],
 ) -> TickResult {
-    device.tick(elapsed_secs).await
+    device.tick(elapsed_secs, clusters).await
 }
 
 impl<M: MacDriver> crate::ZigbeeDevice<M> {
-    /// Tick the Zigbee stack — process pending actions and reporting.
+    /// Tick the Zigbee stack — process pending actions, send reports.
     ///
     /// Call this periodically. `elapsed_secs` is the time since the last tick.
-    pub async fn tick(&mut self, elapsed_secs: u16) -> TickResult {
+    /// Pass registered cluster instances for automatic attribute reporting.
+    pub async fn tick(
+        &mut self,
+        elapsed_secs: u16,
+        clusters: &mut [crate::ClusterRef<'_>],
+    ) -> TickResult {
         // Phase 1: Handle pending user actions
         if let Some(action) = self.pending_action.take() {
             return self.handle_action(action).await;
@@ -170,7 +160,15 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
         // Phase 4: Tick the reporting engine timers
         self.reporting.tick(elapsed_secs);
 
-        // Phase 5: Power management
+        // Phase 5: Check and send due attribute reports for each cluster
+        for cr in clusters.iter() {
+            let ep = cr.endpoint;
+            let cid = cr.cluster.cluster_id().0;
+            self.check_and_send_cluster_reports(ep, cid, cr.cluster.attributes())
+                .await;
+        }
+
+        // Phase 6: Power management
         // (Currently returns StayAwake for AlwaysOn devices)
 
         TickResult::Idle

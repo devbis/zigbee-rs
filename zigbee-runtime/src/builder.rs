@@ -113,7 +113,43 @@ impl<M: MacDriver> DeviceBuilder<M> {
         // Construct the layer stack: MAC → NWK → APS → ZDO → BDB
         let nwk = NwkLayer::new(self.mac, self.device_type);
         let aps = ApsLayer::new(nwk);
-        let zdo = ZdoLayer::new(aps);
+        let mut zdo = ZdoLayer::new(aps);
+
+        // Register application endpoints into ZDO so that
+        // Simple_Desc_req, Active_EP_req, Match_Desc_req return correct data.
+        for ep in &self.endpoints {
+            let mut input_clusters = heapless::Vec::new();
+            for &c in &ep.server_clusters {
+                let _ = input_clusters.push(c);
+            }
+            let mut output_clusters = heapless::Vec::new();
+            for &c in &ep.client_clusters {
+                let _ = output_clusters.push(c);
+            }
+            let desc = zigbee_zdo::descriptors::SimpleDescriptor {
+                endpoint: ep.endpoint,
+                profile_id: ep.profile_id,
+                device_id: ep.device_id,
+                device_version: ep.device_version,
+                input_clusters,
+                output_clusters,
+            };
+            let _ = zdo.register_endpoint(desc);
+        }
+
+        // Set IEEE address from MAC layer — deferred to start() since mlme_get is async.
+        // For now, leave as default; it will be updated after join.
+
+        // Set node/power descriptors based on device type
+        let mut node_desc = zigbee_zdo::descriptors::NodeDescriptor::default();
+        node_desc.logical_type = match self.device_type {
+            DeviceType::Coordinator => zigbee_zdo::descriptors::LogicalType::Coordinator,
+            DeviceType::Router => zigbee_zdo::descriptors::LogicalType::Router,
+            DeviceType::EndDevice => zigbee_zdo::descriptors::LogicalType::EndDevice,
+        };
+        zdo.set_node_descriptor(node_desc);
+        zdo.set_power_descriptor(zigbee_zdo::descriptors::PowerDescriptor::default());
+
         let bdb = BdbLayer::new(zdo);
 
         ZigbeeDevice {
