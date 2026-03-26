@@ -37,6 +37,8 @@ pub struct NetworkDescriptor {
     pub lqi: u8,
     /// Short address of the beacon sender (coordinator or router)
     pub router_address: ShortAddress,
+    /// Network depth of the beacon sender (from Zigbee beacon payload)
+    pub depth: u8,
 }
 
 impl From<&PanDescriptor> for NetworkDescriptor {
@@ -59,6 +61,7 @@ impl From<&PanDescriptor> for NetworkDescriptor {
             update_id: pd.zigbee_beacon.update_id,
             lqi: pd.lqi,
             router_address,
+            depth: pd.zigbee_beacon.device_depth,
         }
     }
 }
@@ -324,8 +327,8 @@ impl<M: MacDriver> NwkLayer<M> {
             self.nib.ieee_address = addr;
         }
 
-        // Set depth (coordinator depth + 1)
-        self.nib.depth = 1; // Simplified — real depth comes from beacon
+        // Set depth from beacon's device_depth + 1 (our depth is one hop deeper than parent)
+        self.nib.depth = network.depth.saturating_add(1);
 
         // Update MAC PIB
         let _ = self
@@ -361,7 +364,7 @@ impl<M: MacDriver> NwkLayer<M> {
             relationship: Relationship::Parent,
             lqi: network.lqi,
             outgoing_cost: 1,
-            depth: 0,
+            depth: network.depth,
             permit_joining: network.permit_joining,
             age: 0,
             extended_pan_id: network.extended_pan_id,
@@ -547,6 +550,8 @@ impl<M: MacDriver> NwkLayer<M> {
                     self.nib.network_address = ShortAddress(new_addr);
                     // Refresh parent address to the sender of the rejoin response
                     self.nib.parent_address = hdr.src_addr;
+                    // Update depth from beacon (parent depth + 1)
+                    self.nib.depth = network.depth.saturating_add(1);
                     let _ = self
                         .mac
                         .mlme_set(
@@ -554,6 +559,29 @@ impl<M: MacDriver> NwkLayer<M> {
                             PibValue::ShortAddress(ShortAddress(new_addr)),
                         )
                         .await;
+                    // Update parent neighbor entry
+                    let parent_device_type =
+                        if hdr.src_addr == ShortAddress::COORDINATOR {
+                            NeighborDeviceType::Coordinator
+                        } else {
+                            NeighborDeviceType::Router
+                        };
+                    let parent_ieee = hdr.src_ieee.unwrap_or([0; 8]);
+                    let parent = NeighborEntry {
+                        ieee_address: parent_ieee,
+                        network_address: hdr.src_addr,
+                        device_type: parent_device_type,
+                        rx_on_when_idle: true,
+                        relationship: Relationship::Parent,
+                        lqi: network.lqi,
+                        outgoing_cost: 1,
+                        depth: network.depth,
+                        permit_joining: network.permit_joining,
+                        age: 0,
+                        extended_pan_id: network.extended_pan_id,
+                        active: true,
+                    };
+                    let _ = self.neighbors.add_or_update(parent);
                     self.joined = true;
                     return Ok(ShortAddress(new_addr));
                 } else {
