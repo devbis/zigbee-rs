@@ -48,6 +48,12 @@ impl<M: MacDriver> ZdoLayer<M> {
             return Ok(());
         }
 
+        // --- Check if this is a response to a pending client request ---
+        if self.deliver_response(cluster, tsn, payload) {
+            log::debug!("[ZDO] Delivered response cluster=0x{cluster:04X} tsn={tsn}");
+            return Ok(());
+        }
+
         // --- Build response in a stack buffer ---
         let mut rsp_buf = [0u8; 256];
         rsp_buf[0] = tsn; // echo TSN
@@ -111,11 +117,15 @@ impl<M: MacDriver> ZdoLayer<M> {
                 (crate::MGMT_LEAVE_RSP, 1 + n)
             }
             crate::MGMT_PERMIT_JOINING_REQ => {
-                let n = self.handle_mgmt_permit_joining_req(payload, &mut rsp_buf[1..])?;
+                let n = self
+                    .handle_mgmt_permit_joining_req(payload, &mut rsp_buf[1..])
+                    .await?;
                 (crate::MGMT_PERMIT_JOINING_RSP, 1 + n)
             }
             crate::MGMT_NWK_UPDATE_REQ => {
-                let n = self.handle_mgmt_nwk_update_req(payload, &mut rsp_buf[1..])?;
+                let n = self
+                    .handle_mgmt_nwk_update_req(payload, &mut rsp_buf[1..])
+                    .await?;
                 (crate::MGMT_NWK_UPDATE_RSP, 1 + n)
             }
 
@@ -488,39 +498,137 @@ impl<M: MacDriver> ZdoLayer<M> {
         Ok(1)
     }
 
-    fn handle_mgmt_permit_joining_req(
-        &self,
+    async fn handle_mgmt_permit_joining_req(
+        &mut self,
         payload: &[u8],
         rsp: &mut [u8],
     ) -> Result<usize, ZdoError> {
-        let _req = MgmtPermitJoiningReq::parse(payload)?;
-        // Cannot invoke nlme_permit_joining here (handler is &self, NWK op is async).
-        // Return NotSupported until async handler refactor or queue mechanism is added.
-        log::warn!("Mgmt_Permit_Joining_req: not yet wired to NWK (returning NotSupported)");
+        let req = MgmtPermitJoiningReq::parse(payload)?;
         if rsp.is_empty() {
             return Err(ZdoError::BufferTooSmall);
         }
-        rsp[0] = ZdpStatus::NotSupported as u8;
+        match self
+            .nwk_mut()
+            .nlme_permit_joining(req.permit_duration)
+            .await
+        {
+            Ok(()) => {
+                log::info!(
+                    "[ZDO] Mgmt_Permit_Joining_req: duration={} tc_significance={}",
+                    req.permit_duration,
+                    req.tc_significance,
+                );
+                rsp[0] = ZdpStatus::Success as u8;
+            }
+            Err(e) => {
+                log::warn!("[ZDO] Mgmt_Permit_Joining_req failed: {:?}", e,);
+                rsp[0] = ZdpStatus::NotSupported as u8;
+            }
+        }
         Ok(1)
     }
 
-    fn handle_mgmt_nwk_update_req(
-        &self,
+    async fn handle_mgmt_nwk_update_req(
+        &mut self,
         payload: &[u8],
         rsp: &mut [u8],
     ) -> Result<usize, ZdoError> {
-        let _req = MgmtNwkUpdateReq::parse(payload)?;
-        // ED scan / channel change / manager change not yet implemented.
-        // Return NotSupported instead of fake Success.
-        log::warn!("Mgmt_NWK_Update_req: not yet implemented (returning NotSupported)");
-        let rsp_data = MgmtNwkUpdateRsp {
-            status: ZdpStatus::NotSupported,
-            scanned_channels: 0,
-            total_transmissions: 0,
-            transmission_failures: 0,
-            energy_values: heapless::Vec::new(),
-        };
-        rsp_data.serialize(rsp)
+        let req = MgmtNwkUpdateReq::parse(payload)?;
+        match req {
+            MgmtNwkUpdateReq::EdScan {
+                scan_channels,
+                scan_duration,
+                scan_count,
+            } => {
+                log::info!(
+                    "[ZDO] Mgmt_NWK_Update: ED scan channels=0x{scan_channels:08X} duration={scan_duration} count={scan_count}"
+                );
+                // Perform ED scan (use first scan_count iteration, repeat is optional)
+                match self
+                    .nwk_mut()
+                    .nlme_ed_scan(zigbee_types::ChannelMask(scan_channels), scan_duration)
+                    .await
+                {
+                    Ok(result) => {
+                        let mut energy_values: heapless::Vec<u8, 16> = heapless::Vec::new();
+                        for ed in &result.energy_list {
+                            let _ = energy_values.push(ed.energy);
+                        }
+                        let rsp_data = MgmtNwkUpdateRsp {
+                            status: ZdpStatus::Success,
+                            scanned_channels: scan_channels,
+                            total_transmissions: 0,
+                            transmission_failures: 0,
+                            energy_values,
+                        };
+                        rsp_data.serialize(rsp)
+                    }
+                    Err(e) => {
+                        log::warn!("[ZDO] ED scan failed: {e:?}");
+                        let rsp_data = MgmtNwkUpdateRsp {
+                            status: ZdpStatus::NotSupported,
+                            scanned_channels: scan_channels,
+                            total_transmissions: 0,
+                            transmission_failures: 0,
+                            energy_values: heapless::Vec::new(),
+                        };
+                        rsp_data.serialize(rsp)
+                    }
+                }
+            }
+            MgmtNwkUpdateReq::ChannelChange {
+                scan_channels,
+                nwk_update_id,
+            } => {
+                // Find the single channel bit set in scan_channels
+                let channel = (0u8..=26).find(|&ch| scan_channels & (1 << ch) != 0);
+                if let Some(ch) = channel {
+                    log::info!(
+                        "[ZDO] Mgmt_NWK_Update: channel change to {ch} (update_id={nwk_update_id})"
+                    );
+                    match self.nwk_mut().nlme_set_channel(ch).await {
+                        Ok(()) => {
+                            self.nwk_mut().nib_mut().update_id = nwk_update_id;
+                            if rsp.is_empty() {
+                                return Err(ZdoError::BufferTooSmall);
+                            }
+                            rsp[0] = ZdpStatus::Success as u8;
+                            Ok(1)
+                        }
+                        Err(_) => {
+                            if rsp.is_empty() {
+                                return Err(ZdoError::BufferTooSmall);
+                            }
+                            rsp[0] = ZdpStatus::InvRequestType as u8;
+                            Ok(1)
+                        }
+                    }
+                } else {
+                    if rsp.is_empty() {
+                        return Err(ZdoError::BufferTooSmall);
+                    }
+                    rsp[0] = ZdpStatus::InvRequestType as u8;
+                    Ok(1)
+                }
+            }
+            MgmtNwkUpdateReq::ManagerChange {
+                nwk_update_id,
+                nwk_manager_addr,
+                ..
+            } => {
+                log::info!(
+                    "[ZDO] Mgmt_NWK_Update: manager change to 0x{:04X} (update_id={nwk_update_id})",
+                    nwk_manager_addr.0,
+                );
+                self.nwk_mut().nib_mut().nwk_manager_addr = nwk_manager_addr;
+                self.nwk_mut().nib_mut().update_id = nwk_update_id;
+                if rsp.is_empty() {
+                    return Err(ZdoError::BufferTooSmall);
+                }
+                rsp[0] = ZdpStatus::Success as u8;
+                Ok(1)
+            }
+        }
     }
 }
 

@@ -31,6 +31,8 @@ pub struct Nib {
     pub max_children: u8,
     /// Network update ID
     pub update_id: u8,
+    /// NWK manager address (for frequency agility)
+    pub nwk_manager_addr: ShortAddress,
 
     // ── Addressing ──────────────────────────────────────
     /// Own IEEE (extended) address
@@ -104,6 +106,7 @@ impl Nib {
             max_routers: 5,
             max_children: 20,
             update_id: 0,
+            nwk_manager_addr: ShortAddress::COORDINATOR,
             ieee_address: [0u8; 8],
             parent_address: ShortAddress(0xFFFF),
             address_assign: AddressAssignMethod::Stochastic,

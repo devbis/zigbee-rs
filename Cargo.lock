@@ -1807,6 +1807,7 @@ dependencies = [
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-types",
+ "zigbee-zcl",
  "zigbee-zdo",
 ]
 

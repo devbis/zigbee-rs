@@ -11,7 +11,7 @@ use crate::frames::{ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader};
 use crate::{ApsAddress, ApsAddressMode, ApsLayer, ApsStatus, ApsTxOptions, PendingApsAck};
 use zigbee_mac::MacDriver;
 use zigbee_nwk::NwkStatus;
-use zigbee_types::ShortAddress;
+use zigbee_types::{IeeeAddress, ShortAddress};
 
 // ── APSDE-DATA.request ──────────────────────────────────────────
 
@@ -242,14 +242,20 @@ impl<M: MacDriver> ApsLayer<M> {
             .await;
 
         match nwk_result {
-            Ok(_confirm) => Ok(ApsdeDataConfirm {
-                status: ApsStatus::Success,
-                dst_addr_mode: req.dst_addr_mode,
-                dst_address: req.dst_address,
-                dst_endpoint: req.dst_endpoint,
-                src_endpoint: req.src_endpoint,
-                aps_counter,
-            }),
+            Ok(_confirm) => {
+                // Register for ACK tracking if requested
+                if req.tx_options.ack_request {
+                    self.register_ack_pending(aps_counter, nwk_dst.0);
+                }
+                Ok(ApsdeDataConfirm {
+                    status: ApsStatus::Success,
+                    dst_addr_mode: req.dst_addr_mode,
+                    dst_address: req.dst_address,
+                    dst_endpoint: req.dst_endpoint,
+                    src_endpoint: req.src_endpoint,
+                    aps_counter,
+                })
+            }
             Err(nwk_err) => {
                 log::warn!("APSDE-DATA.request failed: NWK error {:?}", nwk_err);
                 let aps_err = match nwk_err {
@@ -395,8 +401,13 @@ impl<M: MacDriver> ApsLayer<M> {
                 }
             }
             ApsFrameType::Ack => {
-                // TODO: match APS ack to pending request
-                log::debug!("APS ACK received (counter={})", header.aps_counter);
+                // Match this ACK to a pending outbound request
+                if !self.confirm_ack(nwk_src.0, header.aps_counter) {
+                    log::debug!(
+                        "APS ACK received (counter={}) — no matching pending",
+                        header.aps_counter
+                    );
+                }
                 return None;
             }
             ApsFrameType::Command => {
@@ -502,21 +513,22 @@ impl<M: MacDriver> ApsLayer<M> {
         self.nwk_mut().nib_mut().active_key_seq_number = key_seq;
     }
 
-    /// Build and send an APSME-REQUEST-KEY to the Trust Center.
+    /// Build and send an APS command frame.
     ///
-    /// After receiving the NWK key via Transport-Key, the device must request
-    /// a unique TC link key. Z2M requires this within ~10s of joining.
-    pub async fn send_request_key(&mut self, tc_addr: ShortAddress) -> Result<(), ApsStatus> {
-        // Request-Key frame: APS command with key_type=0x04 (TC Link Key)
+    /// Common helper for APSME-TRANSPORT-KEY, REQUEST-KEY, SWITCH-KEY, VERIFY-KEY.
+    async fn send_aps_command(
+        &mut self,
+        dst: ShortAddress,
+        cmd_payload: &[u8],
+        secured: bool,
+    ) -> Result<(), ApsStatus> {
         let aps_counter = self.next_aps_counter();
-
-        // APS command header: frame_type=Command, no endpoints, no cluster/profile
         let aps_header = ApsHeader {
             frame_control: ApsFrameControl {
                 frame_type: ApsFrameType::Command as u8,
                 delivery_mode: ApsDeliveryMode::Unicast as u8,
                 ack_format: false,
-                security: false, // Request-Key is sent without APS security
+                security: secured,
                 ack_request: false,
                 extended_header: false,
             },
@@ -529,22 +541,93 @@ impl<M: MacDriver> ApsLayer<M> {
             extended_header: None,
         };
 
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; 80];
         let hdr_len = aps_header.serialize(&mut buf);
-
-        // APS command payload: cmd_id(1) + key_type(1)
-        buf[hdr_len] = crate::frames::ApsCommandId::RequestKey as u8; // 0x08
-        buf[hdr_len + 1] = 0x04; // key_type = TC Link Key
-        let total = hdr_len + 2;
-
-        log::info!("[APS] Sending APSME-REQUEST-KEY to TC 0x{:04X}", tc_addr.0);
+        let payload_len = cmd_payload.len();
+        if hdr_len + payload_len > buf.len() {
+            return Err(ApsStatus::IllegalRequest);
+        }
+        buf[hdr_len..hdr_len + payload_len].copy_from_slice(cmd_payload);
+        let total = hdr_len + payload_len;
 
         self.nwk
-            .nlde_data_request(tc_addr, 1, &buf[..total], true, false)
+            .nlde_data_request(dst, 1, &buf[..total], true, false)
             .await
-            .map_err(|_| ApsStatus::NoAck)?;
+            .map(|_| ())
+            .map_err(|_| ApsStatus::NoAck)
+    }
 
-        Ok(())
+    /// Build and send an APSME-REQUEST-KEY to the Trust Center.
+    ///
+    /// After receiving the NWK key via Transport-Key, the device must request
+    /// a unique TC link key. Z2M requires this within ~10s of joining.
+    pub async fn send_request_key(&mut self, tc_addr: ShortAddress) -> Result<(), ApsStatus> {
+        log::info!("[APS] Sending APSME-REQUEST-KEY to TC 0x{:04X}", tc_addr.0);
+        // APS command payload: cmd_id(1) + key_type(1)
+        let cmd_payload = [
+            crate::frames::ApsCommandId::RequestKey as u8, // 0x08
+            0x04,                                          // key_type = TC Link Key
+        ];
+        self.send_aps_command(tc_addr, &cmd_payload, false).await
+    }
+
+    /// Build and send an APSME-TRANSPORT-KEY command frame.
+    pub async fn send_transport_key(
+        &mut self,
+        dst: ShortAddress,
+        key_type: u8,
+        key: &[u8; 16],
+        key_seq_number: u8,
+        src_ieee: &IeeeAddress,
+    ) -> Result<(), ApsStatus> {
+        log::info!(
+            "[APS] Sending Transport-Key to 0x{:04X} type={key_type}",
+            dst.0
+        );
+        // cmd_id(1) + key_type(1) + key(16) + key_seq(1) + src_ieee(8)
+        let mut payload = [0u8; 27];
+        payload[0] = crate::frames::ApsCommandId::TransportKey as u8;
+        payload[1] = key_type;
+        payload[2..18].copy_from_slice(key);
+        payload[18] = key_seq_number;
+        payload[19..27].copy_from_slice(src_ieee);
+        self.send_aps_command(dst, &payload, true).await
+    }
+
+    /// Build and send an APSME-SWITCH-KEY command frame.
+    pub async fn send_switch_key(
+        &mut self,
+        dst: ShortAddress,
+        key_seq_number: u8,
+    ) -> Result<(), ApsStatus> {
+        log::info!(
+            "[APS] Sending Switch-Key to 0x{:04X} seq={key_seq_number}",
+            dst.0
+        );
+        // cmd_id(1) + key_seq(1)
+        let payload = [crate::frames::ApsCommandId::SwitchKey as u8, key_seq_number];
+        self.send_aps_command(dst, &payload, true).await
+    }
+
+    /// Build and send an APSME-VERIFY-KEY command frame.
+    pub async fn send_verify_key(
+        &mut self,
+        dst: ShortAddress,
+        src_ieee: &IeeeAddress,
+        key_type: u8,
+        hash: &[u8; 16],
+    ) -> Result<(), ApsStatus> {
+        log::info!(
+            "[APS] Sending Verify-Key to 0x{:04X} type={key_type}",
+            dst.0
+        );
+        // cmd_id(1) + src_ieee(8) + key_type(1) + hash(16)
+        let mut payload = [0u8; 26];
+        payload[0] = crate::frames::ApsCommandId::VerifyKey as u8;
+        payload[1..9].copy_from_slice(src_ieee);
+        payload[9] = key_type;
+        payload[10..26].copy_from_slice(hash);
+        self.send_aps_command(dst, &payload, true).await
     }
 
     /// Send a pending APS ACK if one is queued.

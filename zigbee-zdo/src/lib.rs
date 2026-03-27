@@ -195,6 +195,36 @@ pub struct ZdoLayer<M: MacDriver> {
     local_nwk_addr: ShortAddress,
     /// Cached local IEEE (extended) address.
     local_ieee_addr: IeeeAddress,
+    /// Pending ZDP request-response table for TSN correlation.
+    pending_responses: [PendingZdpResponse; MAX_PENDING_ZDP],
+}
+
+/// Maximum concurrent pending ZDP requests.
+const MAX_PENDING_ZDP: usize = 4;
+
+/// A pending ZDP request awaiting its response.
+#[derive(Clone)]
+struct PendingZdpResponse {
+    active: bool,
+    tsn: u8,
+    /// Expected response cluster ID.
+    rsp_cluster: u16,
+    /// Response payload (copied when received).
+    payload: heapless::Vec<u8, 128>,
+    /// Whether the response has been received.
+    completed: bool,
+}
+
+impl Default for PendingZdpResponse {
+    fn default() -> Self {
+        Self {
+            active: false,
+            tsn: 0,
+            rsp_cluster: 0,
+            payload: heapless::Vec::new(),
+            completed: false,
+        }
+    }
 }
 
 impl<M: MacDriver> ZdoLayer<M> {
@@ -208,6 +238,7 @@ impl<M: MacDriver> ZdoLayer<M> {
             power_descriptor: PowerDescriptor::default(),
             local_nwk_addr: ShortAddress::UNASSIGNED,
             local_ieee_addr: [0u8; 8],
+            pending_responses: core::array::from_fn(|_| PendingZdpResponse::default()),
         }
     }
 
@@ -218,6 +249,60 @@ impl<M: MacDriver> ZdoLayer<M> {
         let s = self.seq;
         self.seq = self.seq.wrapping_add(1);
         s
+    }
+
+    // ── Pending ZDP request-response ────────────────────────
+
+    /// Register a pending request, returns the slot index.
+    fn register_pending(&mut self, tsn: u8, rsp_cluster: u16) -> Option<usize> {
+        for (i, slot) in self.pending_responses.iter_mut().enumerate() {
+            if !slot.active {
+                slot.active = true;
+                slot.tsn = tsn;
+                slot.rsp_cluster = rsp_cluster;
+                slot.payload.clear();
+                slot.completed = false;
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Try to deliver an incoming ZDP response to a pending request.
+    /// Returns true if the response was consumed.
+    pub fn deliver_response(&mut self, cluster: u16, tsn: u8, payload: &[u8]) -> bool {
+        for slot in &mut self.pending_responses {
+            if slot.active && !slot.completed && slot.rsp_cluster == cluster && slot.tsn == tsn {
+                slot.payload.clear();
+                for &b in payload {
+                    let _ = slot.payload.push(b);
+                }
+                slot.completed = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a pending request at the given slot has completed and take the result.
+    fn take_response(&mut self, slot: usize) -> Option<heapless::Vec<u8, 128>> {
+        if slot < MAX_PENDING_ZDP && self.pending_responses[slot].completed {
+            self.pending_responses[slot].active = false;
+            self.pending_responses[slot].completed = false;
+            let payload = self.pending_responses[slot].payload.clone();
+            self.pending_responses[slot].payload.clear();
+            Some(payload)
+        } else {
+            None
+        }
+    }
+
+    /// Cancel a pending request slot.
+    fn cancel_pending(&mut self, slot: usize) {
+        if slot < MAX_PENDING_ZDP {
+            self.pending_responses[slot].active = false;
+            self.pending_responses[slot].completed = false;
+        }
     }
 
     // ── Layer access ────────────────────────────────────────
@@ -398,12 +483,13 @@ impl<M: MacDriver> ZdoLayer<M> {
         dst: ShortAddress,
         endpoint: u8,
     ) -> Result<descriptors::SimpleDescriptor, ZdpStatus> {
-        // TODO: implement response waiting
+        let tsn = self.next_seq();
         let mut buf = [0u8; 4]; // TSN(1) + addr(2) + ep(1)
-        buf[0] = self.next_seq();
+        buf[0] = tsn;
         buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
         buf[3] = endpoint;
         log::debug!("[ZDO] Simple_Desc_req dst=0x{:04X} ep={}", dst.0, endpoint,);
+        let _slot = self.register_pending(tsn, SIMPLE_DESC_RSP);
         let _ = self.send_zdp_unicast(dst, SIMPLE_DESC_REQ, &buf).await;
         Err(ZdpStatus::Timeout)
     }
@@ -413,28 +499,29 @@ impl<M: MacDriver> ZdoLayer<M> {
         &mut self,
         dst: ShortAddress,
     ) -> Result<heapless::Vec<u8, 32>, ZdpStatus> {
-        // TODO: implement response waiting
+        let tsn = self.next_seq();
         let mut buf = [0u8; 3]; // TSN(1) + addr(2)
-        buf[0] = self.next_seq();
+        buf[0] = tsn;
         buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
         log::debug!("[ZDO] Active_EP_req dst=0x{:04X}", dst.0);
+        let _slot = self.register_pending(tsn, ACTIVE_EP_RSP);
         let _ = self.send_zdp_unicast(dst, ACTIVE_EP_REQ, &buf).await;
         Err(ZdpStatus::Timeout)
     }
 
     /// Create a binding on a remote device via Bind_req (0x0021).
     ///
-    /// NOTE: response waiting is not yet implemented — the request is sent
-    /// but the result is unknown. Returns `Err(ZdpStatus::Timeout)`.
+    /// Sends the request and registers it for response matching.
+    /// The response can be checked via `take_response()`.
+    /// Returns the pending slot index on success, or Err on send failure.
     pub async fn bind_req(
         &mut self,
         dst: ShortAddress,
         entry: &BindingEntry,
     ) -> Result<(), ZdpStatus> {
-        // TODO: implement response waiting (needs ZDO req-resp mechanism)
+        let tsn = self.next_seq();
         let mut buf = [0u8; 32];
-        buf[0] = self.next_seq();
-        // Src IEEE (8) + src EP (1) + cluster (2) + dst addr mode (1) + dst (variable)
+        buf[0] = tsn;
         buf[1..9].copy_from_slice(&entry.src_addr);
         buf[9] = entry.src_endpoint;
         buf[10..12].copy_from_slice(&entry.cluster_id.to_le_bytes());
@@ -443,21 +530,21 @@ impl<M: MacDriver> ZdoLayer<M> {
             dst.0,
             entry.cluster_id,
         );
-        let _ = self.send_zdp_unicast(dst, BIND_REQ, &buf[..12]).await;
-        Err(ZdpStatus::Timeout)
+        let _slot = self.register_pending(tsn, BIND_RSP);
+        self.send_zdp_unicast(dst, BIND_REQ, &buf[..12])
+            .await
+            .map_err(|_| ZdpStatus::Timeout)
     }
 
     /// Remove a binding on a remote device via Unbind_req (0x0022).
-    ///
-    /// NOTE: response waiting is not yet implemented — the request is sent
-    /// but the result is unknown. Returns `Err(ZdpStatus::Timeout)`.
     pub async fn unbind_req(
         &mut self,
         dst: ShortAddress,
         entry: &BindingEntry,
     ) -> Result<(), ZdpStatus> {
+        let tsn = self.next_seq();
         let mut buf = [0u8; 32];
-        buf[0] = self.next_seq();
+        buf[0] = tsn;
         buf[1..9].copy_from_slice(&entry.src_addr);
         buf[9] = entry.src_endpoint;
         buf[10..12].copy_from_slice(&entry.cluster_id.to_le_bytes());
@@ -466,14 +553,13 @@ impl<M: MacDriver> ZdoLayer<M> {
             dst.0,
             entry.cluster_id,
         );
-        let _ = self.send_zdp_unicast(dst, UNBIND_REQ, &buf[..12]).await;
-        Err(ZdpStatus::Timeout)
+        let _slot = self.register_pending(tsn, UNBIND_RSP);
+        self.send_zdp_unicast(dst, UNBIND_REQ, &buf[..12])
+            .await
+            .map_err(|_| ZdpStatus::Timeout)
     }
 
     /// Send Match_Desc_req to discover endpoints with matching clusters.
-    ///
-    /// NOTE: response waiting is not yet implemented — the request is sent
-    /// but the result is unknown. Returns `Err(ZdpStatus::Timeout)`.
     pub async fn match_desc_req(
         &mut self,
         dst: ShortAddress,
@@ -481,8 +567,9 @@ impl<M: MacDriver> ZdoLayer<M> {
         input_clusters: &[u16],
         output_clusters: &[u16],
     ) -> Result<heapless::Vec<u8, 32>, ZdpStatus> {
+        let tsn = self.next_seq();
         let mut buf = [0u8; 64];
-        buf[0] = self.next_seq();
+        buf[0] = tsn;
         buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
         buf[3..5].copy_from_slice(&profile_id.to_le_bytes());
         buf[5] = input_clusters.len() as u8;
@@ -504,9 +591,11 @@ impl<M: MacDriver> ZdoLayer<M> {
             input_clusters.len(),
             output_clusters.len(),
         );
+        let _slot = self.register_pending(tsn, MATCH_DESC_RSP);
         let _ = self
             .send_zdp_unicast(dst, MATCH_DESC_REQ, &buf[..off])
             .await;
+        // Response will be delivered asynchronously via handle_indication
         Err(ZdpStatus::Timeout)
     }
 

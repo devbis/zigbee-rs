@@ -781,6 +781,39 @@ impl<M: MacDriver> NwkLayer<M> {
         Ok(())
     }
 
+    // ── NLME-ED-SCAN ───────────────────────────────────────────
+
+    /// Perform an energy-detection scan on the specified channels.
+    ///
+    /// Returns the scan result with energy readings per channel.
+    pub async fn nlme_ed_scan(
+        &mut self,
+        channel_mask: ChannelMask,
+        scan_duration: u8,
+    ) -> Result<MlmeScanConfirm, NwkStatus> {
+        self.mac
+            .mlme_scan(MlmeScanRequest {
+                scan_type: ScanType::Ed,
+                channel_mask,
+                scan_duration,
+            })
+            .await
+            .map_err(|_| NwkStatus::InvalidRequest)
+    }
+
+    // ── NLME-SET-CHANNEL ──────────────────────────────────────
+
+    /// Change the operating channel.
+    pub async fn nlme_set_channel(&mut self, channel: u8) -> Result<(), NwkStatus> {
+        self.mac
+            .mlme_set(PibAttribute::PhyCurrentChannel, PibValue::U8(channel))
+            .await
+            .map_err(|_| NwkStatus::InvalidRequest)?;
+        self.nib.logical_channel = channel;
+        log::info!("[NWK] Channel changed to {channel}");
+        Ok(())
+    }
+
     // ── NLME-RESET ──────────────────────────────────────────
 
     /// Reset the NWK layer to initial state.

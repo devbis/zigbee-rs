@@ -193,6 +193,16 @@ impl<M: MacDriver> NwkLayer<M> {
         self.neighbors.find_by_ieee(ieee).map(|e| e.network_address)
     }
 
+    /// Look up an IEEE address by short address from the neighbor table.
+    pub fn find_ieee_by_short(&self, short: ShortAddress) -> Option<IeeeAddress> {
+        for entry in self.neighbors.iter() {
+            if entry.network_address == short {
+                return Some(entry.ieee_address);
+            }
+        }
+        None
+    }
+
     /// Update or insert a neighbor entry when a Device_annce is received.
     /// This keeps the NWK address → IEEE address mapping current.
     pub fn update_neighbor_address(&mut self, nwk_addr: ShortAddress, ieee_addr: IeeeAddress) {

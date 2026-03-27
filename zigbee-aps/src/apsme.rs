@@ -290,8 +290,7 @@ impl<M: MacDriver> ApsLayer<M> {
 
     /// APSME-TRANSPORT-KEY.request — distribute a key.
     ///
-    /// Builds an APS Transport Key command frame and sends it secured
-    /// with the Trust Center link key (or NWK key for network key transport).
+    /// Stores the key locally and sends an APS Transport Key command frame.
     pub async fn apsme_transport_key(&mut self, req: &ApsmeTransportKeyRequest) -> ApsStatus {
         // Store the key locally
         match req.key_type {
@@ -313,50 +312,107 @@ impl<M: MacDriver> ApsLayer<M> {
             _ => {}
         }
 
-        // TODO: Build APS Transport Key command frame and send via APSDE.
-        // Key is stored locally above, but OTA frame is NOT sent to dst_address.
-        log::warn!(
-            "APSME-TRANSPORT-KEY: type={:?}, dst={:02X?}",
-            req.key_type,
-            req.dst_address
-        );
-        ApsStatus::Success
+        // Resolve destination short address from IEEE
+        let dst_short = match self.nwk.find_short_by_ieee(&req.dst_address) {
+            Some(addr) => addr,
+            None => {
+                log::warn!(
+                    "APSME-TRANSPORT-KEY: no short address for {:02X?}",
+                    req.dst_address
+                );
+                return ApsStatus::Success; // Key stored locally, but can't send OTA
+            }
+        };
+        let local_ieee = self.nwk.nib().ieee_address;
+        let key_type_byte = req.key_type as u8;
+        match self
+            .send_transport_key(dst_short, key_type_byte, &req.key, 0, &local_ieee)
+            .await
+        {
+            Ok(()) => ApsStatus::Success,
+            Err(e) => {
+                log::warn!("APSME-TRANSPORT-KEY: send failed: {e:?}");
+                ApsStatus::Success // Key stored locally even if OTA fails
+            }
+        }
     }
 
     /// APSME-REQUEST-KEY.request — request a key from the Trust Center.
-    ///
-    /// Not yet implemented — APS command frame construction required.
     pub async fn apsme_request_key(&mut self, req: &ApsmeRequestKeyRequest) -> ApsStatus {
-        log::warn!(
-            "APSME-REQUEST-KEY: not implemented (type={:?}, dst={:02X?})",
-            req.key_type,
-            req.dst_address
-        );
-        ApsStatus::IllegalRequest
+        let dst_short = match self.nwk.find_short_by_ieee(&req.dst_address) {
+            Some(addr) => addr,
+            None => {
+                log::warn!(
+                    "APSME-REQUEST-KEY: no short address for {:02X?}",
+                    req.dst_address
+                );
+                return ApsStatus::IllegalRequest;
+            }
+        };
+        match self.send_request_key(dst_short).await {
+            Ok(()) => ApsStatus::Success,
+            Err(e) => {
+                log::warn!("APSME-REQUEST-KEY: send failed: {e:?}");
+                ApsStatus::IllegalRequest
+            }
+        }
     }
 
     /// APSME-SWITCH-KEY.request — switch to a new active network key.
-    ///
-    /// Not yet implemented — APS command frame construction required.
     pub async fn apsme_switch_key(&mut self, req: &ApsmeSwitchKeyRequest) -> ApsStatus {
-        log::warn!(
-            "APSME-SWITCH-KEY: not implemented (seq={}, dst={:02X?})",
-            req.key_seq_number,
-            req.dst_address
-        );
-        ApsStatus::IllegalRequest
+        let dst_short = match self.nwk.find_short_by_ieee(&req.dst_address) {
+            Some(addr) => addr,
+            None => {
+                log::warn!(
+                    "APSME-SWITCH-KEY: no short address for {:02X?}",
+                    req.dst_address
+                );
+                return ApsStatus::IllegalRequest;
+            }
+        };
+        match self.send_switch_key(dst_short, req.key_seq_number).await {
+            Ok(()) => ApsStatus::Success,
+            Err(e) => {
+                log::warn!("APSME-SWITCH-KEY: send failed: {e:?}");
+                ApsStatus::IllegalRequest
+            }
+        }
     }
 
     /// APSME-VERIFY-KEY.request — initiate key verification with TC.
-    ///
-    /// Not yet implemented — APS command frame construction required.
     pub async fn apsme_verify_key(&mut self, req: &ApsmeVerifyKeyRequest) -> ApsStatus {
-        log::warn!(
-            "APSME-VERIFY-KEY: not implemented (type={:?}, dst={:02X?})",
-            req.key_type,
-            req.dst_address
-        );
-        ApsStatus::IllegalRequest
+        let dst_short = match self.nwk.find_short_by_ieee(&req.dst_address) {
+            Some(addr) => addr,
+            None => {
+                log::warn!(
+                    "APSME-VERIFY-KEY: no short address for {:02X?}",
+                    req.dst_address
+                );
+                return ApsStatus::IllegalRequest;
+            }
+        };
+        // Compute HMAC hash of the key for verification
+        // Simplified: use first 16 bytes of key as the hash placeholder
+        // Real implementation needs AES-MMO hash (HMAC-AES-128)
+        let hash = match self.security.find_key(&req.dst_address, req.key_type) {
+            Some(entry) => entry.key,
+            None => {
+                log::warn!("APSME-VERIFY-KEY: no key for {:02X?}", req.dst_address);
+                return ApsStatus::IllegalRequest;
+            }
+        };
+        let key_type_byte = req.key_type as u8;
+        let local_ieee = self.nwk.nib().ieee_address;
+        match self
+            .send_verify_key(dst_short, &local_ieee, key_type_byte, &hash)
+            .await
+        {
+            Ok(()) => ApsStatus::Success,
+            Err(e) => {
+                log::warn!("APSME-VERIFY-KEY: send failed: {e:?}");
+                ApsStatus::IllegalRequest
+            }
+        }
     }
 
     // ── APSME-GET / APSME-SET ───────────────────────────────

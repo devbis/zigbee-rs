@@ -28,9 +28,13 @@
 //! share the same application profile ID.
 
 use heapless::Vec;
+use zigbee_aps::apsde::ApsdeDataRequest;
 use zigbee_aps::binding::BindingEntry;
+use zigbee_aps::{ApsAddress, ApsAddressMode, ApsTxOptions};
 use zigbee_mac::MacDriver;
 use zigbee_types::ShortAddress;
+use zigbee_zcl::ClusterDirection;
+use zigbee_zcl::frame::{ZclFrameHeader, ZclFrameType};
 use zigbee_zdo::descriptors::SimpleDescriptor;
 
 use crate::attributes::BDB_MIN_COMMISSIONING_TIME;
@@ -137,27 +141,59 @@ impl<M: MacDriver> BdbLayer<M> {
     }
 
     /// Broadcast Identify Query and collect responding targets.
+    ///
+    /// Builds a real ZCL Identify Query frame and sends it via APS broadcast.
+    /// In the current cooperative async model, we send the broadcast and return
+    /// an empty list — responses will be collected by the ZCL layer as they
+    /// arrive and should be fed back via a target accumulation mechanism.
     async fn send_identify_query(&mut self) -> Result<Vec<IdentifyTarget, 8>, BdbStatus> {
-        // TODO: Build ZCL Identify Query frame:
-        //   Frame control: cluster-specific, client-to-server, disable default response
-        //   Seq number
-        //   Command ID: 0x01 (Identify Query)
-        // Send via APSDE-DATA.request to broadcast (0xFFFF), cluster 0x0003
-        //
-        // Then collect Identify Query Response frames for up to FB_WINDOW_SECONDS.
-        // Each response contains the target's short address.
-
         log::debug!(
             "[BDB:F&B] Broadcasting Identify Query (window={}s)",
             FB_WINDOW_SECONDS,
         );
 
-        // Placeholder: In a real implementation, we would:
-        // 1. Send the broadcast
-        // 2. Start a timer for FB_WINDOW_SECONDS
-        // 3. Collect responses as they arrive
-        // 4. Return the list of targets
-        let _ = (CMD_IDENTIFY_QUERY, CLUSTER_IDENTIFY);
+        // Build ZCL Identify Query frame:
+        // Frame control: cluster-specific, client-to-server, disable default response
+        let fc = ZclFrameHeader::build_frame_control(
+            ZclFrameType::ClusterSpecific,
+            false,
+            ClusterDirection::ClientToServer,
+            true,
+        );
+        let seq = self.zdo.next_seq();
+        // 3-byte ZCL header: FC(1) + SeqNum(1) + CmdId(1), no payload
+        let zcl_frame = [fc, seq, CMD_IDENTIFY_QUERY];
+
+        // Send via APSDE-DATA.request as broadcast to all RxOnWhenIdle devices
+        let req = ApsdeDataRequest {
+            dst_addr_mode: ApsAddressMode::Short,
+            dst_address: ApsAddress::Short(ShortAddress(0xFFFD)),
+            dst_endpoint: 0xFF, // broadcast to all endpoints
+            profile_id: 0x0104, // HA profile
+            cluster_id: CLUSTER_IDENTIFY,
+            src_endpoint: 0x01, // default endpoint
+            payload: &zcl_frame,
+            tx_options: ApsTxOptions::default(),
+            radius: 0,
+            alias_src_addr: None,
+            alias_seq: None,
+        };
+
+        match self.zdo.aps_mut().apsde_data_request(&req).await {
+            Ok(_) => {
+                log::debug!("[BDB:F&B] Identify Query broadcast sent");
+            }
+            Err(e) => {
+                log::warn!("[BDB:F&B] Identify Query broadcast failed: {:?}", e);
+                return Err(BdbStatus::NotPermitted);
+            }
+        }
+
+        // Responses arrive asynchronously via the ZCL Identify Query Response
+        // handler. In a real implementation, we'd wait for FB_WINDOW_SECONDS
+        // collecting targets. For now, return empty — the caller should retry
+        // or use an event-driven collection mechanism.
+        let _ = FB_WINDOW_SECONDS;
         Ok(Vec::new())
     }
 
@@ -193,7 +229,9 @@ impl<M: MacDriver> BdbLayer<M> {
             }
 
             // Match clusters and create bindings
-            bindings_created += self.match_and_bind(local_desc, &remote_desc, target.nwk_addr)?;
+            bindings_created += self
+                .match_and_bind(local_desc, &remote_desc, target.nwk_addr)
+                .await?;
         }
 
         Ok(bindings_created)
@@ -204,13 +242,18 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Creates bindings where:
     /// - Our **output** cluster matches their **input** cluster
     /// - Our **input** cluster matches their **output** cluster
-    fn match_and_bind(
+    async fn match_and_bind(
         &mut self,
         local: &SimpleDescriptor,
         remote: &SimpleDescriptor,
         remote_addr: ShortAddress,
     ) -> Result<usize, BdbStatus> {
         let our_ieee = self.zdo.nwk().nib().ieee_address;
+        let remote_ieee = self
+            .zdo
+            .nwk()
+            .find_ieee_by_short(remote_addr)
+            .unwrap_or_default();
         let mut count = 0;
 
         // Our output clusters → their input clusters (client → server binding)
@@ -220,11 +263,10 @@ impl<M: MacDriver> BdbLayer<M> {
                     our_ieee,
                     local.endpoint,
                     out_cluster,
-                    // TODO: resolve remote IEEE address from NWK addr
-                    [0u8; 8],
+                    remote_ieee,
                     remote.endpoint,
                 );
-                match self.create_binding(remote_addr, &entry) {
+                match self.create_binding(remote_addr, &entry).await {
                     Ok(()) => count += 1,
                     Err(BdbStatus::BindingTableFull) => return Err(BdbStatus::BindingTableFull),
                     Err(_) => {}
@@ -239,10 +281,10 @@ impl<M: MacDriver> BdbLayer<M> {
                     our_ieee,
                     local.endpoint,
                     in_cluster,
-                    [0u8; 8],
+                    remote_ieee,
                     remote.endpoint,
                 );
-                match self.create_binding(remote_addr, &entry) {
+                match self.create_binding(remote_addr, &entry).await {
                     Ok(()) => count += 1,
                     Err(BdbStatus::BindingTableFull) => return Err(BdbStatus::BindingTableFull),
                     Err(_) => {}
@@ -260,7 +302,7 @@ impl<M: MacDriver> BdbLayer<M> {
                         out_cluster,
                         self.attributes.commissioning_group_id,
                     );
-                    match self.create_binding(remote_addr, &entry) {
+                    match self.create_binding(remote_addr, &entry).await {
                         Ok(()) => count += 1,
                         Err(BdbStatus::BindingTableFull) => {
                             return Err(BdbStatus::BindingTableFull);
@@ -274,11 +316,11 @@ impl<M: MacDriver> BdbLayer<M> {
         Ok(count)
     }
 
-    /// Install a binding in the local APS binding table and optionally
-    /// send a ZDP Bind_req to the remote device.
-    fn create_binding(
+    /// Install a binding in the local APS binding table and send a
+    /// ZDP Bind_req to the remote device for bidirectional awareness.
+    async fn create_binding(
         &mut self,
-        _remote_addr: ShortAddress,
+        remote_addr: ShortAddress,
         entry: &BindingEntry,
     ) -> Result<(), BdbStatus> {
         // Add to local binding table
@@ -299,8 +341,14 @@ impl<M: MacDriver> BdbLayer<M> {
             entry.cluster_id,
         );
 
-        // TODO: send ZDP Bind_req to remote device so it also knows about
-        // the binding (for bidirectional communication).
+        // Send ZDP Bind_req to remote device (best-effort, don't fail on error)
+        if let Err(e) = self.zdo.bind_req(remote_addr, entry).await {
+            log::debug!(
+                "[BDB:F&B] Remote Bind_req to 0x{:04X} returned {:?} (local binding still valid)",
+                remote_addr.0,
+                e,
+            );
+        }
 
         Ok(())
     }

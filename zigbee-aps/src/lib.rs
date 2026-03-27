@@ -187,6 +187,9 @@ pub struct PendingApsAck {
 /// Maximum entries in APS duplicate rejection table
 const APS_DUP_TABLE_SIZE: usize = 16;
 
+/// Maximum entries in outbound APS ACK tracking table
+const APS_ACK_TABLE_SIZE: usize = 8;
+
 /// APS duplicate rejection entry
 #[derive(Debug, Clone, Copy)]
 struct ApsDuplicateEntry {
@@ -203,6 +206,33 @@ impl ApsDuplicateEntry {
             aps_counter: 0,
             age: 0,
             active: false,
+        }
+    }
+}
+
+/// Tracks an outbound APS frame that requested an ACK.
+#[derive(Debug, Clone, Copy)]
+struct PendingApsAckEntry {
+    /// Whether this slot is in use
+    active: bool,
+    /// APS counter of the sent frame
+    aps_counter: u8,
+    /// Destination short address
+    dst_addr: u16,
+    /// Whether an ACK has been received
+    confirmed: bool,
+    /// Remaining retries (decremented each timeout tick)
+    retries: u8,
+}
+
+impl PendingApsAckEntry {
+    const fn empty() -> Self {
+        Self {
+            active: false,
+            aps_counter: 0,
+            dst_addr: 0,
+            confirmed: false,
+            retries: 0,
         }
     }
 }
@@ -227,6 +257,8 @@ pub struct ApsLayer<M: MacDriver> {
     pending_aps_ack: Option<PendingApsAck>,
     /// APS duplicate rejection table
     dup_table: [ApsDuplicateEntry; APS_DUP_TABLE_SIZE],
+    /// Outbound APS ACK tracking (frames awaiting ACK confirmation)
+    ack_table: [PendingApsAckEntry; APS_ACK_TABLE_SIZE],
 }
 
 impl<M: MacDriver> ApsLayer<M> {
@@ -241,6 +273,7 @@ impl<M: MacDriver> ApsLayer<M> {
             aps_counter: 0,
             pending_aps_ack: None,
             dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
+            ack_table: [PendingApsAckEntry::empty(); APS_ACK_TABLE_SIZE],
         }
     }
 
@@ -293,6 +326,75 @@ impl<M: MacDriver> ApsLayer<M> {
                 entry.age = entry.age.saturating_add(1);
                 if entry.age >= timeout {
                     entry.active = false;
+                }
+            }
+        }
+    }
+
+    /// Register an outbound frame for ACK tracking.
+    /// Returns the slot index, or None if the table is full.
+    pub fn register_ack_pending(&mut self, aps_counter: u8, dst_addr: u16) -> Option<usize> {
+        for (i, entry) in self.ack_table.iter_mut().enumerate() {
+            if !entry.active {
+                *entry = PendingApsAckEntry {
+                    active: true,
+                    aps_counter,
+                    dst_addr,
+                    confirmed: false,
+                    retries: 3, // APS max retry count per spec
+                };
+                return Some(i);
+            }
+        }
+        log::warn!("[APS] ACK tracking table full, cannot track counter={aps_counter}");
+        None
+    }
+
+    /// Deliver an incoming APS ACK. Returns true if matched a pending request.
+    pub fn confirm_ack(&mut self, src_addr: u16, aps_counter: u8) -> bool {
+        for entry in self.ack_table.iter_mut() {
+            if entry.active
+                && entry.aps_counter == aps_counter
+                && entry.dst_addr == src_addr
+                && !entry.confirmed
+            {
+                entry.confirmed = true;
+                log::debug!(
+                    "[APS] ACK confirmed counter={} from 0x{:04X}",
+                    aps_counter,
+                    src_addr,
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a specific APS counter has been ACK'd. Clears the slot if confirmed.
+    pub fn take_ack_status(&mut self, aps_counter: u8) -> Option<bool> {
+        for entry in self.ack_table.iter_mut() {
+            if entry.active && entry.aps_counter == aps_counter {
+                let confirmed = entry.confirmed;
+                entry.active = false;
+                return Some(confirmed);
+            }
+        }
+        None
+    }
+
+    /// Clean up expired ACK entries (no retries left, not confirmed).
+    pub fn age_ack_table(&mut self) {
+        for entry in self.ack_table.iter_mut() {
+            if entry.active && !entry.confirmed {
+                if entry.retries == 0 {
+                    log::warn!(
+                        "[APS] ACK timeout counter={} dst=0x{:04X}",
+                        entry.aps_counter,
+                        entry.dst_addr,
+                    );
+                    entry.active = false;
+                } else {
+                    entry.retries = entry.retries.saturating_sub(1);
                 }
             }
         }
