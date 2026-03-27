@@ -45,6 +45,7 @@ use zigbee_zcl::foundation::reporting::ReportingEngine;
 use zigbee_zcl::frame::ZclFrame;
 use zigbee_zcl::{ClusterDirection, CommandId, ZclStatus};
 
+use crate::nv_storage::{NvItemId, NvStorage};
 use crate::power::PowerManager;
 
 /// A queued ZCL response to be sent in the next tick().
@@ -261,6 +262,126 @@ impl<M: MacDriver> ZigbeeDevice<M> {
     /// Whether this device is configured as a sleepy end device.
     pub fn is_sleepy(&self) -> bool {
         !matches!(self.power.mode(), power::PowerMode::AlwaysOn)
+    }
+
+    // ── NV Persistence ─────────────────────────────────────
+
+    /// Save critical network state to non-volatile storage.
+    ///
+    /// Call after: join, key update, bind/unbind, group changes, or before sleep.
+    pub fn save_state(&self, nv: &mut dyn NvStorage) {
+        let nib = self.bdb.zdo().nwk().nib();
+
+        // Network identity
+        let _ = nv.write(NvItemId::NwkPanId, &nib.pan_id.0.to_le_bytes());
+        let _ = nv.write(NvItemId::NwkChannel, &[nib.logical_channel]);
+        let _ = nv.write(NvItemId::NwkShortAddress, &nib.network_address.0.to_le_bytes());
+        let _ = nv.write(NvItemId::NwkExtendedPanId, &nib.extended_pan_id);
+        let _ = nv.write(NvItemId::NwkIeeeAddress, &nib.ieee_address);
+        let _ = nv.write(NvItemId::NwkDepth, &[nib.depth]);
+        let _ = nv.write(NvItemId::NwkParentAddress, &nib.parent_address.0.to_le_bytes());
+        let _ = nv.write(NvItemId::NwkUpdateId, &[nib.update_id]);
+
+        // NWK security — active key + frame counter
+        if let Some(key_entry) = self.bdb.zdo().nwk().security().active_key() {
+            let _ = nv.write(NvItemId::NwkKey, &key_entry.key);
+            let _ = nv.write(NvItemId::NwkKeySeqNum, &[key_entry.seq_number]);
+        }
+        let fc = nib.outgoing_frame_counter;
+        let _ = nv.write(NvItemId::NwkFrameCounter, &fc.to_le_bytes());
+
+        // BDB state
+        let on_network: u8 = if self.bdb.is_on_network() { 1 } else { 0 };
+        let _ = nv.write(NvItemId::BdbNodeIsOnNetwork, &[on_network]);
+
+        log::debug!("[NV] Saved network state (PAN=0x{:04X}, ch={}, addr=0x{:04X})",
+            nib.pan_id.0, nib.logical_channel, nib.network_address.0);
+    }
+
+    /// Restore network state from non-volatile storage.
+    ///
+    /// Call on startup before `start()`. If state is found, the device can
+    /// attempt rejoin instead of full commissioning.
+    /// Returns `true` if valid state was restored.
+    pub fn restore_state(&mut self, nv: &dyn NvStorage) -> bool {
+        let mut buf = [0u8; 16];
+
+        // Check if we have stored network state
+        let on_network = match nv.read(NvItemId::BdbNodeIsOnNetwork, &mut buf) {
+            Ok(1) => buf[0] != 0,
+            _ => return false,
+        };
+        if !on_network {
+            return false;
+        }
+
+        // Restore network identity
+        let pan_id = match nv.read(NvItemId::NwkPanId, &mut buf) {
+            Ok(2) => PanId(u16::from_le_bytes([buf[0], buf[1]])),
+            _ => return false,
+        };
+        let channel = match nv.read(NvItemId::NwkChannel, &mut buf) {
+            Ok(1) => buf[0],
+            _ => return false,
+        };
+        let short_addr = match nv.read(NvItemId::NwkShortAddress, &mut buf) {
+            Ok(2) => ShortAddress(u16::from_le_bytes([buf[0], buf[1]])),
+            _ => return false,
+        };
+        let mut epid = [0u8; 8];
+        if nv.read(NvItemId::NwkExtendedPanId, &mut epid).is_err() {
+            return false;
+        }
+        let depth = match nv.read(NvItemId::NwkDepth, &mut buf) {
+            Ok(1) => buf[0],
+            _ => 1,
+        };
+        let parent = match nv.read(NvItemId::NwkParentAddress, &mut buf) {
+            Ok(2) => ShortAddress(u16::from_le_bytes([buf[0], buf[1]])),
+            _ => ShortAddress(0x0000),
+        };
+        let update_id = match nv.read(NvItemId::NwkUpdateId, &mut buf) {
+            Ok(1) => buf[0],
+            _ => 0,
+        };
+
+        // Apply to NIB
+        {
+            let nib = self.bdb.zdo_mut().nwk_mut().nib_mut();
+            nib.pan_id = pan_id;
+            nib.logical_channel = channel;
+            nib.network_address = short_addr;
+            nib.extended_pan_id = epid;
+            nib.depth = depth;
+            nib.parent_address = parent;
+            nib.update_id = update_id;
+        }
+
+        // Restore NWK security key
+        let mut key_buf = [0u8; 16];
+        if let Ok(16) = nv.read(NvItemId::NwkKey, &mut key_buf) {
+            let seq = match nv.read(NvItemId::NwkKeySeqNum, &mut buf) {
+                Ok(1) => buf[0],
+                _ => 0,
+            };
+            let fc = match nv.read(NvItemId::NwkFrameCounter, &mut buf) {
+                Ok(4) => u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+                _ => 0,
+            };
+            self.bdb.zdo_mut().nwk_mut().security_mut()
+                .set_network_key(key_buf, seq);
+            // Restore frame counter in NIB
+            self.bdb.zdo_mut().nwk_mut().nib_mut().outgoing_frame_counter = fc;
+        }
+
+        // Mark as on-network in BDB
+        self.bdb.attributes_mut().node_is_on_a_network = true;
+
+        log::info!(
+            "[NV] Restored network state (PAN=0x{:04X}, ch={}, addr=0x{:04X})",
+            pan_id.0, channel, short_addr.0
+        );
+        true
     }
 
     // ── MAC proxy ───────────────────────────────────────────
