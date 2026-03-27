@@ -1,4 +1,5 @@
-//! Discover Attributes command (0x0C) and Discover Attributes Response (0x0D).
+//! Discover Attributes (0x0C/0x0D) and Discover Commands Received/Generated
+//! (0x11/0x12/0x13/0x14).
 
 use crate::AttributeId;
 use crate::data_types::ZclDataType;
@@ -108,5 +109,95 @@ pub fn process_discover_dyn(
     DiscoverAttributesResponse {
         complete,
         attributes,
+    }
+}
+
+// ── Discover Commands Received (0x11/0x12) & Generated (0x13/0x14) ──
+
+/// Maximum command IDs returned in a single discover-commands response.
+pub const MAX_DISCOVER_COMMANDS: usize = 32;
+
+/// Discover Commands Received/Generated request (0x11 / 0x13) — same wire format.
+#[derive(Debug, Clone)]
+pub struct DiscoverCommandsRequest {
+    /// First command identifier to return.
+    pub start_command_id: u8,
+    /// Maximum number of command IDs to return.
+    pub max_results: u8,
+}
+
+/// Discover Commands Received/Generated response (0x12 / 0x14) — same wire format.
+#[derive(Debug, Clone)]
+pub struct DiscoverCommandsResponse {
+    /// `true` when the entire command list has been returned.
+    pub complete: bool,
+    /// The matching command identifiers.
+    pub command_ids: heapless::Vec<u8, MAX_DISCOVER_COMMANDS>,
+}
+
+impl DiscoverCommandsRequest {
+    /// Parse from ZCL payload (1 byte start_id + 1 byte max).
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 2 {
+            return None;
+        }
+        Some(Self {
+            start_command_id: data[0],
+            max_results: data[1],
+        })
+    }
+
+    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        if buf.len() < 2 {
+            return 0;
+        }
+        buf[0] = self.start_command_id;
+        buf[1] = self.max_results;
+        2
+    }
+}
+
+impl DiscoverCommandsResponse {
+    /// Serialize the response: 1 byte complete flag + N command-ID bytes.
+    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        buf[0] = u8::from(self.complete);
+        let mut pos = 1;
+        for &id in &self.command_ids {
+            if pos >= buf.len() {
+                break;
+            }
+            buf[pos] = id;
+            pos += 1;
+        }
+        pos
+    }
+}
+
+/// Filter `all_commands` starting from `start_id`, returning up to `max_results`.
+pub fn process_discover_commands(
+    all_commands: &[u8],
+    start_id: u8,
+    max_results: u8,
+) -> DiscoverCommandsResponse {
+    let max = max_results as usize;
+    let mut command_ids: heapless::Vec<u8, MAX_DISCOVER_COMMANDS> = heapless::Vec::new();
+    let mut complete = true;
+
+    for &id in all_commands {
+        if id >= start_id {
+            if command_ids.len() >= max {
+                complete = false;
+                break;
+            }
+            let _ = command_ids.push(id);
+        }
+    }
+
+    DiscoverCommandsResponse {
+        complete,
+        command_ids,
     }
 }

@@ -367,4 +367,9 @@ impl Cluster for ColorControlCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[0x00, 0x03, 0x06, 0x07, 0x0A, 0x40, 0x44, 0x47, 0x4B, 0x4C])
+            .unwrap_or_default()
+    }
 }

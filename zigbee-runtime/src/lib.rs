@@ -849,6 +849,84 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             });
         }
 
+        // ── Discover Commands Received (0x11) ───────────────────
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && cmd_id == 0x11
+        {
+            if let Some(req) = zigbee_zcl::foundation::discover::DiscoverCommandsRequest::parse(
+                zcl_frame.payload.as_slice(),
+            ) && let Some(cr) = clusters
+                .iter()
+                .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
+            {
+                let all = cr.cluster.received_commands();
+                let response = zigbee_zcl::foundation::discover::process_discover_commands(
+                    &all,
+                    req.start_command_id,
+                    req.max_results,
+                );
+                let mut payload_buf = [0u8; 64];
+                let payload_len = response.serialize(&mut payload_buf);
+                self.queue_global_response(
+                    src_addr,
+                    aps_indication.src_endpoint,
+                    dst_ep,
+                    cluster_id,
+                    zcl_frame.header.seq_number,
+                    0x12, // Discover Commands Received Response
+                    &payload_buf[..payload_len],
+                );
+            }
+            return Some(event_loop::StackEvent::CommandReceived {
+                src_addr,
+                endpoint: dst_ep,
+                cluster_id,
+                command_id: cmd_id,
+                seq_number: zcl_frame.header.seq_number,
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
+                    .unwrap_or_default(),
+            });
+        }
+
+        // ── Discover Commands Generated (0x13) ──────────────────
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && cmd_id == 0x13
+        {
+            if let Some(req) = zigbee_zcl::foundation::discover::DiscoverCommandsRequest::parse(
+                zcl_frame.payload.as_slice(),
+            ) && let Some(cr) = clusters
+                .iter()
+                .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
+            {
+                let all = cr.cluster.generated_commands();
+                let response = zigbee_zcl::foundation::discover::process_discover_commands(
+                    &all,
+                    req.start_command_id,
+                    req.max_results,
+                );
+                let mut payload_buf = [0u8; 64];
+                let payload_len = response.serialize(&mut payload_buf);
+                self.queue_global_response(
+                    src_addr,
+                    aps_indication.src_endpoint,
+                    dst_ep,
+                    cluster_id,
+                    zcl_frame.header.seq_number,
+                    0x14, // Discover Commands Generated Response
+                    &payload_buf[..payload_len],
+                );
+            }
+            return Some(event_loop::StackEvent::CommandReceived {
+                src_addr,
+                endpoint: dst_ep,
+                cluster_id,
+                command_id: cmd_id,
+                seq_number: zcl_frame.header.seq_number,
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
+                    .unwrap_or_default(),
+            });
+        }
+
         // ── Cluster-specific command dispatch ────────────────────
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::ClusterSpecific {
             let mut cmd_status = ZclStatus::Success;

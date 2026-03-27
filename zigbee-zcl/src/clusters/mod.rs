@@ -72,6 +72,16 @@ pub trait Cluster {
 
     /// Mutable access to the cluster's attribute store.
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess;
+
+    /// Command IDs this cluster can receive (client→server).
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::new()
+    }
+
+    /// Command IDs this cluster can generate (server→client).
+    fn generated_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::new()
+    }
 }
 
 /// Type-erased read access to an attribute store.

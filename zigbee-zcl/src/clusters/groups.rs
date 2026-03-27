@@ -237,4 +237,12 @@ impl Cluster for GroupsCluster {
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
         &mut self.store
     }
+
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[0x00, 0x01, 0x02, 0x03, 0x04, 0x05]).unwrap_or_default()
+    }
+
+    fn generated_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[0x00, 0x01, 0x02, 0x03]).unwrap_or_default()
+    }
 }
