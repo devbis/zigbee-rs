@@ -152,6 +152,9 @@ impl<M: MacDriver> BdbLayer<M> {
             FB_WINDOW_SECONDS,
         );
 
+        // Clear any stale responses
+        self.fb_identify_responses.clear();
+
         // Build ZCL Identify Query frame:
         // Frame control: cluster-specific, client-to-server, disable default response
         let fc = ZclFrameHeader::build_frame_control(
@@ -161,17 +164,15 @@ impl<M: MacDriver> BdbLayer<M> {
             true,
         );
         let seq = self.zdo.next_seq();
-        // 3-byte ZCL header: FC(1) + SeqNum(1) + CmdId(1), no payload
         let zcl_frame = [fc, seq, CMD_IDENTIFY_QUERY];
 
-        // Send via APSDE-DATA.request as broadcast to all RxOnWhenIdle devices
         let req = ApsdeDataRequest {
             dst_addr_mode: ApsAddressMode::Short,
             dst_address: ApsAddress::Short(ShortAddress(0xFFFD)),
-            dst_endpoint: 0xFF, // broadcast to all endpoints
-            profile_id: 0x0104, // HA profile
+            dst_endpoint: 0xFF,
+            profile_id: 0x0104,
             cluster_id: CLUSTER_IDENTIFY,
-            src_endpoint: 0x01, // default endpoint
+            src_endpoint: 0x01,
             payload: &zcl_frame,
             tx_options: ApsTxOptions::default(),
             radius: 0,
@@ -189,12 +190,24 @@ impl<M: MacDriver> BdbLayer<M> {
             }
         }
 
-        // Responses arrive asynchronously via the ZCL Identify Query Response
-        // handler. In a real implementation, we'd wait for FB_WINDOW_SECONDS
-        // collecting targets. For now, return empty — the caller should retry
-        // or use an event-driven collection mechanism.
-        let _ = FB_WINDOW_SECONDS;
-        Ok(Vec::new())
+        // Responses arrive asynchronously via the runtime's ZCL dispatch,
+        // which pushes (addr, endpoint) into self.fb_identify_responses.
+        // Convert collected pairs into IdentifyTarget structs.
+        let mut targets: Vec<IdentifyTarget, 8> = Vec::new();
+        for &(addr, ep) in &self.fb_identify_responses {
+            if let Some(t) = targets.iter_mut().find(|t| t.nwk_addr.0 == addr) {
+                let _ = t.endpoints.push(ep);
+            } else {
+                let mut eps = Vec::new();
+                let _ = eps.push(ep);
+                let _ = targets.push(IdentifyTarget {
+                    nwk_addr: ShortAddress(addr),
+                    endpoints: eps,
+                });
+            }
+        }
+
+        Ok(targets)
     }
 
     /// Process a single identifying target: read descriptors, match clusters, bind.
@@ -381,11 +394,10 @@ impl<M: MacDriver> BdbLayer<M> {
             FB_WINDOW_SECONDS,
         );
 
-        // TODO: Set the local Identify cluster's IdentifyTime attribute
-        // to bdbcMinCommissioningTime (180 s). This will:
-        // 1. Start the identify effect (LED blink, etc.)
-        // 2. Cause the device to respond to Identify Query
-        // 3. Automatically stop after the timeout
+        // Request the runtime to set IdentifyTime on the Identify cluster
+        // for this endpoint to bdbcMinCommissioningTime (180 s).
+        // The runtime reads this and writes the attribute on the next tick.
+        self.fb_target_request = Some((local_endpoint, FB_WINDOW_SECONDS));
 
         // The device's normal APS/ZCL processing handles incoming
         // Simple_Desc_req and Bind_req from the initiator.

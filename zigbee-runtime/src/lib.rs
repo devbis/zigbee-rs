@@ -929,6 +929,23 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
         // ── Cluster-specific command dispatch ────────────────────
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::ClusterSpecific {
+            // Intercept Identify Query Response (cluster 0x0003, cmd 0x00, server→client)
+            // for F&B initiator target collection
+            if cluster_id == 0x0003
+                && cmd_id == 0x00
+                && zcl_frame.header.direction() == ClusterDirection::ServerToClient
+            {
+                let _ = self
+                    .bdb
+                    .fb_identify_responses
+                    .push((src_addr, aps_indication.src_endpoint));
+                log::debug!(
+                    "[Runtime] F&B: Identify Query Response from 0x{:04X} ep {}",
+                    src_addr,
+                    aps_indication.src_endpoint,
+                );
+            }
+
             let mut cmd_status = ZclStatus::Success;
             let mut response_payload: Option<heapless::Vec<u8, 64>> = None;
             let mut cluster_found = false;

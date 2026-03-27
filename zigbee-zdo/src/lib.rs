@@ -624,6 +624,17 @@ impl<M: MacDriver> ZdoLayer<M> {
             .map_err(ZdpStatus::from)
     }
 
+    /// Rejoin an existing network using the stored NWK key (wraps NLME-JOIN with Rejoin method).
+    pub async fn nlme_rejoin(
+        &mut self,
+        network: &NetworkDescriptor,
+    ) -> Result<ShortAddress, ZdpStatus> {
+        self.nwk_mut()
+            .nlme_join(network, JoinMethod::Rejoin)
+            .await
+            .map_err(ZdpStatus::from)
+    }
+
     /// Form a new network — coordinator only (wraps NLME-NETWORK-FORMATION).
     pub async fn nlme_network_formation(
         &mut self,
