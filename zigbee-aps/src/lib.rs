@@ -36,6 +36,7 @@ pub mod aib;
 pub mod apsde;
 pub mod apsme;
 pub mod binding;
+pub mod fragment;
 pub mod frames;
 pub mod group;
 pub mod security;
@@ -211,7 +212,7 @@ impl ApsDuplicateEntry {
 }
 
 /// Tracks an outbound APS frame that requested an ACK.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PendingApsAckEntry {
     /// Whether this slot is in use
     active: bool,
@@ -223,18 +224,8 @@ struct PendingApsAckEntry {
     confirmed: bool,
     /// Remaining retries (decremented each timeout tick)
     retries: u8,
-}
-
-impl PendingApsAckEntry {
-    const fn empty() -> Self {
-        Self {
-            active: false,
-            aps_counter: 0,
-            dst_addr: 0,
-            confirmed: false,
-            retries: 0,
-        }
-    }
+    /// Original serialized frame bytes for retransmission
+    original_frame: heapless::Vec<u8, 128>,
 }
 
 /// The APS layer — owns the NWK layer and all APS state.
@@ -258,7 +249,9 @@ pub struct ApsLayer<M: MacDriver> {
     /// APS duplicate rejection table
     dup_table: [ApsDuplicateEntry; APS_DUP_TABLE_SIZE],
     /// Outbound APS ACK tracking (frames awaiting ACK confirmation)
-    ack_table: [PendingApsAckEntry; APS_ACK_TABLE_SIZE],
+    ack_table: heapless::Vec<PendingApsAckEntry, APS_ACK_TABLE_SIZE>,
+    /// Fragment reassembly buffer for incoming fragmented frames
+    fragment_rx: fragment::FragmentReassembly,
 }
 
 impl<M: MacDriver> ApsLayer<M> {
@@ -273,7 +266,8 @@ impl<M: MacDriver> ApsLayer<M> {
             aps_counter: 0,
             pending_aps_ack: None,
             dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
-            ack_table: [PendingApsAckEntry::empty(); APS_ACK_TABLE_SIZE],
+            ack_table: heapless::Vec::new(),
+            fragment_rx: fragment::FragmentReassembly::new(),
         }
     }
 
@@ -333,7 +327,13 @@ impl<M: MacDriver> ApsLayer<M> {
 
     /// Register an outbound frame for ACK tracking.
     /// Returns the slot index, or None if the table is full.
-    pub fn register_ack_pending(&mut self, aps_counter: u8, dst_addr: u16) -> Option<usize> {
+    pub fn register_ack_pending(
+        &mut self,
+        aps_counter: u8,
+        dst_addr: u16,
+        frame_bytes: &[u8],
+    ) -> Option<usize> {
+        // Try to find an inactive slot to reuse
         for (i, entry) in self.ack_table.iter_mut().enumerate() {
             if !entry.active {
                 *entry = PendingApsAckEntry {
@@ -341,10 +341,26 @@ impl<M: MacDriver> ApsLayer<M> {
                     aps_counter,
                     dst_addr,
                     confirmed: false,
-                    retries: 3, // APS max retry count per spec
+                    retries: 3,
+                    original_frame: heapless::Vec::new(),
                 };
+                let _ = entry.original_frame.extend_from_slice(frame_bytes);
                 return Some(i);
             }
+        }
+        // No inactive slot — try to push a new entry
+        let idx = self.ack_table.len();
+        let mut new_entry = PendingApsAckEntry {
+            active: true,
+            aps_counter,
+            dst_addr,
+            confirmed: false,
+            retries: 3,
+            original_frame: heapless::Vec::new(),
+        };
+        let _ = new_entry.original_frame.extend_from_slice(frame_bytes);
+        if self.ack_table.push(new_entry).is_ok() {
+            return Some(idx);
         }
         log::warn!("[APS] ACK tracking table full, cannot track counter={aps_counter}");
         None
@@ -382,8 +398,13 @@ impl<M: MacDriver> ApsLayer<M> {
         None
     }
 
-    /// Clean up expired ACK entries (no retries left, not confirmed).
-    pub fn age_ack_table(&mut self) {
+    /// Age the ACK table. Returns frames that need retransmission.
+    ///
+    /// When an unconfirmed entry still has retries, it decrements the retry
+    /// count and returns the original frame bytes for retransmission.
+    /// When retries are exhausted, the entry is deactivated.
+    pub fn age_ack_table(&mut self) -> heapless::Vec<heapless::Vec<u8, 128>, 4> {
+        let mut retransmit = heapless::Vec::<heapless::Vec<u8, 128>, 4>::new();
         for entry in self.ack_table.iter_mut() {
             if entry.active && !entry.confirmed {
                 if entry.retries == 0 {
@@ -395,9 +416,19 @@ impl<M: MacDriver> ApsLayer<M> {
                     entry.active = false;
                 } else {
                     entry.retries = entry.retries.saturating_sub(1);
+                    if !entry.original_frame.is_empty() {
+                        log::debug!(
+                            "[APS] Retransmit counter={} dst=0x{:04X} retries_left={}",
+                            entry.aps_counter,
+                            entry.dst_addr,
+                            entry.retries,
+                        );
+                        let _ = retransmit.push(entry.original_frame.clone());
+                    }
                 }
             }
         }
+        retransmit
     }
 
     /// Reference to the underlying NWK layer.
@@ -448,5 +479,15 @@ impl<M: MacDriver> ApsLayer<M> {
     /// Mutable reference to APS security state.
     pub fn security_mut(&mut self) -> &mut security::ApsSecurity {
         &mut self.security
+    }
+
+    /// Reference to the fragment reassembly buffer.
+    pub fn fragment_rx(&self) -> &fragment::FragmentReassembly {
+        &self.fragment_rx
+    }
+
+    /// Mutable reference to the fragment reassembly buffer.
+    pub fn fragment_rx_mut(&mut self) -> &mut fragment::FragmentReassembly {
+        &mut self.fragment_rx
     }
 }

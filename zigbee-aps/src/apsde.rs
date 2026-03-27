@@ -7,11 +7,18 @@
 //! - `APSDE-DATA.confirm`:    transmission result
 //! - `APSDE-DATA.indication`: received data delivered to upper layer
 
-use crate::frames::{ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader};
+use crate::frames::{
+    ApsDeliveryMode, ApsExtendedHeader, ApsFrameControl, ApsFrameType, ApsHeader, FRAG_FIRST,
+    FRAG_NONE, FRAG_SUBSEQUENT,
+};
 use crate::{ApsAddress, ApsAddressMode, ApsLayer, ApsStatus, ApsTxOptions, PendingApsAck};
 use zigbee_mac::MacDriver;
 use zigbee_nwk::NwkStatus;
 use zigbee_types::{IeeeAddress, ShortAddress};
+
+/// Maximum APS payload size (bytes) before fragmentation is required.
+/// Accounts for APS header + APS security overhead in the NWK frame.
+pub const APS_MAX_PAYLOAD: usize = 80;
 
 // ── APSDE-DATA.request ──────────────────────────────────────────
 
@@ -127,8 +134,8 @@ impl Default for ApsFrameBuffer {
 impl<M: MacDriver> ApsLayer<M> {
     /// APSDE-DATA.request — transmit application data through APS.
     ///
-    /// Builds an APS header, serializes it + payload into a NWK NSDU,
-    /// and calls `nlde_data_request` to send via the NWK layer.
+    /// Builds an APS header, optionally encrypts with a link key, fragments
+    /// if needed, serializes into NWK NSDUs, and calls `nlde_data_request`.
     pub async fn apsde_data_request(
         &mut self,
         req: &ApsdeDataRequest<'_>,
@@ -147,11 +154,9 @@ impl<M: MacDriver> ApsLayer<M> {
                     ApsAddress::Group(g) => g,
                     _ => return Err(ApsStatus::InvalidParameter),
                 };
-                // Group messages are broadcast at the NWK level
                 (ShortAddress(0xFFFF), ApsDeliveryMode::Group)
             }
             ApsAddressMode::Extended => {
-                // Resolve IEEE → short address via NWK neighbor table
                 let ieee = match req.dst_address {
                     ApsAddress::Extended(addr) => addr,
                     _ => return Err(ApsStatus::InvalidParameter),
@@ -162,7 +167,6 @@ impl<M: MacDriver> ApsLayer<M> {
                 }
             }
             ApsAddressMode::Indirect => {
-                // Look up binding table to find destinations
                 let ieee = self.nwk.nib().ieee_address;
                 let has_binding = self
                     .binding_table
@@ -172,23 +176,176 @@ impl<M: MacDriver> ApsLayer<M> {
                 if !has_binding {
                     return Err(ApsStatus::NoBoundDevice);
                 }
-                // Send to coordinator for indirect delivery
                 (ShortAddress::COORDINATOR, ApsDeliveryMode::Indirect)
             }
         };
 
-        // Allocate APS counter
-        let aps_counter = self.next_aps_counter();
+        let radius = if req.radius == 0 {
+            self.nwk.nib().max_depth.saturating_mul(2)
+        } else {
+            req.radius
+        };
 
-        // Build APS header
-        let aps_header = ApsHeader {
+        // APS-level encryption
+        if req.tx_options.security_enabled {
+            let dst_ieee = self.nwk.find_ieee_by_short(nwk_dst);
+            let link_key = if let Some(ref ieee) = dst_ieee {
+                if let Some(entry) = self.security.find_any_key(ieee) {
+                    Some(entry.key)
+                } else {
+                    Some(*self.security.default_tc_link_key())
+                }
+            } else {
+                Some(*self.security.default_tc_link_key())
+            };
+
+            if let Some(key) = link_key {
+                let src_ieee = self.nwk.nib().ieee_address;
+                let frame_counter = if let Some(ref ieee) = dst_ieee {
+                    self.security
+                        .next_frame_counter(ieee, crate::security::ApsKeyType::TrustCenterLinkKey)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let sec_hdr = crate::security::ApsSecurityHeader {
+                    security_control: crate::security::ApsSecurityHeader::APS_DEFAULT_EXT_NONCE,
+                    frame_counter,
+                    source_address: Some(src_ieee),
+                    key_seq_number: None,
+                };
+
+                let aps_counter = self.next_aps_counter();
+                let aps_header =
+                    self.build_data_header(delivery_mode, req, aps_counter, true, false);
+
+                // Serialize header for AAD
+                let mut aad_buf = [0u8; 32];
+                let hdr_len = aps_header.serialize(&mut aad_buf);
+                let sec_hdr_len = sec_hdr.serialize(&mut aad_buf[hdr_len..]);
+                let aad = &aad_buf[..hdr_len + sec_hdr_len];
+
+                if let Some(enc) = self.security.encrypt(aad, req.payload, &key, &sec_hdr) {
+                    let mut encrypted_buf = [0u8; 128];
+                    let mut offset = 0;
+                    let aps_hdr_len = aps_header.serialize(&mut encrypted_buf);
+                    offset += aps_hdr_len;
+                    let sec_len = sec_hdr.serialize(&mut encrypted_buf[offset..]);
+                    offset += sec_len;
+                    if offset + enc.len() > encrypted_buf.len() {
+                        return Err(ApsStatus::AsduTooLong);
+                    }
+                    encrypted_buf[offset..offset + enc.len()].copy_from_slice(&enc);
+                    let total = offset + enc.len();
+
+                    let nwk_result = self
+                        .nwk
+                        .nlde_data_request(
+                            nwk_dst,
+                            radius,
+                            &encrypted_buf[..total],
+                            req.tx_options.use_nwk_key,
+                            true,
+                        )
+                        .await;
+
+                    match nwk_result {
+                        Ok(_) => {
+                            if req.tx_options.ack_request {
+                                self.register_ack_pending(
+                                    aps_counter,
+                                    nwk_dst.0,
+                                    &encrypted_buf[..total],
+                                );
+                            }
+                            return Ok(ApsdeDataConfirm {
+                                status: ApsStatus::Success,
+                                dst_addr_mode: req.dst_addr_mode,
+                                dst_address: req.dst_address,
+                                dst_endpoint: req.dst_endpoint,
+                                src_endpoint: req.src_endpoint,
+                                aps_counter,
+                            });
+                        }
+                        Err(nwk_err) => {
+                            return Err(nwk_status_to_aps(nwk_err));
+                        }
+                    }
+                } else {
+                    log::warn!("[APS] APS encryption failed");
+                    return Err(ApsStatus::SecurityFail);
+                }
+            }
+        }
+
+        // Check if fragmentation is needed
+        if req.payload.len() > APS_MAX_PAYLOAD && req.tx_options.fragmentation_permitted {
+            return self
+                .send_fragmented(req, nwk_dst, delivery_mode, radius)
+                .await;
+        }
+
+        // Normal (non-encrypted, non-fragmented) send
+        let aps_counter = self.next_aps_counter();
+        let aps_header = self.build_data_header(delivery_mode, req, aps_counter, false, false);
+
+        let mut aps_buf = [0u8; 128];
+        let hdr_len = aps_header.serialize(&mut aps_buf);
+        let total_len = hdr_len + req.payload.len();
+        if total_len > aps_buf.len() {
+            return Err(ApsStatus::AsduTooLong);
+        }
+        aps_buf[hdr_len..total_len].copy_from_slice(req.payload);
+
+        let nwk_result = self
+            .nwk
+            .nlde_data_request(
+                nwk_dst,
+                radius,
+                &aps_buf[..total_len],
+                req.tx_options.use_nwk_key,
+                true,
+            )
+            .await;
+
+        match nwk_result {
+            Ok(_) => {
+                if req.tx_options.ack_request {
+                    self.register_ack_pending(aps_counter, nwk_dst.0, &aps_buf[..total_len]);
+                }
+                Ok(ApsdeDataConfirm {
+                    status: ApsStatus::Success,
+                    dst_addr_mode: req.dst_addr_mode,
+                    dst_address: req.dst_address,
+                    dst_endpoint: req.dst_endpoint,
+                    src_endpoint: req.src_endpoint,
+                    aps_counter,
+                })
+            }
+            Err(nwk_err) => {
+                log::warn!("APSDE-DATA.request failed: NWK error {:?}", nwk_err);
+                Err(nwk_status_to_aps(nwk_err))
+            }
+        }
+    }
+
+    /// Build a standard APS Data header.
+    fn build_data_header(
+        &self,
+        delivery_mode: ApsDeliveryMode,
+        req: &ApsdeDataRequest<'_>,
+        aps_counter: u8,
+        security: bool,
+        extended_header: bool,
+    ) -> ApsHeader {
+        ApsHeader {
             frame_control: ApsFrameControl {
                 frame_type: ApsFrameType::Data as u8,
                 delivery_mode: delivery_mode as u8,
                 ack_format: false,
-                security: req.tx_options.security_enabled,
+                security,
                 ack_request: req.tx_options.ack_request,
-                extended_header: false,
+                extended_header,
             },
             dst_endpoint: match delivery_mode {
                 ApsDeliveryMode::Unicast | ApsDeliveryMode::Broadcast => Some(req.dst_endpoint),
@@ -209,75 +366,113 @@ impl<M: MacDriver> ApsLayer<M> {
             src_endpoint: Some(req.src_endpoint),
             aps_counter,
             extended_header: None,
-        };
-
-        // Serialize APS frame into buffer
-        let mut aps_buf = [0u8; 128];
-        let hdr_len = aps_header.serialize(&mut aps_buf);
-
-        // Copy payload after header
-        let total_len = hdr_len + req.payload.len();
-        if total_len > aps_buf.len() {
-            return Err(ApsStatus::AsduTooLong);
         }
-        aps_buf[hdr_len..total_len].copy_from_slice(req.payload);
+    }
 
-        // Determine radius (0 = use NIB default, typically 2×max_depth)
-        let radius = if req.radius == 0 {
-            self.nwk.nib().max_depth.saturating_mul(2)
-        } else {
-            req.radius
-        };
+    /// Send a payload as multiple APS fragments.
+    async fn send_fragmented(
+        &mut self,
+        req: &ApsdeDataRequest<'_>,
+        nwk_dst: ShortAddress,
+        delivery_mode: ApsDeliveryMode,
+        radius: u8,
+    ) -> Result<ApsdeDataConfirm, ApsStatus> {
+        let aps_counter = self.next_aps_counter();
+        let total_blocks = req.payload.len().div_ceil(APS_MAX_PAYLOAD) as u8;
 
-        // Send via NWK layer
-        let nwk_result = self
-            .nwk
-            .nlde_data_request(
-                nwk_dst,
-                radius,
-                &aps_buf[..total_len],
-                req.tx_options.use_nwk_key,
-                true, // discover_route
-            )
-            .await;
+        for block_num in 0..total_blocks {
+            let start = block_num as usize * APS_MAX_PAYLOAD;
+            let end = (start + APS_MAX_PAYLOAD).min(req.payload.len());
+            let chunk = &req.payload[start..end];
 
-        match nwk_result {
-            Ok(_confirm) => {
-                // Register for ACK tracking if requested
-                if req.tx_options.ack_request {
-                    self.register_ack_pending(aps_counter, nwk_dst.0);
-                }
-                Ok(ApsdeDataConfirm {
-                    status: ApsStatus::Success,
-                    dst_addr_mode: req.dst_addr_mode,
-                    dst_address: req.dst_address,
-                    dst_endpoint: req.dst_endpoint,
-                    src_endpoint: req.src_endpoint,
-                    aps_counter,
-                })
-            }
-            Err(nwk_err) => {
-                log::warn!("APSDE-DATA.request failed: NWK error {:?}", nwk_err);
-                let aps_err = match nwk_err {
-                    NwkStatus::FrameTooLong => ApsStatus::AsduTooLong,
-                    NwkStatus::InvalidRequest => ApsStatus::IllegalRequest,
-                    NwkStatus::RouteError | NwkStatus::RouteDiscoveryFailed => {
-                        ApsStatus::NoShortAddress
+            let (fragmentation, ack_bitfield) = if block_num == 0 {
+                (FRAG_FIRST, Some(0u8))
+            } else {
+                (FRAG_SUBSEQUENT, None)
+            };
+
+            let frag_header = ApsHeader {
+                frame_control: ApsFrameControl {
+                    frame_type: ApsFrameType::Data as u8,
+                    delivery_mode: delivery_mode as u8,
+                    ack_format: false,
+                    security: false,
+                    ack_request: req.tx_options.ack_request && block_num == total_blocks - 1,
+                    extended_header: true,
+                },
+                dst_endpoint: match delivery_mode {
+                    ApsDeliveryMode::Unicast | ApsDeliveryMode::Broadcast => Some(req.dst_endpoint),
+                    _ => None,
+                },
+                group_address: match delivery_mode {
+                    ApsDeliveryMode::Group => {
+                        if let ApsAddress::Group(g) = req.dst_address {
+                            Some(g)
+                        } else {
+                            None
+                        }
                     }
-                    _ => ApsStatus::NoAck,
-                };
-                Err(aps_err)
+                    _ => None,
+                },
+                cluster_id: Some(req.cluster_id),
+                profile_id: Some(req.profile_id),
+                src_endpoint: Some(req.src_endpoint),
+                aps_counter,
+                extended_header: Some(ApsExtendedHeader {
+                    fragmentation,
+                    block_number: if block_num == 0 {
+                        total_blocks
+                    } else {
+                        block_num
+                    },
+                    ack_bitfield,
+                }),
+            };
+
+            let mut frag_buf = [0u8; 128];
+            let hdr_len = frag_header.serialize(&mut frag_buf);
+            let total = hdr_len + chunk.len();
+            if total > frag_buf.len() {
+                return Err(ApsStatus::AsduTooLong);
+            }
+            frag_buf[hdr_len..total].copy_from_slice(chunk);
+
+            let nwk_result = self
+                .nwk
+                .nlde_data_request(
+                    nwk_dst,
+                    radius,
+                    &frag_buf[..total],
+                    req.tx_options.use_nwk_key,
+                    true,
+                )
+                .await;
+
+            if let Err(nwk_err) = nwk_result {
+                log::warn!(
+                    "[APS] Fragment {}/{} send failed: {:?}",
+                    block_num,
+                    total_blocks,
+                    nwk_err
+                );
+                return Err(nwk_status_to_aps(nwk_err));
             }
         }
+
+        Ok(ApsdeDataConfirm {
+            status: ApsStatus::Success,
+            dst_addr_mode: req.dst_addr_mode,
+            dst_address: req.dst_address,
+            dst_endpoint: req.dst_endpoint,
+            src_endpoint: req.src_endpoint,
+            aps_counter,
+        })
     }
 
     /// Process an incoming APS frame from a NWK data indication.
     ///
     /// Parses the APS header from the NWK payload and returns an
     /// `ApsdeDataIndication` for the upper layer.
-    ///
-    /// For APS-secured frames (Transport Key, etc.), this decrypts using
-    /// the appropriate link key before processing commands.
     pub fn process_incoming_aps_frame<'a>(
         &mut self,
         nwk_payload: &'a [u8],
@@ -289,29 +484,20 @@ impl<M: MacDriver> ApsLayer<M> {
     ) -> Option<ApsdeDataIndication<'a>> {
         let (header, consumed) = ApsHeader::parse(nwk_payload)?;
 
-        // Determine if APS security is applied
         let aps_secured = header.frame_control.security;
-
-        // Get the payload after the APS header
         let after_header = &nwk_payload[consumed..];
+        let mut used_decrypted_buf = false;
 
-        // If APS-secured, we need to decrypt before processing
-        let (effective_payload, _aps_sec_overhead) = if aps_secured {
-            // Parse APS security auxiliary header
+        // Phase 1: APS security decryption
+        if aps_secured {
             let (sec_hdr, sec_consumed) = crate::security::ApsSecurityHeader::parse(after_header)?;
-
             let ciphertext = &after_header[sec_consumed..];
-
-            // Build AAD = APS header bytes || APS security header bytes
             let aad_end = consumed + sec_consumed;
             let aad = &nwk_payload[..aad_end];
 
-            // Determine the decryption key:
-            // For key_id=0 (Data Key / Link Key), use TC link key
             let key_id =
                 crate::security::ApsSecurityHeader::key_identifier(sec_hdr.security_control);
             let key = if key_id == crate::security::KEY_ID_DATA_KEY {
-                // Try partner-specific key first, then default TC link key
                 if let Some(addr) = &sec_hdr.source_address {
                     if let Some(entry) = self.security.find_any_key(addr) {
                         entry.key
@@ -322,17 +508,14 @@ impl<M: MacDriver> ApsLayer<M> {
                     *self.security.default_tc_link_key()
                 }
             } else if key_id == crate::security::KEY_ID_KEY_TRANSPORT {
-                // Key-Transport Key: derive from TC link key via HMAC-MMO (spec §4.5.3.4)
                 crate::security::derive_key_transport_key(self.security.default_tc_link_key())
             } else if key_id == crate::security::KEY_ID_KEY_LOAD {
-                // Key-Load Key: derive from TC link key via HMAC-MMO
                 crate::security::derive_key_load_key(self.security.default_tc_link_key())
             } else {
                 log::warn!("[APS] Unsupported key_id={} in APS security", key_id);
                 return None;
             };
 
-            // Two-phase replay protection: check BEFORE decrypt, commit AFTER
             let replay_key_type = if key_id == crate::security::KEY_ID_DATA_KEY {
                 crate::security::ApsKeyType::TrustCenterLinkKey
             } else {
@@ -350,10 +533,8 @@ impl<M: MacDriver> ApsLayer<M> {
                 return None;
             }
 
-            // Decrypt (includes MIC verification)
             match self.security.decrypt(aad, ciphertext, &key, &sec_hdr) {
                 Some(plaintext) => {
-                    // MIC verified — commit frame counter (phase 2 of replay protection)
                     if let Some(addr) = &sec_hdr.source_address {
                         self.security.commit_frame_counter(
                             addr,
@@ -361,17 +542,15 @@ impl<M: MacDriver> ApsLayer<M> {
                             sec_hdr.frame_counter,
                         );
                     }
-                    // Copy to owned buffer
                     let pt_len = plaintext.len().min(decrypted_buf.data.len());
                     decrypted_buf.data[..pt_len].copy_from_slice(&plaintext[..pt_len]);
                     decrypted_buf.len = pt_len;
-                    decrypted_buf.len = pt_len;
+                    used_decrypted_buf = true;
                     log::debug!(
                         "[APS] Decrypted APS frame ({} bytes) from 0x{:04X}",
                         pt_len,
                         nwk_src.0
                     );
-                    (decrypted_buf.payload(), sec_consumed)
                 }
                 None => {
                     log::warn!(
@@ -382,15 +561,12 @@ impl<M: MacDriver> ApsLayer<M> {
                     return None;
                 }
             }
-        } else {
-            (after_header, 0)
-        };
+        }
 
-        // Only deliver Data frames to the upper layer
+        // Phase 2: Frame type dispatch
         let ft = crate::frames::ApsFrameType::from_u8(header.frame_control.frame_type)?;
         match ft {
             ApsFrameType::Data => {
-                // APS duplicate rejection — drop duplicate data frames
                 if self.is_aps_duplicate(nwk_src.0, header.aps_counter) {
                     log::debug!(
                         "APS duplicate rejected: src=0x{:04X} counter={}",
@@ -399,25 +575,84 @@ impl<M: MacDriver> ApsLayer<M> {
                     );
                     return None;
                 }
+
+                // Handle fragmented frames
+                if header.frame_control.extended_header
+                    && let Some(ref ext) = header.extended_header
+                    && ext.fragmentation != FRAG_NONE
+                {
+                    let total_blocks = if ext.fragmentation == FRAG_FIRST {
+                        ext.block_number
+                    } else {
+                        0
+                    };
+                    let block_num = if ext.fragmentation == FRAG_FIRST {
+                        0
+                    } else {
+                        ext.block_number
+                    };
+
+                    // Copy fragment data to temp buffer to avoid borrow conflict
+                    let mut frag_tmp = [0u8; 128];
+                    let frag_len = if used_decrypted_buf {
+                        let l = decrypted_buf.len.min(frag_tmp.len());
+                        frag_tmp[..l].copy_from_slice(&decrypted_buf.data[..l]);
+                        l
+                    } else {
+                        let l = after_header.len().min(frag_tmp.len());
+                        frag_tmp[..l].copy_from_slice(&after_header[..l]);
+                        l
+                    };
+
+                    let is_complete;
+                    {
+                        let result = self.fragment_rx.insert_fragment(
+                            nwk_src.0,
+                            header.aps_counter,
+                            block_num,
+                            total_blocks,
+                            &frag_tmp[..frag_len],
+                        );
+                        if let Some(reassembled) = result {
+                            let rlen = reassembled.len().min(decrypted_buf.data.len());
+                            decrypted_buf.data[..rlen].copy_from_slice(&reassembled[..rlen]);
+                            decrypted_buf.len = rlen;
+                            is_complete = true;
+                        } else {
+                            is_complete = false;
+                        }
+                    }
+
+                    if is_complete {
+                        self.fragment_rx
+                            .complete_entry(nwk_src.0, header.aps_counter);
+                        used_decrypted_buf = true;
+                    } else {
+                        return None;
+                    }
+                }
             }
             ApsFrameType::Ack => {
-                // Match this ACK to a pending outbound request
                 if !self.confirm_ack(nwk_src.0, header.aps_counter) {
                     log::debug!(
-                        "APS ACK received (counter={}) — no matching pending",
+                        "APS ACK received (counter={}) - no matching pending",
                         header.aps_counter
                     );
                 }
                 return None;
             }
             ApsFrameType::Command => {
-                // APS command frame — parse command ID and handle key management
-                if effective_payload.is_empty() {
+                let cmd_payload = if used_decrypted_buf {
+                    &decrypted_buf.data[..decrypted_buf.len]
+                } else {
+                    after_header
+                };
+                if cmd_payload.is_empty() {
                     log::warn!("APS command frame with empty payload");
                     return None;
                 }
-                let cmd_id = effective_payload[0];
-                let cmd_data = &effective_payload[1..];
+                let cmd_id = cmd_payload[0];
+                let cmd_data = &cmd_payload[1..];
                 match crate::frames::ApsCommandId::from_u8(cmd_id) {
                     Some(crate::frames::ApsCommandId::TransportKey) => {
                         self.handle_transport_key(cmd_data, nwk_src);
@@ -477,7 +712,11 @@ impl<M: MacDriver> ApsLayer<M> {
             ),
         };
 
-        let payload = effective_payload;
+        let payload = if used_decrypted_buf {
+            decrypted_buf.payload()
+        } else {
+            after_header
+        };
 
         Some(ApsdeDataIndication {
             dst_addr_mode,
@@ -723,5 +962,15 @@ impl<M: MacDriver> ApsLayer<M> {
                 log::debug!("[APS] Transport-Key: unknown key_type=0x{:02X}", key_type,);
             }
         }
+    }
+}
+
+/// Convert NWK status to APS status.
+fn nwk_status_to_aps(nwk_err: NwkStatus) -> ApsStatus {
+    match nwk_err {
+        NwkStatus::FrameTooLong => ApsStatus::AsduTooLong,
+        NwkStatus::InvalidRequest => ApsStatus::IllegalRequest,
+        NwkStatus::RouteError | NwkStatus::RouteDiscoveryFailed => ApsStatus::NoShortAddress,
+        _ => ApsStatus::NoAck,
     }
 }

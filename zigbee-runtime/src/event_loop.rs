@@ -179,10 +179,42 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
             return TickResult::Idle;
         }
 
-        // Phase 4: Tick the reporting engine timers
+        // Phase 4: APS layer maintenance — ACK retransmission and fragment aging
+        {
+            let aps = self.bdb.zdo_mut().aps_mut();
+            let retransmit_frames = aps.age_ack_table();
+            for frame in retransmit_frames.iter() {
+                let _ = aps
+                    .nwk_mut()
+                    .nlde_data_request(zigbee_types::ShortAddress(0xFFFF), 0, frame, true, false)
+                    .await;
+            }
+            aps.age_dup_table();
+            aps.fragment_rx_mut().age_entries();
+        }
+
+        // Phase 5: Tick the reporting engine timers
         self.reporting.tick(elapsed_secs);
 
-        // Phase 5: Check and send due attribute reports for each cluster
+        // Phase 5b: Handle F&B target request — set IdentifyTime on Identify cluster
+        if let Some((ep, time_secs)) = self.bdb.fb_target_request.take() {
+            for cr in clusters.iter_mut() {
+                if cr.endpoint == ep && cr.cluster.cluster_id().0 == 0x0003 {
+                    let _ = cr.cluster.set_attribute(
+                        zigbee_zcl::AttributeId(0x0000), // IdentifyTime
+                        zigbee_zcl::data_types::ZclValue::U16(time_secs),
+                    );
+                    log::info!(
+                        "[Runtime] F&B target: set IdentifyTime={}s on ep {}",
+                        time_secs,
+                        ep,
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Phase 6: Check and send due attribute reports for each cluster
         for cr in clusters.iter() {
             let ep = cr.endpoint;
             let cid = cr.cluster.cluster_id().0;
