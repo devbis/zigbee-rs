@@ -37,6 +37,9 @@ pub mod nrf;
 #[cfg(feature = "bl702")]
 pub mod bl702;
 
+#[cfg(feature = "cc2340")]
+pub mod cc2340;
+
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 

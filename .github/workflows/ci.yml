@@ -251,6 +251,27 @@ jobs:
           # the Bouffalo toolchain.
           cargo check --release -Z build-std=core,alloc
 
+  # ── CC2340 (TI, ARM Cortex-M0+) ────────────────────────────
+  build-cc2340:
+    name: Build CC2340 sensor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: thumbv6m-none-eabi
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/cc2340-sensor
+      - name: Check CC2340 sensor compiles
+        working-directory: examples/cc2340-sensor
+        run: |
+          # CC2340 uses FFI to TI's RCL library (rcl_cc23x0r5.a) and
+          # RF firmware patches. Full link requires TI SimpleLink SDK.
+          # CI verifies compilation; full firmware build is done locally.
+          cargo check --release
+
   # ── Deploy Web Flasher to GitHub Pages ──────────────────────
   # Bundles the flasher HTML with latest ESP firmware binaries
   # so users can flash directly from the browser.
