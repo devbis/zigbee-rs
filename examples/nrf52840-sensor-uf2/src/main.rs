@@ -32,10 +32,10 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, select3, Either, Either3};
+use embassy_futures::select::{select, Either};
 use embassy_nrf::temp::Temp;
 use embassy_nrf::{self as _, bind_interrupts, gpio, peripherals, radio};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 
 use defmt::*;
 use {defmt_rtt as _, panic_probe as _};
@@ -240,234 +240,186 @@ async fn main(_spawner: Spawner) {
         }
     }
 
+    // ── Read sensors once so clusters have real values for ZHA interview ──
+    {
+        let raw_temp = temp_sensor.read().await;
+        let temp_hundredths = (raw_temp.to_bits() * 100 / 4) as i16;
+        let hum_hundredths = 5000u16; // initial humidity placeholder
+        temp_cluster.set_temperature(temp_hundredths);
+        hum_cluster.set_humidity(hum_hundredths);
+        info!(
+            "Initial: T={}.{:02}°C  H={}.{:02}%",
+            temp_hundredths / 100,
+            (temp_hundredths % 100).unsigned_abs(),
+            hum_hundredths / 100,
+            hum_hundredths % 100,
+        );
+    }
+
     // ── Main loop ──
-    let mut secs_since_report: u64 = 0;
-    let mut fast_poll_remaining: u64 = 0; // seconds left in fast-poll mode
+    // SED architecture: sleep → poll parent → process indirect frames → periodic tasks.
+    // ALL frames reach a Sleepy End Device through the parent's indirect queue,
+    // so we poll() instead of receive(). This avoids the rapid Timer
+    // creation/teardown that caused RefCell panics in embassy's timer driver.
+    let mut last_report = Instant::now();
+    // If already joined (from BDB steering above), start fast-poll immediately
+    // so ZHA's ZCL attribute reads during interview don't time out.
+    let mut fast_poll_until = if device.is_joined() {
+        info!("Fast poll ON ({}s) — post-join", FAST_POLL_DURATION_SECS);
+        Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS)
+    } else {
+        Instant::now() // expires immediately
+    };
+    let mut last_rejoin_attempt = Instant::now();
+    let mut rejoin_count: u8 = 0;
 
     loop {
-        // Determine poll/timer interval based on mode
-        let (poll_ms, is_fast) = if fast_poll_remaining > 0 {
-            (FAST_POLL_MS, true)
-        } else if device.is_joined() {
-            (SLOW_POLL_SECS * 1000, false)
-        } else {
-            (1000, false) // 1s tick when not joined
-        };
+        let now = Instant::now();
+        let in_fast_poll = now < fast_poll_until;
+        let poll_ms = if in_fast_poll { FAST_POLL_MS } else { SLOW_POLL_SECS * 1000 };
 
-        // Build a future that waits for button press (or never completes if no button)
-        let button_fut = async {
-            if let Some(ref mut btn) = button {
-                btn.wait_for_falling_edge().await;
-            } else {
-                core::future::pending::<()>().await;
-            }
-        };
-
-        match select3(
-            // Poll parent for indirect frames, then passive listen
-            async {
-                if device.is_joined() {
-                    match device.poll().await {
-                        Ok(Some(ind)) => return Ok(ind),
-                        _ => {}
-                    }
-                }
-                device.receive().await
-            },
-            button_fut,
-            Timer::after(Duration::from_millis(poll_ms)),
-        )
-        .await
-        {
-            // ── Incoming MAC frame ──
-            Either3::First(Ok(indication)) => {
-                let mut clusters = [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                ];
-                if let Some(event) = device.process_incoming(&indication, &mut clusters).await {
-                    if log_event(&event, &mut led) {
-                        fast_poll_remaining = FAST_POLL_DURATION_SECS;
-                        info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
-                    }
-                }
-                if let TickResult::Event(ref e) = device.tick(0, &mut [
-                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                ]).await {
-                    if log_event(e, &mut led) {
-                        fast_poll_remaining = FAST_POLL_DURATION_SECS;
-                        info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
-                    }
-                }
-
-                // In fast-poll: immediately poll again to drain indirect queue
-                if fast_poll_remaining > 0 && device.is_joined() {
-                    for _ in 0..3 {
-                        match device.poll().await {
-                            Ok(Some(extra)) => {
-                                let mut cls = [
-                                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                                ];
-                                if let Some(ev) = device.process_incoming(&extra, &mut cls).await {
-                                    if log_event(&ev, &mut led) {
-                                        fast_poll_remaining = FAST_POLL_DURATION_SECS;
-                                    }
-                                }
-                                let _ = device.tick(0, &mut [
-                                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                                ]).await;
-                            }
-                            _ => break, // No more indirect frames
-                        }
-                    }
-                }
-            }
-            Either3::First(Err(_)) => {
-                // MAC receive error/timeout — normal, just loop
-            }
-
-            // ── Button press ──
-            Either3::Second(_) => {
-                // Detect long press: wait for release or 3s timeout
-                let held_long = if let Some(ref mut btn) = button {
-                    match select(
+        // ── Step 1: Sleep until next poll ──
+        // Single Timer per iteration — avoids rapid create/drop that panics embassy.
+        // During sleep, check button via select (only 2 futures, not 3).
+        if let Some(ref mut btn) = button {
+            match select(
+                btn.wait_for_falling_edge(),
+                Timer::after(Duration::from_millis(poll_ms)),
+            )
+            .await
+            {
+                Either::First(_) => {
+                    // Button pressed — check for long press
+                    let held_long = match select(
                         btn.wait_for_rising_edge(),
                         Timer::after(Duration::from_secs(3)),
-                    ).await {
-                        Either::Second(_) => true,  // 3s elapsed = long press
-                        Either::First(_) => false,  // released early = short press
-                    }
-                } else {
-                    false
-                };
+                    )
+                    .await
+                    {
+                        Either::Second(_) => true,
+                        Either::First(_) => false,
+                    };
 
-                if held_long {
-                    info!("FACTORY RESET");
-                    for _ in 0..5 {
-                        led_on(&mut led);
-                        Timer::after(Duration::from_millis(100)).await;
-                        led_off(&mut led);
-                        Timer::after(Duration::from_millis(100)).await;
-                    }
-                    cortex_m::peripheral::SCB::sys_reset();
-                } else {
-                    if device.is_joined() {
-                        info!("Button → leave");
-                    } else {
-                        info!("Button → join");
-                    }
-                    device.user_action(UserAction::Toggle);
-                    let mut clusters = [
-                        ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                        ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                    ];
-                    if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-                        if log_event(e, &mut led) {
-                            fast_poll_remaining = FAST_POLL_DURATION_SECS;
-                            info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
+                    if held_long {
+                        info!("FACTORY RESET");
+                        for _ in 0..5u8 {
+                            led_on(&mut led);
+                            Timer::after(Duration::from_millis(100)).await;
+                            led_off(&mut led);
+                            Timer::after(Duration::from_millis(100)).await;
                         }
+                        cortex_m::peripheral::SCB::sys_reset();
+                    } else {
+                        info!("Button → {}", if device.is_joined() { "leave" } else { "join" });
+                        device.user_action(UserAction::Toggle);
+                        let _ = device.tick(0, &mut [
+                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                        ]).await;
                     }
-                    Timer::after(Duration::from_millis(300)).await;
+                }
+                Either::Second(_) => {} // Normal timeout — proceed to poll
+            }
+        } else {
+            // No button — just sleep
+            Timer::after(Duration::from_millis(poll_ms)).await;
+        }
+
+        // ── Step 2: Poll parent for indirect frames (SED core) ──
+        if device.is_joined() {
+            for poll_round in 0..4u8 {
+                match device.poll().await {
+                    Ok(Some(ind)) => {
+                        let mut cls = [
+                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                        ];
+                        if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
+                            if log_event(&ev, &mut led) {
+                                fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                                info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
+                            }
+                        }
+                        // Immediately tick to send any queued ZCL responses
+                        let _ = device.tick(0, &mut [
+                            ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                            ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                        ]).await;
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
                 }
             }
 
-            // ── Timer tick ──
-            Either3::Third(_) => {
-                // Track time in seconds (fast poll ticks are sub-second)
-                let elapsed_secs = if is_fast { 0u64 } else { poll_ms / 1000 };
-                secs_since_report += elapsed_secs;
+            // ── Step 3: Periodic tasks ──
+            let now2 = Instant::now();
+            let elapsed_s = now2.duration_since(last_report).as_secs();
 
-                // Decrement fast-poll countdown
-                if fast_poll_remaining > 0 {
-                    let decr = (poll_ms + 999) / 1000; // round up to nearest second
-                    fast_poll_remaining = fast_poll_remaining.saturating_sub(decr);
-                    if fast_poll_remaining == 0 {
-                        info!("Switching to slow poll ({}s)", SLOW_POLL_SECS);
-                    }
+            // Read sensors when report interval elapsed
+            if elapsed_s >= REPORT_INTERVAL_SECS {
+                last_report = now2;
+                let raw_temp = temp_sensor.read().await;
+                let temp_hundredths = (raw_temp.to_bits() * 100 / 4) as i16;
+
+                hum_tick = hum_tick.wrapping_add(1);
+                let hum_hundredths = 5000u16 + ((hum_tick % 100) as u16).wrapping_mul(10);
+
+                temp_cluster.set_temperature(temp_hundredths);
+                hum_cluster.set_humidity(hum_hundredths);
+
+                info!(
+                    "T={}.{:02}°C  H={}.{:02}%",
+                    temp_hundredths / 100,
+                    (temp_hundredths % 100).unsigned_abs(),
+                    hum_hundredths / 100,
+                    hum_hundredths % 100,
+                );
+            }
+
+            // Tick the runtime (sends queued responses, reports, etc.)
+            let tick_elapsed = elapsed_s.min(60) as u16;
+            if let TickResult::Event(ref e) = device.tick(tick_elapsed, &mut [
+                ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+            ]).await {
+                if log_event(e, &mut led) {
+                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                    info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
                 }
+            }
+        } else {
+            // ── Not joined — blink and auto-retry ──
+            let now2 = Instant::now();
+            if now2.duration_since(last_rejoin_attempt).as_secs() >= 1 {
+                led_on(&mut led);
+                Timer::after(Duration::from_millis(80)).await;
+                led_off(&mut led);
+                Timer::after(Duration::from_millis(120)).await;
+                led_on(&mut led);
+                Timer::after(Duration::from_millis(80)).await;
+                led_off(&mut led);
+            }
 
-                if device.is_joined() {
-                    if secs_since_report >= REPORT_INTERVAL_SECS {
-                        secs_since_report = 0;
-                        let raw_temp = temp_sensor.read().await;
-                        let temp_hundredths = (raw_temp.to_bits() * 100 / 4) as i16;
-
-                        hum_tick = hum_tick.wrapping_add(1);
-                        let hum_hundredths = 5000u16 + ((hum_tick % 100) as u16).wrapping_mul(10);
-
-                        temp_cluster.set_temperature(temp_hundredths);
-                        hum_cluster.set_humidity(hum_hundredths);
-
-                        info!(
-                            "T={}.{:02}°C  H={}.{:02}%",
-                            temp_hundredths / 100,
-                            (temp_hundredths % 100).unsigned_abs(),
-                            hum_hundredths / 100,
-                            hum_hundredths % 100,
-                        );
-                    }
-                } else {
-                    // Double-blink while not joined
-                    led_on(&mut led);
-                    Timer::after(Duration::from_millis(80)).await;
-                    led_off(&mut led);
-                    Timer::after(Duration::from_millis(120)).await;
-                    led_on(&mut led);
-                    Timer::after(Duration::from_millis(80)).await;
-                    led_off(&mut led);
-
-                    // Auto-retry join (only for non-button boards)
-                    if button.is_none() && secs_since_report >= 10 {
-                        secs_since_report = 0;
-                        info!("Not joined — retrying…");
-                        device.user_action(UserAction::Join);
-                    }
-                }
-
-                // Use 0 for tick elapsed during fast-poll to avoid
-                // premature reporting timer expiry
-                let tick_secs = if is_fast { 0u16 } else { (poll_ms / 1000) as u16 };
-                if let TickResult::Event(ref e) = device.tick(tick_secs, &mut [
+            if now2.duration_since(last_rejoin_attempt).as_secs() >= 15 {
+                rejoin_count = rejoin_count.wrapping_add(1);
+                last_rejoin_attempt = Instant::now();
+                info!("Not joined — retrying (attempt {})…", rejoin_count);
+                device.user_action(UserAction::Join);
+                let _ = device.tick(0, &mut [
                     ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                ]).await {
-                    if log_event(e, &mut led) {
-                        fast_poll_remaining = FAST_POLL_DURATION_SECS;
-                        info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
-                    }
-                }
-
-                // In fast-poll timer ticks: also poll aggressively
-                if is_fast && device.is_joined() {
-                    for _ in 0..2 {
-                        match device.poll().await {
-                            Ok(Some(ind)) => {
-                                let mut cls = [
-                                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                                ];
-                                if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
-                                    log_event(&ev, &mut led);
-                                }
-                                let _ = device.tick(0, &mut [
-                                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
-                                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
-                                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                                ]).await;
-                            }
-                            _ => break,
-                        }
-                    }
+                ]).await;
+                // If join succeeded during tick, activate fast-poll for interview
+                if device.is_joined() {
+                    info!("Joined! addr=0x{:04X}", device.short_address());
+                    fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                    info!("Fast poll ON ({}s) — post-rejoin", FAST_POLL_DURATION_SECS);
+                    led_on(&mut led);
                 }
             }
         }

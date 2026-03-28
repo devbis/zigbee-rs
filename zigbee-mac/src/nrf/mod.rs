@@ -604,10 +604,12 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
         // application retry) handle end-to-end reliability.
         // TODO: implement DISABLED→RXEN hardware shortcut for proper ACK.
         if ack_requested {
-            // Best-effort retransmit 2 more times with short delay
-            for _ in 0..2 {
-                Timer::after_micros(1_500).await; // inter-frame spacing
+            // Best-effort retransmit 4 more times with CSMA-CA for each
+            for retransmit in 0..4u8 {
+                // Inter-frame spacing: 3ms + 2ms per retry (increasing gap)
+                Timer::after_millis(3 + retransmit as u64 * 2).await;
                 pkt.copy_from_slice(&frame_buf[..len]);
+                // Simple CCA: back off if channel is busy
                 let _ = self.radio.try_send(&mut pkt).await;
             }
         }
@@ -695,7 +697,7 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                         let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
                         let addr_ok = addr.0 == self.short_address.0 || addr.0 == 0xFFFF;
                         if !pan_ok || !addr_ok {
-                            log::info!(
+                            log::trace!(
                                 "[nRF RX] Filtered short dst: pan=0x{:04X} addr=0x{:04X} (ours: pan=0x{:04X} addr=0x{:04X})",
                                 pan.0, addr.0, self.pan_id.0, self.short_address.0
                             );

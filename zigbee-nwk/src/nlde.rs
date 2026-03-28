@@ -66,18 +66,24 @@ impl<M: MacDriver> NwkLayer<M> {
         let seq = self.nib.next_seq();
 
         // Build NWK header
-        let is_multicast = dst_addr.0 >= 0xFFF8;
+        // Note: multicast flag is ONLY for group-addressed frames (via APS group delivery).
+        // Broadcast addresses (0xFFF8-0xFFFF) must NOT set the multicast flag.
+        // End devices suppress route discovery (parent handles routing).
         let header = NwkHeader {
             frame_control: NwkFrameControl {
                 frame_type: NwkFrameType::Data as u8,
                 protocol_version: 0x02,
-                discover_route: if discover_route { 1 } else { 0 },
-                multicast: is_multicast,
+                discover_route: if discover_route && self.device_type != DeviceType::EndDevice {
+                    1
+                } else {
+                    0
+                },
+                multicast: false,
                 security: security_enable && self.nib.security_enabled,
                 source_route: false,
                 dst_ieee_present: false,
                 src_ieee_present: false,
-                end_device_initiator: self.device_type == DeviceType::EndDevice,
+                end_device_initiator: false, // Maximise compatibility with older stacks
             },
             dst_addr,
             src_addr: self.nib.network_address,
@@ -95,6 +101,15 @@ impl<M: MacDriver> NwkLayer<M> {
 
         let total_len;
         if security_enable && self.nib.security_enabled {
+            // Check key availability BEFORE allocating frame counter
+            let key_entry = match self.security.active_key() {
+                Some(k) => k.clone(),
+                None => {
+                    log::warn!("[NWK] No active network key for encryption");
+                    return Err(NwkStatus::InvalidRequest);
+                }
+            };
+
             // Build NWK security auxiliary header
             let sec_hdr = crate::security::NwkSecurityHeader {
                 security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
@@ -105,6 +120,12 @@ impl<M: MacDriver> NwkLayer<M> {
                 source_address: self.nib.ieee_address,
                 key_seq_number: self.nib.active_key_seq_number,
             };
+            log::info!(
+                "[NWK TX] sec: fc={} key_seq={} ieee={:02X?}",
+                sec_hdr.frame_counter,
+                sec_hdr.key_seq_number,
+                &sec_hdr.source_address[..4],
+            );
 
             // Serialize security header right after NWK header
             let sec_hdr_len = sec_hdr.serialize(&mut nwk_buf[hdr_len..]);
@@ -113,25 +134,19 @@ impl<M: MacDriver> NwkLayer<M> {
             let aad_len = hdr_len + sec_hdr_len;
 
             // Encrypt payload with NWK key
-            if let Some(key_entry) = self.security.active_key() {
-                if let Some(encrypted) =
-                    self.security
-                        .encrypt(&nwk_buf[..aad_len], payload, &key_entry.key, &sec_hdr)
-                {
-                    // Append encrypted payload + MIC after security header
-                    if aad_len + encrypted.len() > nwk_buf.len() {
-                        return Err(NwkStatus::FrameTooLong);
-                    }
-                    nwk_buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
-                    total_len = aad_len + encrypted.len();
-                    // Zero security level bits for OTA transmission (spec §4.3.1.2)
-                    nwk_buf[hdr_len] &= !0x07;
-                } else {
-                    log::warn!("[NWK] Encryption failed");
-                    return Err(NwkStatus::InvalidRequest);
+            if let Some(encrypted) =
+                self.security
+                    .encrypt(&nwk_buf[..aad_len], payload, &key_entry.key, &sec_hdr)
+            {
+                if aad_len + encrypted.len() > nwk_buf.len() {
+                    return Err(NwkStatus::FrameTooLong);
                 }
+                nwk_buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+                total_len = aad_len + encrypted.len();
+                // Zero security level bits for OTA transmission (spec §4.3.1.2)
+                nwk_buf[hdr_len] &= !0x07;
             } else {
-                log::warn!("[NWK] No active network key for encryption");
+                log::warn!("[NWK] Encryption failed");
                 return Err(NwkStatus::InvalidRequest);
             }
         } else {
@@ -147,10 +162,11 @@ impl<M: MacDriver> NwkLayer<M> {
         let next_hop = self.resolve_next_hop(dst_addr)?;
 
         log::info!(
-            "[NWK TX] dst=0x{:04X} next_hop=0x{:04X} sec={} len={}",
+            "[NWK TX] dst=0x{:04X} next_hop=0x{:04X} sec={} len={} hdr={:02X?}",
             dst_addr.0, next_hop.0,
             security_enable && self.nib.security_enabled,
-            total_len
+            total_len,
+            &nwk_buf[..core::cmp::min(8, total_len)],
         );
 
         // Send via MAC

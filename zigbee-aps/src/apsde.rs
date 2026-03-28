@@ -297,6 +297,14 @@ impl<M: MacDriver> ApsLayer<M> {
         }
         aps_buf[hdr_len..total_len].copy_from_slice(req.payload);
 
+        log::info!(
+            "[APS TX] ep={}/{} cl=0x{:04X} prof=0x{:04X} cnt={} hdr={:02X?}",
+            req.src_endpoint, req.dst_endpoint,
+            req.cluster_id, req.profile_id,
+            aps_counter,
+            &aps_buf[..core::cmp::min(12, total_len)],
+        );
+
         let nwk_result = self
             .nwk
             .nlde_data_request(
@@ -615,7 +623,7 @@ impl<M: MacDriver> ApsLayer<M> {
         match ft {
             ApsFrameType::Data => {
                 if self.is_aps_duplicate(nwk_src.0, header.aps_counter) {
-                    log::debug!(
+                    log::info!(
                         "APS duplicate rejected: src=0x{:04X} counter={}",
                         nwk_src.0,
                         header.aps_counter

@@ -155,6 +155,13 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
 
         // Phase 2: Send any queued ZCL responses
         while let Some(resp) = self.pending_responses.pop() {
+            log::info!(
+                "[Runtime] Sending ZCL response: dst=0x{:04X} ep={} cluster=0x{:04X} len={}",
+                resp.dst_addr.0,
+                resp.dst_endpoint,
+                resp.cluster_id,
+                resp.zcl_data.len(),
+            );
             if let Err(_e) = self
                 .send_zcl_frame(
                     resp.dst_addr,
@@ -337,7 +344,10 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
             cluster_id,
             src_endpoint: endpoint,
             payload: &zcl_buf[..zcl_len],
-            tx_options: ApsTxOptions::default(),
+            tx_options: ApsTxOptions {
+                use_nwk_key: true,
+                ..ApsTxOptions::default()
+            },
             radius: 0,
             alias_src_addr: None,
             alias_seq: None,

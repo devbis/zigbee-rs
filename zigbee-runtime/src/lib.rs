@@ -655,16 +655,16 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         if dst_ep == 0x00 {
             // ZDO endpoint — dispatch to ZDP handler which sends responses
             // directly through the APS layer.
-            log::debug!(
-                "[Runtime] ZDO frame: cluster=0x{:04X} from 0x{:04X} len={}",
+            log::info!(
+                "[Runtime] ZDO request: cluster=0x{:04X} from 0x{:04X} len={}",
                 cluster_id,
                 src_addr,
                 aps_indication.payload.len(),
             );
             match self.bdb.zdo_mut().handle_indication(&aps_indication).await {
-                Ok(()) => log::debug!("[Runtime] ZDO handled cluster 0x{:04X} OK", cluster_id,),
+                Ok(()) => log::info!("[Runtime] ZDO OK cluster=0x{:04X}", cluster_id),
                 Err(e) => log::warn!(
-                    "[Runtime] ZDO error on cluster 0x{:04X}: {:?}",
+                    "[Runtime] ZDO FAIL cluster=0x{:04X}: {:?}",
                     cluster_id,
                     e,
                 ),
@@ -690,6 +690,10 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         }
 
         // Application endpoint — parse ZCL frame
+        log::info!(
+            "[Runtime] ZCL frame: ep={} cluster=0x{:04X} from 0x{:04X} len={}",
+            dst_ep, cluster_id, src_addr, aps_indication.payload.len()
+        );
         let zcl_frame = match ZclFrame::parse(aps_indication.payload) {
             Ok(f) => f,
             Err(_) => {
@@ -888,6 +892,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             if let Some(req) = zigbee_zcl::foundation::read_attributes::ReadAttributesRequest::parse(
                 zcl_frame.payload.as_slice(),
             ) {
+                log::info!(
+                    "[ZCL] ReadAttr ep={} cluster=0x{:04X} attrs={} from 0x{:04X}",
+                    dst_ep,
+                    cluster_id,
+                    req.attributes.len(),
+                    src_addr,
+                );
                 // Find the cluster's attribute store
                 if let Some(cr) = clusters
                     .iter()
@@ -899,6 +910,11 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     );
                     let mut payload_buf = [0u8; 253]; // Max ZCL payload size
                     let payload_len = response.serialize(&mut payload_buf).min(payload_buf.len());
+                    log::info!(
+                        "[ZCL] ReadAttr response: {} bytes, {} records queued",
+                        payload_len,
+                        response.records.len(),
+                    );
                     self.queue_global_response(
                         src_addr,
                         aps_indication.src_endpoint,
@@ -907,6 +923,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                         zcl_frame.header.seq_number,
                         0x01, // Read Attributes Response
                         &payload_buf[..payload_len],
+                    );
+                } else {
+                    log::warn!(
+                        "[ZCL] ReadAttr: no cluster found for ep={} cluster=0x{:04X} (have {} clusters)",
+                        dst_ep,
+                        cluster_id,
+                        clusters.len(),
                     );
                 }
             }
