@@ -73,3 +73,7 @@ cc2340 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]
 
+telink = [
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+]
+

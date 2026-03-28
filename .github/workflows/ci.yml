@@ -272,6 +272,46 @@ jobs:
           # CI verifies compilation; full firmware build is done locally.
           cargo check --release
 
+  build-telink-b91:
+    name: Build Telink B91 sensor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: riscv32imc-unknown-none-elf
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/telink-b91-sensor
+      - name: Check Telink B91 sensor compiles
+        working-directory: examples/telink-b91-sensor
+        run: |
+          # Telink B91 uses FFI to Telink's tl_zigbee_sdk radio driver
+          # (libdrivers_b91.a). Full link requires Telink SDK.
+          # CI verifies compilation; full firmware build is done locally.
+          cargo check --release
+
+  build-telink-tlsr8258:
+    name: Build Telink TLSR8258 sensor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: thumbv6m-none-eabi
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/telink-tlsr8258-sensor
+      - name: Check Telink TLSR8258 sensor compiles
+        working-directory: examples/telink-tlsr8258-sensor
+        run: |
+          # TLSR8258 uses Telink's tc32 ISA (no Rust target). We use
+          # thumbv6m-none-eabi as a cargo check stand-in to verify Rust
+          # code compiles. Real builds use the Telink tc32 GCC toolchain.
+          cargo check --release
+
   # ── Deploy Web Flasher to GitHub Pages ──────────────────────
   # Bundles the flasher HTML with latest ESP firmware binaries
   # so users can flash directly from the browser.

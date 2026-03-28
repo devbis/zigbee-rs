@@ -40,6 +40,9 @@ pub mod bl702;
 #[cfg(feature = "cc2340")]
 pub mod cc2340;
 
+#[cfg(feature = "telink")]
+pub mod telink;
+
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 
