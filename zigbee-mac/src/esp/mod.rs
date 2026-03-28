@@ -22,6 +22,7 @@ pub struct EspMac<'a> {
     pan_id: PanId,
     channel: u8,
     extended_address: IeeeAddress,
+    coord_short_address: ShortAddress,
     rx_on_when_idle: bool,
     association_permit: bool,
     auto_request: bool,
@@ -44,6 +45,7 @@ impl<'a> EspMac<'a> {
             pan_id: PanId(0xFFFF),
             channel: 11,
             extended_address: [0u8; 8],
+            coord_short_address: ShortAddress(0x0000),
             rx_on_when_idle: false,
             association_permit: false,
             auto_request: true,
@@ -242,13 +244,47 @@ impl MacDriver for EspMac<'_> {
             (PibAttribute::MacMaxFrameRetries, PibValue::U8(v)) => self.max_frame_retries = v,
             (PibAttribute::MacPromiscuousMode, PibValue::Bool(v)) => self.promiscuous = v,
             (PibAttribute::PhyTransmitPower, PibValue::I8(v)) => self.tx_power = v,
+            (PibAttribute::MacCoordShortAddress, PibValue::ShortAddress(v)) => {
+                self.coord_short_address = v;
+            }
             _ => return Err(MacError::Unsupported),
         }
         Ok(())
     }
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
-        Ok(None)
+        // Build MAC Data Request command to parent (coordinator)
+        let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
+        let data_req = build_data_request(self.next_dsn(), &parent, &self.extended_address);
+
+        // Transmit Data Request
+        self.driver
+            .transmit(&data_req)
+            .await
+            .map_err(|_| MacError::RadioError)?;
+
+        // Wait for response — parent may reply with data or empty ACK
+        let result = select::select(
+            Timer::after_millis(500),
+            self.driver.receive(),
+        )
+        .await;
+
+        match result {
+            select::Either::Second(Ok(received)) => {
+                if received.len < 3 {
+                    return Ok(None);
+                }
+                let frame_type = received.data[0] & 0x07;
+                if frame_type != 0x01 {
+                    return Ok(None); // Not a data frame
+                }
+                let payload = MacFrame::from_slice(&received.data[..received.len])
+                    .unwrap_or_default();
+                Ok(Some(payload))
+            }
+            _ => Ok(None), // Timeout or error
+        }
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
@@ -263,10 +299,17 @@ impl MacDriver for EspMac<'_> {
             &req,
         )?;
 
-        self.driver
-            .transmit(&frame_buf[..len])
-            .await
-            .map_err(|_| MacError::RadioError)?;
+        // Fire-and-forget: try up to 3 times (no ACK verification)
+        for attempt in 0..3u8 {
+            match self.driver.transmit(&frame_buf[..len]).await {
+                Ok(_) => break,
+                Err(_) if attempt < 2 => {
+                    Timer::after_millis(2).await;
+                    continue;
+                }
+                Err(_) => return Err(MacError::RadioError),
+            }
+        }
 
         Ok(McpsDataConfirm {
             msdu_handle,
@@ -318,6 +361,30 @@ impl MacDriver for EspMac<'_> {
 /// Build a Beacon Request MAC command frame.
 fn build_beacon_request(seq: u8) -> [u8; 8] {
     [0x03, 0x08, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07]
+}
+
+/// Build a MAC Data Request command frame (used for polling parent).
+fn build_data_request(
+    seq: u8,
+    coord: &MacAddress,
+    own_extended: &IeeeAddress,
+) -> heapless::Vec<u8, 24> {
+    let mut frame = heapless::Vec::new();
+    // FC: MAC command, ack req, PAN compress, dst=short, src=extended
+    let _ = frame.extend_from_slice(&[0x63, 0xC8, seq]);
+    let dst_pan = coord.pan_id();
+    let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
+    match coord {
+        MacAddress::Short(_, addr) => {
+            let _ = frame.extend_from_slice(&addr.0.to_le_bytes());
+        }
+        MacAddress::Extended(_, addr) => {
+            let _ = frame.extend_from_slice(addr);
+        }
+    }
+    let _ = frame.extend_from_slice(own_extended);
+    let _ = frame.push(0x04); // Data Request command ID
+    frame
 }
 
 /// Build an IEEE 802.15.4 data frame into `buf`, return length.

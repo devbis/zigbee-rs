@@ -66,6 +66,7 @@ pub struct Bl702Mac {
     pan_id: PanId,
     channel: u8,
     extended_address: IeeeAddress,
+    coord_short_address: ShortAddress,
     rx_on_when_idle: bool,
     association_permit: bool,
     auto_request: bool,
@@ -94,6 +95,7 @@ impl Bl702Mac {
             pan_id: PanId(0xFFFF),
             channel: 11,
             extended_address: [0u8; 8],
+            coord_short_address: ShortAddress(0x0000),
             rx_on_when_idle: false,
             association_permit: false,
             auto_request: true,
@@ -542,6 +544,9 @@ impl MacDriver for Bl702Mac {
                 self.sync_radio_config();
             }
             (MacBeaconPayload, PibValue::Payload(v)) => self.beacon_payload = v,
+            (MacCoordShortAddress, PibValue::ShortAddress(v)) => {
+                self.coord_short_address = v;
+            }
             _ => return Err(MacError::Unsupported),
         }
 
@@ -549,15 +554,36 @@ impl MacDriver for Bl702Mac {
     }
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
-        // TODO: Send Data Request MAC command to coordinator and wait
-        // for an indirect frame or empty ACK.
-        //
-        // Steps:
-        // 1. Build Data Request MAC command (type 0x04)
-        // 2. Transmit to coordinator address
-        // 3. If ACK has frame-pending bit set, wait for the data frame
-        // 4. Return the received frame or None
-        Ok(None)
+        // Build MAC Data Request command to parent (coordinator)
+        let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
+        let data_req = build_data_request(self.next_dsn(), &parent, &self.extended_address);
+
+        // Transmit Data Request
+        self.driver
+            .transmit(&data_req)
+            .await
+            .map_err(|_| MacError::RadioError)?;
+
+        // Wait for response — parent may reply with data or empty ACK
+        let result = select::select(
+            Timer::after_millis(500),
+            self.driver.receive(),
+        )
+        .await;
+
+        match result {
+            select::Either::Second(Ok(received)) => {
+                if received.len < 3 {
+                    return Ok(None);
+                }
+                let frame_type = received.data[0] & 0x07;
+                if frame_type != 0x01 {
+                    return Ok(None);
+                }
+                Ok(MacFrame::from_slice(&received.data[..received.len]))
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
@@ -565,10 +591,17 @@ impl MacDriver for Bl702Mac {
 
         let frame = self.build_data_frame(&req.dst_address, req.payload, ack_request);
 
-        self.driver
-            .transmit(&frame)
-            .await
-            .map_err(|_| MacError::RadioError)?;
+        // Fire-and-forget: try up to 3 times (no ACK verification)
+        for attempt in 0..3u8 {
+            match self.driver.transmit(&frame).await {
+                Ok(_) => break,
+                Err(_) if attempt < 2 => {
+                    Timer::after_millis(2).await;
+                    continue;
+                }
+                Err(_) => return Err(MacError::RadioError),
+            }
+        }
 
         Ok(McpsDataConfirm {
             msdu_handle: req.msdu_handle,
@@ -639,4 +672,28 @@ impl MacDriver for Bl702Mac {
             tx_power_max: TxPower(14),
         }
     }
+}
+
+/// Build a MAC Data Request command frame (used for polling parent).
+fn build_data_request(
+    seq: u8,
+    coord: &MacAddress,
+    own_extended: &IeeeAddress,
+) -> heapless::Vec<u8, 24> {
+    let mut frame = heapless::Vec::new();
+    // FC: MAC command, ack req, PAN compress, dst=short, src=extended
+    let _ = frame.extend_from_slice(&[0x63, 0xC8, seq]);
+    let dst_pan = coord.pan_id();
+    let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
+    match coord {
+        MacAddress::Short(_, addr) => {
+            let _ = frame.extend_from_slice(&addr.0.to_le_bytes());
+        }
+        MacAddress::Extended(_, addr) => {
+            let _ = frame.extend_from_slice(addr);
+        }
+    }
+    let _ = frame.extend_from_slice(own_extended);
+    let _ = frame.push(0x04); // Data Request command ID
+    frame
 }

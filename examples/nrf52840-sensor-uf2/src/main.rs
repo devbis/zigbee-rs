@@ -66,6 +66,9 @@ use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
 const REPORT_INTERVAL_SECS: u64 = 15;
+const FAST_POLL_MS: u64 = 250; // Fast poll during interview (250ms)
+const SLOW_POLL_SECS: u64 = 10; // Normal poll interval (10s)
+const FAST_POLL_DURATION_SECS: u64 = 60; // Stay in fast-poll for 60s after join
 
 bind_interrupts!(struct Irqs {
     RADIO => radio::InterruptHandler<peripherals::RADIO>;
@@ -232,17 +235,23 @@ async fn main(_spawner: Spawner) {
         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
     ];
     if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-        log_event(e, &mut led);
+        if log_event(e, &mut led) {
+            // Join happened during init tick
+        }
     }
 
     // ── Main loop ──
     let mut secs_since_report: u64 = 0;
+    let mut fast_poll_remaining: u64 = 0; // seconds left in fast-poll mode
 
     loop {
-        let interval = if device.is_joined() {
-            REPORT_INTERVAL_SECS
+        // Determine poll/timer interval based on mode
+        let (poll_ms, is_fast) = if fast_poll_remaining > 0 {
+            (FAST_POLL_MS, true)
+        } else if device.is_joined() {
+            (SLOW_POLL_SECS * 1000, false)
         } else {
-            1
+            (1000, false) // 1s tick when not joined
         };
 
         // Build a future that waits for button press (or never completes if no button)
@@ -255,21 +264,18 @@ async fn main(_spawner: Spawner) {
         };
 
         match select3(
-            // For RX-off end devices: alternate between poll and passive listen.
-            // Poll retrieves indirect frames from parent; passive catches broadcasts.
+            // Poll parent for indirect frames, then passive listen
             async {
                 if device.is_joined() {
-                    // Poll parent first — most frames arrive via indirect delivery
                     match device.poll().await {
                         Ok(Some(ind)) => return Ok(ind),
                         _ => {}
                     }
                 }
-                // Fall through to passive listen (also handles pre-join traffic)
                 device.receive().await
             },
             button_fut,
-            Timer::after(Duration::from_secs(interval)),
+            Timer::after(Duration::from_millis(poll_ms)),
         )
         .await
         {
@@ -281,14 +287,46 @@ async fn main(_spawner: Spawner) {
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                 ];
                 if let Some(event) = device.process_incoming(&indication, &mut clusters).await {
-                    log_event(&event, &mut led);
+                    if log_event(&event, &mut led) {
+                        fast_poll_remaining = FAST_POLL_DURATION_SECS;
+                        info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
+                    }
                 }
                 if let TickResult::Event(ref e) = device.tick(0, &mut [
                     ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                 ]).await {
-                    log_event(e, &mut led);
+                    if log_event(e, &mut led) {
+                        fast_poll_remaining = FAST_POLL_DURATION_SECS;
+                        info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
+                    }
+                }
+
+                // In fast-poll: immediately poll again to drain indirect queue
+                if fast_poll_remaining > 0 && device.is_joined() {
+                    for _ in 0..3 {
+                        match device.poll().await {
+                            Ok(Some(extra)) => {
+                                let mut cls = [
+                                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                                ];
+                                if let Some(ev) = device.process_incoming(&extra, &mut cls).await {
+                                    if log_event(&ev, &mut led) {
+                                        fast_poll_remaining = FAST_POLL_DURATION_SECS;
+                                    }
+                                }
+                                let _ = device.tick(0, &mut [
+                                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                                ]).await;
+                            }
+                            _ => break, // No more indirect frames
+                        }
+                    }
                 }
             }
             Either3::First(Err(_)) => {
@@ -332,7 +370,10 @@ async fn main(_spawner: Spawner) {
                         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                     ];
                     if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-                        log_event(e, &mut led);
+                        if log_event(e, &mut led) {
+                            fast_poll_remaining = FAST_POLL_DURATION_SECS;
+                            info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
+                        }
                     }
                     Timer::after(Duration::from_millis(300)).await;
                 }
@@ -340,7 +381,18 @@ async fn main(_spawner: Spawner) {
 
             // ── Timer tick ──
             Either3::Third(_) => {
-                secs_since_report += interval;
+                // Track time in seconds (fast poll ticks are sub-second)
+                let elapsed_secs = if is_fast { 0u64 } else { poll_ms / 1000 };
+                secs_since_report += elapsed_secs;
+
+                // Decrement fast-poll countdown
+                if fast_poll_remaining > 0 {
+                    let decr = (poll_ms + 999) / 1000; // round up to nearest second
+                    fast_poll_remaining = fast_poll_remaining.saturating_sub(decr);
+                    if fast_poll_remaining == 0 {
+                        info!("Switching to slow poll ({}s)", SLOW_POLL_SECS);
+                    }
+                }
 
                 if device.is_joined() {
                     if secs_since_report >= REPORT_INTERVAL_SECS {
@@ -380,20 +432,50 @@ async fn main(_spawner: Spawner) {
                     }
                 }
 
-                if let TickResult::Event(ref e) = device.tick(interval as u16, &mut [
+                // Use 0 for tick elapsed during fast-poll to avoid
+                // premature reporting timer expiry
+                let tick_secs = if is_fast { 0u16 } else { (poll_ms / 1000) as u16 };
+                if let TickResult::Event(ref e) = device.tick(tick_secs, &mut [
                     ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                 ]).await {
-                    log_event(e, &mut led);
+                    if log_event(e, &mut led) {
+                        fast_poll_remaining = FAST_POLL_DURATION_SECS;
+                        info!("Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
+                    }
+                }
+
+                // In fast-poll timer ticks: also poll aggressively
+                if is_fast && device.is_joined() {
+                    for _ in 0..2 {
+                        match device.poll().await {
+                            Ok(Some(ind)) => {
+                                let mut cls = [
+                                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                                ];
+                                if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
+                                    log_event(&ev, &mut led);
+                                }
+                                let _ = device.tick(0, &mut [
+                                    ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
+                                    ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
+                                    ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
+                                ]).await;
+                            }
+                            _ => break,
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/// LED ON = joined, LED OFF = not joined.
-fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) {
+/// LED ON = joined, LED OFF = not joined. Returns true if this is a join event.
+fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) -> bool {
     match event {
         StackEvent::Joined {
             short_address,
@@ -405,18 +487,21 @@ fn log_event(event: &StackEvent, led: &mut gpio::Output<'_>) {
                 "Joined! addr=0x{:04X} ch={} pan=0x{:04X}",
                 short_address, channel, pan_id,
             );
+            true
         }
         StackEvent::Left => {
             led_off(led);
             info!("Left network");
+            false
         }
-        StackEvent::ReportSent => info!("Report sent"),
+        StackEvent::ReportSent => { info!("Report sent"); false }
         StackEvent::CommissioningComplete { success } => {
             info!(
                 "Commissioning: {}",
                 if *success { "ok" } else { "failed" }
             );
+            false
         }
-        _ => info!("Stack event"),
+        _ => { info!("Stack event"); false }
     }
 }
