@@ -104,6 +104,20 @@ impl Cluster for AlarmsCluster {
         }
     }
 
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[
+            CMD_RESET_ALARM.0,
+            CMD_RESET_ALL_ALARMS.0,
+            CMD_GET_ALARM.0,
+            CMD_RESET_ALARM_LOG.0,
+        ])
+        .unwrap_or_default()
+    }
+
+    fn generated_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[CMD_ALARM.0, CMD_GET_ALARM_RESPONSE.0]).unwrap_or_default()
+    }
+
     fn attributes(&self) -> &dyn AttributeStoreAccess {
         &self.store
     }

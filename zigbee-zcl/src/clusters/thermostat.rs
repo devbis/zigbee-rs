@@ -227,6 +227,97 @@ impl ThermostatCluster {
             .store
             .set_raw(ATTR_LOCAL_TEMPERATURE, ZclValue::I16(hundredths));
     }
+
+    /// Advance schedule execution.
+    ///
+    /// `day_of_week` is a bitmask (bit 0 = Sunday … bit 6 = Saturday).
+    /// `minutes_since_midnight` is the current time of day in minutes.
+    ///
+    /// Finds the latest schedule transition that has already passed for the
+    /// given day and applies its setpoints, then updates running mode.
+    pub fn tick(&mut self, day_of_week: u8, minutes_since_midnight: u16) {
+        let mut best_time: Option<u16> = None;
+        let mut best_heat: Option<i16> = None;
+        let mut best_cool: Option<i16> = None;
+
+        for entry in self.schedule.iter() {
+            if entry.days_of_week & day_of_week == 0 {
+                continue;
+            }
+            for t in entry.transitions.iter() {
+                if t.transition_time <= minutes_since_midnight
+                    && (best_time.is_none() || t.transition_time >= best_time.unwrap())
+                {
+                    best_time = Some(t.transition_time);
+                    best_heat = t.heat_setpoint;
+                    best_cool = t.cool_setpoint;
+                }
+            }
+        }
+
+        if best_time.is_some() {
+            if let Some(heat) = best_heat {
+                let _ = self
+                    .store
+                    .set(ATTR_OCCUPIED_HEATING_SETPOINT, ZclValue::I16(heat));
+            }
+            if let Some(cool) = best_cool {
+                let _ = self
+                    .store
+                    .set(ATTR_OCCUPIED_COOLING_SETPOINT, ZclValue::I16(cool));
+            }
+        }
+
+        // Update running mode based on system mode and current temperature vs setpoints
+        let system_mode = match self.store.get(ATTR_SYSTEM_MODE) {
+            Some(ZclValue::Enum8(v)) => *v,
+            _ => SYSTEM_MODE_OFF,
+        };
+        let local_temp = match self.store.get(ATTR_LOCAL_TEMPERATURE) {
+            Some(ZclValue::I16(v)) => *v,
+            _ => 0,
+        };
+        let heat_sp = match self.store.get(ATTR_OCCUPIED_HEATING_SETPOINT) {
+            Some(ZclValue::I16(v)) => *v,
+            _ => 2000,
+        };
+        let cool_sp = match self.store.get(ATTR_OCCUPIED_COOLING_SETPOINT) {
+            Some(ZclValue::I16(v)) => *v,
+            _ => 2600,
+        };
+
+        let running_mode = match system_mode {
+            SYSTEM_MODE_OFF | SYSTEM_MODE_FAN_ONLY => SYSTEM_MODE_OFF,
+            SYSTEM_MODE_HEAT | SYSTEM_MODE_EMERGENCY_HEAT => {
+                if local_temp < heat_sp {
+                    SYSTEM_MODE_HEAT
+                } else {
+                    SYSTEM_MODE_OFF
+                }
+            }
+            SYSTEM_MODE_COOL => {
+                if local_temp > cool_sp {
+                    SYSTEM_MODE_COOL
+                } else {
+                    SYSTEM_MODE_OFF
+                }
+            }
+            SYSTEM_MODE_AUTO => {
+                if local_temp < heat_sp {
+                    SYSTEM_MODE_HEAT
+                } else if local_temp > cool_sp {
+                    SYSTEM_MODE_COOL
+                } else {
+                    SYSTEM_MODE_OFF
+                }
+            }
+            _ => SYSTEM_MODE_OFF,
+        };
+        let _ = self.store.set_raw(
+            ATTR_THERMOSTAT_RUNNING_MODE,
+            ZclValue::Enum8(running_mode),
+        );
+    }
 }
 
 impl Cluster for ThermostatCluster {
@@ -372,6 +463,20 @@ impl Cluster for ThermostatCluster {
             }
             _ => Err(ZclStatus::UnsupClusterCommand),
         }
+    }
+
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[
+            CMD_SETPOINT_RAISE_LOWER.0,
+            CMD_SET_WEEKLY_SCHEDULE.0,
+            CMD_GET_WEEKLY_SCHEDULE.0,
+            CMD_CLEAR_WEEKLY_SCHEDULE.0,
+        ])
+        .unwrap_or_default()
+    }
+
+    fn generated_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[CMD_GET_WEEKLY_SCHEDULE_RESPONSE.0]).unwrap_or_default()
     }
 
     fn attributes(&self) -> &dyn AttributeStoreAccess {

@@ -135,6 +135,10 @@ impl Cluster for IasWdCluster {
         }
     }
 
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[CMD_START_WARNING.0, CMD_SQUAWK.0]).unwrap_or_default()
+    }
+
     fn attributes(&self) -> &dyn AttributeStoreAccess {
         &self.store
     }

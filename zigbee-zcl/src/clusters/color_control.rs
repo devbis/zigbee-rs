@@ -263,6 +263,37 @@ impl ColorControlCluster {
         let _ = self
             .store
             .set_raw(ATTR_REMAINING_TIME, ZclValue::U16(remaining));
+
+        // Color loop engine: cycle enhanced hue when active
+        let loop_active = self.get_u8_attr(ATTR_COLOR_LOOP_ACTIVE);
+        if loop_active != 0 {
+            let loop_time = self.get_u16_attr(ATTR_COLOR_LOOP_TIME);
+            let direction = self.get_u8_attr(ATTR_COLOR_LOOP_DIRECTION);
+            if loop_time > 0 {
+                let current = self.get_u16_attr(ATTR_ENHANCED_CURRENT_HUE);
+                // loop_time is in seconds; elapsed_ds is in 1/10th seconds
+                // Full hue cycle (0..65535) in loop_time seconds
+                // Step per tick = 65536 / (loop_time * 10 / elapsed_ds)
+                let steps_per_cycle = (loop_time as u32) * 10;
+                let hue_step = (65536u32 * elapsed_ds as u32)
+                    .checked_div(steps_per_cycle)
+                    .unwrap_or(1) as u16;
+                let new_hue = if direction == 0x01 {
+                    // Increment
+                    current.wrapping_add(hue_step)
+                } else {
+                    // Decrement
+                    current.wrapping_sub(hue_step)
+                };
+                let _ = self
+                    .store
+                    .set_raw(ATTR_ENHANCED_CURRENT_HUE, ZclValue::U16(new_hue));
+                // Update 8-bit hue too (high byte of enhanced)
+                let _ = self
+                    .store
+                    .set_raw(ATTR_CURRENT_HUE, ZclValue::U8((new_hue >> 8) as u8));
+            }
+        }
     }
 }
 
@@ -716,21 +747,78 @@ impl Cluster for ColorControlCluster {
                 if payload.len() < 7 {
                     return Err(ZclStatus::MalformedCommand);
                 }
-                let _move_mode = payload[0];
-                let _rate = u16::from_le_bytes([payload[1], payload[2]]);
-                let _min = u16::from_le_bytes([payload[3], payload[4]]);
-                let _max = u16::from_le_bytes([payload[5], payload[6]]);
+                let move_mode = payload[0];
+                let rate = u16::from_le_bytes([payload[1], payload[2]]);
+                let min_ct = u16::from_le_bytes([payload[3], payload[4]]);
+                let max_ct = u16::from_le_bytes([payload[5], payload[6]]);
+                let _ = self
+                    .store
+                    .set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_TEMPERATURE));
+                let current = self.get_u16_attr(ATTR_COLOR_TEMPERATURE_MIREDS);
+                match move_mode {
+                    0x01 => {
+                        // Move up
+                        let target = if max_ct > 0 { max_ct } else { 65279 };
+                        let distance = target.saturating_sub(current) as i32;
+                        let time_ds = if rate > 0 {
+                            (distance * 10 / rate as i32).max(1) as u16
+                        } else {
+                            1
+                        };
+                        self.transitions
+                            .start(ATTR_COLOR_TEMPERATURE_MIREDS.0, current as i32, target as i32, time_ds);
+                    }
+                    0x03 => {
+                        // Move down
+                        let target = if min_ct > 0 { min_ct } else { 0 };
+                        let distance = current.saturating_sub(target) as i32;
+                        let time_ds = if rate > 0 {
+                            (distance * 10 / rate as i32).max(1) as u16
+                        } else {
+                            1
+                        };
+                        self.transitions
+                            .start(ATTR_COLOR_TEMPERATURE_MIREDS.0, current as i32, target as i32, time_ds);
+                    }
+                    _ => {
+                        // Stop
+                        self.transitions.stop(ATTR_COLOR_TEMPERATURE_MIREDS.0);
+                    }
+                }
                 Ok(heapless::Vec::new())
             }
             CMD_STEP_COLOR_TEMPERATURE => {
                 if payload.len() < 9 {
                     return Err(ZclStatus::MalformedCommand);
                 }
-                let _step_mode = payload[0];
-                let _step_size = u16::from_le_bytes([payload[1], payload[2]]);
-                let _transition = u16::from_le_bytes([payload[3], payload[4]]);
-                let _min = u16::from_le_bytes([payload[5], payload[6]]);
-                let _max = u16::from_le_bytes([payload[7], payload[8]]);
+                let step_mode = payload[0];
+                let step_size = u16::from_le_bytes([payload[1], payload[2]]);
+                let transition = u16::from_le_bytes([payload[3], payload[4]]);
+                let min_ct = u16::from_le_bytes([payload[5], payload[6]]);
+                let max_ct = u16::from_le_bytes([payload[7], payload[8]]);
+                let _ = self
+                    .store
+                    .set_raw(ATTR_COLOR_MODE, ZclValue::Enum8(COLOR_MODE_TEMPERATURE));
+                let current = self.get_u16_attr(ATTR_COLOR_TEMPERATURE_MIREDS) as i32;
+                let target = match step_mode {
+                    0x01 => {
+                        let t = (current + step_size as i32).min(65279);
+                        if max_ct > 0 { t.min(max_ct as i32) } else { t }
+                    }
+                    0x03 => {
+                        let t = (current - step_size as i32).max(0);
+                        if min_ct > 0 { t.max(min_ct as i32) } else { t }
+                    }
+                    _ => current,
+                };
+                if transition == 0 {
+                    let _ = self
+                        .store
+                        .set_raw(ATTR_COLOR_TEMPERATURE_MIREDS, ZclValue::U16(target as u16));
+                } else {
+                    self.transitions
+                        .start(ATTR_COLOR_TEMPERATURE_MIREDS.0, current, target, transition);
+                }
                 Ok(heapless::Vec::new())
             }
             _ => Err(ZclStatus::UnsupClusterCommand),

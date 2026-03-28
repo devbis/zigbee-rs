@@ -177,8 +177,75 @@ impl Cluster for IasAceCluster {
                 Ok(self.build_panel_status_payload(ALARM_STATUS_POLICE_PANIC))
             }
             CMD_GET_PANEL_STATUS => Ok(self.build_panel_status_payload(ALARM_STATUS_NO_ALARM)),
+            CMD_GET_ZONE_ID_MAP => {
+                // Return 16 zero u16 values (no zones mapped)
+                let mut resp = heapless::Vec::new();
+                for _ in 0..16 {
+                    let _ = resp.extend_from_slice(&0u16.to_le_bytes());
+                }
+                Ok(resp)
+            }
+            CMD_GET_ZONE_INFORMATION => {
+                // Payload: zone_id(u8)
+                let zone_id = if payload.is_empty() { 0u8 } else { payload[0] };
+                let mut resp = heapless::Vec::new();
+                let _ = resp.push(zone_id); // zone_id
+                let _ = resp.extend_from_slice(&0u16.to_le_bytes()); // zone_type = 0
+                let _ = resp.extend_from_slice(&[0u8; 8]); // IEEE address = 0
+                // zone_label: ZCL string (length-prefixed), empty
+                let _ = resp.push(0x00); // label length = 0
+                Ok(resp)
+            }
+            CMD_BYPASS => {
+                // Accept but no-op (no bypass table)
+                Ok(heapless::Vec::new())
+            }
+            CMD_GET_BYPASSED_ZONE_LIST => {
+                // Return empty bypassed zone list
+                let mut resp = heapless::Vec::new();
+                let _ = resp.push(0x00); // number of zones = 0
+                Ok(resp)
+            }
+            CMD_GET_ZONE_STATUS => {
+                // Return zone status response with empty zone list
+                let mut resp = heapless::Vec::new();
+                let _ = resp.push(0x01); // zone_status_complete = true
+                let _ = resp.push(0x00); // number_of_zones = 0
+                Ok(resp)
+            }
             _ => Err(ZclStatus::UnsupClusterCommand),
         }
+    }
+
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[
+            CMD_ARM.0,
+            CMD_BYPASS.0,
+            CMD_EMERGENCY.0,
+            CMD_FIRE.0,
+            CMD_PANIC.0,
+            CMD_GET_ZONE_ID_MAP.0,
+            CMD_GET_ZONE_INFORMATION.0,
+            CMD_GET_PANEL_STATUS.0,
+            CMD_GET_BYPASSED_ZONE_LIST.0,
+            CMD_GET_ZONE_STATUS.0,
+        ])
+        .unwrap_or_default()
+    }
+
+    fn generated_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[
+            CMD_ARM_RESPONSE.0,
+            CMD_GET_ZONE_ID_MAP_RESPONSE.0,
+            CMD_GET_ZONE_INFORMATION_RESPONSE.0,
+            CMD_ZONE_STATUS_CHANGED.0,
+            CMD_PANEL_STATUS_CHANGED.0,
+            CMD_GET_PANEL_STATUS_RESPONSE.0,
+            CMD_SET_BYPASSED_ZONE_LIST.0,
+            CMD_BYPASS_RESPONSE.0,
+            CMD_GET_ZONE_STATUS_RESPONSE.0,
+        ])
+        .unwrap_or_default()
     }
 
     fn attributes(&self) -> &dyn AttributeStoreAccess {

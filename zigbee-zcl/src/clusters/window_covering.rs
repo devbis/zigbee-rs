@@ -222,6 +222,19 @@ impl Cluster for WindowCoveringCluster {
         }
     }
 
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[
+            CMD_UP_OPEN.0,
+            CMD_DOWN_CLOSE.0,
+            CMD_STOP.0,
+            CMD_GO_TO_LIFT_VALUE.0,
+            CMD_GO_TO_LIFT_PERCENTAGE.0,
+            CMD_GO_TO_TILT_VALUE.0,
+            CMD_GO_TO_TILT_PERCENTAGE.0,
+        ])
+        .unwrap_or_default()
+    }
+
     fn attributes(&self) -> &dyn AttributeStoreAccess {
         &self.store
     }

@@ -83,6 +83,8 @@ pub struct PinEntry {
 pub struct DoorLockCluster {
     store: AttributeStore<16>,
     pins: heapless::Vec<(u16, PinEntry), 8>,
+    /// Seconds remaining until automatic re-lock (0 = inactive).
+    pub auto_relock_remaining: u32,
 }
 
 impl DoorLockCluster {
@@ -235,6 +237,7 @@ impl DoorLockCluster {
         Self {
             store,
             pins: heapless::Vec::new(),
+            auto_relock_remaining: 0,
         }
     }
 
@@ -261,6 +264,26 @@ impl DoorLockCluster {
         let _ = resp.push(status);
         resp
     }
+
+    /// Start the auto-relock countdown from the ATTR_AUTO_RELOCK_TIME value.
+    fn start_auto_relock_timer(&mut self) {
+        let timeout = match self.store.get(ATTR_AUTO_RELOCK_TIME) {
+            Some(ZclValue::U32(v)) => *v,
+            _ => 0,
+        };
+        self.auto_relock_remaining = timeout;
+    }
+
+    /// Call every 1 second. Decrements the auto-relock timer and locks
+    /// the door when it expires.
+    pub fn tick(&mut self) {
+        if self.auto_relock_remaining > 0 && self.lock_state() == LOCK_STATE_UNLOCKED {
+            self.auto_relock_remaining -= 1;
+            if self.auto_relock_remaining == 0 {
+                self.set_lock_state(LOCK_STATE_LOCKED);
+            }
+        }
+    }
 }
 
 impl Cluster for DoorLockCluster {
@@ -280,6 +303,7 @@ impl Cluster for DoorLockCluster {
             }
             CMD_UNLOCK_DOOR => {
                 self.set_lock_state(LOCK_STATE_UNLOCKED);
+                self.start_auto_relock_timer();
                 Ok(Self::build_status_response(0x00))
             }
             CMD_TOGGLE => {
@@ -289,6 +313,9 @@ impl Cluster for DoorLockCluster {
                     LOCK_STATE_LOCKED
                 };
                 self.set_lock_state(new_state);
+                if new_state == LOCK_STATE_UNLOCKED {
+                    self.start_auto_relock_timer();
+                }
                 Ok(Self::build_status_response(0x00))
             }
             CMD_UNLOCK_WITH_TIMEOUT => {
@@ -296,6 +323,7 @@ impl Cluster for DoorLockCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 self.set_lock_state(LOCK_STATE_UNLOCKED);
+                self.start_auto_relock_timer();
                 Ok(Self::build_status_response(0x00))
             }
             CMD_SET_PIN_CODE => {
@@ -398,6 +426,33 @@ impl Cluster for DoorLockCluster {
             }
             _ => Err(ZclStatus::UnsupClusterCommand),
         }
+    }
+
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[
+            CMD_LOCK_DOOR.0,
+            CMD_UNLOCK_DOOR.0,
+            CMD_TOGGLE.0,
+            CMD_UNLOCK_WITH_TIMEOUT.0,
+            CMD_SET_PIN_CODE.0,
+            CMD_GET_PIN_CODE.0,
+            CMD_CLEAR_PIN_CODE.0,
+            CMD_CLEAR_ALL_PIN_CODES.0,
+            CMD_SET_USER_STATUS.0,
+            CMD_GET_USER_STATUS.0,
+        ])
+        .unwrap_or_default()
+    }
+
+    fn generated_commands(&self) -> heapless::Vec<u8, 32> {
+        heapless::Vec::from_slice(&[
+            CMD_LOCK_DOOR_RSP.0,
+            CMD_UNLOCK_DOOR_RSP.0,
+            CMD_TOGGLE_RSP.0,
+            CMD_OPERATING_EVENT_NOTIFICATION.0,
+            CMD_PROGRAMMING_EVENT_NOTIFICATION.0,
+        ])
+        .unwrap_or_default()
     }
 
     fn attributes(&self) -> &dyn AttributeStoreAccess {
