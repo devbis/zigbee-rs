@@ -127,11 +127,50 @@ impl<'a, T: Instance> NrfMac<'a, T> {
     }
 
     /// Configure hardware address filtering on the radio.
+    ///
+    /// The nRF52840 RADIO peripheral supports automatic MHR (MAC Header) matching
+    /// via DAB/DAP registers for address filtering. This programs:
+    /// - DAP0/DAB0: short address + PAN ID for destination matching
+    /// - DACNF: enable address 0
+    ///
+    /// With this configured, the radio only delivers frames addressed to us
+    /// (or broadcast), reducing CPU wake-ups for sleepy end devices.
     fn update_address_filter(&mut self) {
-        // nRF52840 radio supports hardware PAN ID and short address filtering
-        // This avoids receiving frames not addressed to us
-        // TODO: call radio.set_pan_id() and radio.set_short_address()
-        // when embassy-nrf exposes these APIs
+        // nRF52840 RADIO base address
+        const RADIO_BASE: u32 = 0x4000_1000;
+        // DAB[n] — Device Address Base (lower 32 bits)
+        const DAB0: *mut u32 = (RADIO_BASE + 0x600) as *mut u32;
+        // DAP[n] — Device Address Prefix (upper 16 bits)
+        const DAP0: *mut u32 = (RADIO_BASE + 0x620) as *mut u32;
+        // DACNF — Device Address match Configuration
+        const DACNF: *mut u32 = (RADIO_BASE + 0x640) as *mut u32;
+
+        // For IEEE 802.15.4 MHR matching:
+        // DAB0 = PAN_ID(16) | SHORT_ADDR(16) packed as little-endian
+        let pan = self.pan_id.0;
+        let short = self.short_address.0;
+
+        // Only enable filtering if we have a valid short address and PAN
+        if short == 0xFFFF || pan == 0xFFFF {
+            // Disable address matching — accept all frames
+            unsafe { core::ptr::write_volatile(DACNF, 0) };
+            return;
+        }
+
+        // Pack: lower 16 = PAN ID, upper 16 = short address
+        let dab_val = (pan as u32) | ((short as u32) << 16);
+        unsafe {
+            core::ptr::write_volatile(DAB0, dab_val);
+            core::ptr::write_volatile(DAP0, 0); // not used for short addr matching
+            // Enable address 0 matching (bit 0 = ENA0)
+            // Note: nRF52840 MHR match is best-effort; we still validate in software
+            core::ptr::write_volatile(DACNF, 0x01);
+        }
+        log::debug!(
+            "[nRF MAC] Address filter: PAN=0x{:04X} short=0x{:04X}",
+            pan,
+            short
+        );
     }
 
     /// Construct a beacon request MAC command frame.
@@ -225,9 +264,8 @@ impl<'a, T: Instance> NrfMac<'a, T> {
             return None;
         }
 
-        // Parse superframe spec (first 2 bytes of beacon payload in MHR)
-        // The exact position depends on addressing mode — simplified here
-        // TODO: proper IEEE 802.15.4 frame parsing via ieee802154 crate
+        // Parse superframe spec from beacon payload.
+        // Position depends on addressing mode — computed via addressing_size().
         let superframe_offset = 3 + addressing_size(fc);
         if data.len() < superframe_offset + 2 {
             return None;
@@ -300,11 +338,28 @@ impl<T: Instance> MacDriver for NrfMac<'_, T> {
                 }
                 ScanType::Ed => {
                     self.set_channel(ch);
-                    // nRF52840 supports hardware ED measurement
-                    // TODO: use radio.energy_detection() when available
+                    // Measure energy on channel using RSSI sampling.
+                    // nRF52840 doesn't expose a standalone ED task via embassy-nrf,
+                    // so we start a brief RX and sample RSSISAMPLE register.
+                    const RADIO_BASE: u32 = 0x4000_1000;
+                    const RSSISAMPLE: *const u32 = (RADIO_BASE + 0x548) as *const u32;
+
+                    // Brief listen to let AGC settle and capture RSSI
+                    let mut dummy = Packet::new();
+                    let _ = select::select(
+                        Timer::after_millis(2),
+                        self.radio.receive(&mut dummy),
+                    )
+                    .await;
+
+                    // Read RSSISAMPLE (value is positive dBm magnitude, negate for actual)
+                    let rssi_raw = unsafe { core::ptr::read_volatile(RSSISAMPLE) } as u8;
+                    // Convert to 802.15.4 ED value (0-255, higher = more energy)
+                    // nRF RSSI is 0..127 (abs dBm), map: ED = 255 - (rssi * 2)
+                    let ed = 255u8.saturating_sub(rssi_raw.saturating_mul(2));
                     let _ = energy_list.push(EdValue {
                         channel: ch,
-                        energy: 0,
+                        energy: ed,
                     });
                 }
                 ScanType::Orphan => {

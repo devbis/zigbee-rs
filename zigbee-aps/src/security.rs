@@ -571,3 +571,15 @@ pub fn derive_key_transport_key(link_key: &AesKey) -> AesKey {
 pub fn derive_key_load_key(link_key: &AesKey) -> AesKey {
     hmac_mmo(link_key, &[0x02])
 }
+
+/// Compute Verify-Key hash for APSME-VERIFY-KEY (Zigbee spec §4.4.11.2).
+///
+/// hash = AES-MMO( initiator_ieee[8] || key[16] )
+/// The 24-byte input is the concatenation of the initiator's IEEE address
+/// (little-endian) and the trust center link key being verified.
+pub fn compute_verify_key_hash(initiator_ieee: &[u8; 8], key: &AesKey) -> AesKey {
+    let mut input = [0u8; 24]; // 8 (IEEE) + 16 (key)
+    input[..8].copy_from_slice(initiator_ieee);
+    input[8..24].copy_from_slice(key);
+    matyas_meyer_oseas_hash(&input)
+}

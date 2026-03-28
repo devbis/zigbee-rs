@@ -1016,10 +1016,24 @@ impl<M: MacDriver> ApsLayer<M> {
                 log::info!("[APS] Network key installed");
             }
             0x03 => {
-                // Trust Center Link Key
-                log::info!("[APS] Transport-Key: TC Link Key from 0x{:04X}", src.0,);
+                // Trust Center Link Key (spec §4.4.9.2.3)
+                // Payload: key_type(1) + key(16) + dest_ieee(8) + src_ieee(8) = 33 bytes
+                // src_ieee is the TC's IEEE address
+                let tc_ieee = if data.len() >= 33 {
+                    let mut addr = [0u8; 8];
+                    addr.copy_from_slice(&data[25..33]);
+                    addr
+                } else {
+                    // Short payload — resolve TC IEEE from NWK neighbor table
+                    self.nwk().find_ieee_by_short(src).unwrap_or([0u8; 8])
+                };
+                log::info!(
+                    "[APS] Transport-Key: TC Link Key from 0x{:04X}, TC IEEE={:02X?}",
+                    src.0,
+                    tc_ieee,
+                );
                 let entry = crate::security::ApsLinkKeyEntry {
-                    partner_address: [0u8; 8], // TC address
+                    partner_address: tc_ieee,
                     key,
                     key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
                     outgoing_frame_counter: 0,

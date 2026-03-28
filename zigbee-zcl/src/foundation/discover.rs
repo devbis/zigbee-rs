@@ -201,3 +201,91 @@ pub fn process_discover_commands(
         command_ids,
     }
 }
+
+// ── Discover Attributes Extended (0x15/0x16) ──
+
+/// A single entry in the Discover Attributes Extended Response.
+/// Includes access control flags per ZCL spec §2.5.14.
+#[derive(Debug, Clone)]
+pub struct DiscoverAttributeExtendedInfo {
+    pub id: AttributeId,
+    pub data_type: ZclDataType,
+    /// Bit 0: readable, Bit 1: writable, Bit 2: reportable
+    pub access_control: u8,
+}
+
+/// Discover Attributes Extended Response.
+#[derive(Debug, Clone)]
+pub struct DiscoverAttributesExtendedResponse {
+    pub complete: bool,
+    pub attributes: heapless::Vec<DiscoverAttributeExtendedInfo, MAX_DISCOVER>,
+}
+
+impl DiscoverAttributesExtendedResponse {
+    /// Serialize: 1 byte complete + N*(2 id + 1 type + 1 access) = 4 bytes per entry.
+    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        buf[0] = if self.complete { 1 } else { 0 };
+        let mut pos = 1;
+        for info in &self.attributes {
+            if pos + 4 > buf.len() {
+                break;
+            }
+            let b = info.id.0.to_le_bytes();
+            buf[pos] = b[0];
+            buf[pos + 1] = b[1];
+            buf[pos + 2] = info.data_type as u8;
+            buf[pos + 3] = info.access_control;
+            pos += 4;
+        }
+        pos
+    }
+}
+
+/// Process a Discover Attributes Extended request.
+/// Returns attribute info with access control flags.
+pub fn process_discover_extended_dyn(
+    store: &dyn crate::clusters::AttributeStoreAccess,
+    request: &DiscoverAttributesRequest,
+) -> DiscoverAttributesExtendedResponse {
+    let ids = store.all_ids();
+    let mut attributes = heapless::Vec::new();
+    let max = request.max_results as usize;
+    let mut count = 0;
+    let mut complete = true;
+
+    for id in &ids {
+        if id.0 >= request.start_id.0 {
+            if count >= max {
+                complete = false;
+                break;
+            }
+            if let Some(def) = store.find(*id) {
+                // Bit 0: readable, Bit 1: writable, Bit 2: reportable
+                let mut access_control: u8 = 0;
+                if def.access.is_readable() {
+                    access_control |= 0x01;
+                }
+                if def.access.is_writable() {
+                    access_control |= 0x02;
+                }
+                if def.access.is_reportable() {
+                    access_control |= 0x04;
+                }
+                let _ = attributes.push(DiscoverAttributeExtendedInfo {
+                    id: *id,
+                    data_type: def.data_type,
+                    access_control,
+                });
+                count += 1;
+            }
+        }
+    }
+
+    DiscoverAttributesExtendedResponse {
+        complete,
+        attributes,
+    }
+}

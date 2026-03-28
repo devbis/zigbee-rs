@@ -358,18 +358,19 @@ impl<M: MacDriver> ApsLayer<M> {
                 return ApsStatus::IllegalRequest;
             }
         };
-        // Compute HMAC hash of the key for verification
-        // Simplified: use first 16 bytes of key as the hash placeholder
-        // Real implementation needs AES-MMO hash (HMAC-AES-128)
-        let hash = match self.security.find_key(&req.dst_address, req.key_type) {
+        // Compute APSME-VERIFY-KEY hash per spec §4.4.11.2:
+        // hash = AES-MMO(initiator_ieee || link_key)
+        let key = match self.security.find_key(&req.dst_address, req.key_type) {
             Some(entry) => entry.key,
             None => {
                 log::warn!("APSME-VERIFY-KEY: no key for {:02X?}", req.dst_address);
                 return ApsStatus::IllegalRequest;
             }
         };
-        let key_type_byte = req.key_type as u8;
         let local_ieee = self.nwk.nib().ieee_address;
+        let hash =
+            crate::security::compute_verify_key_hash(&local_ieee, &key);
+        let key_type_byte = req.key_type as u8;
         match self
             .send_verify_key(dst_short, &local_ieee, key_type_byte, &hash)
             .await

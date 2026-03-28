@@ -16,6 +16,8 @@ struct ReassemblyEntry {
     received_mask: u8,
     data: [u8; 256],
     data_len: usize,
+    /// Ticks since last fragment received (incremented by age_entries)
+    age: u8,
 }
 
 impl ReassemblyEntry {
@@ -28,6 +30,7 @@ impl ReassemblyEntry {
             received_mask: 0,
             data: [0u8; 256],
             data_len: 0,
+            age: 0,
         }
     }
 
@@ -93,6 +96,7 @@ impl FragmentReassembly {
             entry.aps_counter = aps_counter;
             entry.total_blocks = total_blocks;
             entry.received_mask = 1; // block 0
+            entry.age = 0;
             let copy_len = payload.len().min(entry.data.len());
             entry.data[..copy_len].copy_from_slice(&payload[..copy_len]);
             entry.data_len = copy_len;
@@ -111,6 +115,7 @@ impl FragmentReassembly {
                 return None; // duplicate
             }
             entry.received_mask |= bit;
+            entry.age = 0; // reset age on new fragment
             let copy_len = payload.len().min(entry.data.len() - entry.data_len);
             entry.data[entry.data_len..entry.data_len + copy_len]
                 .copy_from_slice(&payload[..copy_len]);
@@ -162,9 +167,26 @@ impl FragmentReassembly {
 
     /// Age reassembly entries — expire stale incomplete reassemblies.
     ///
-    /// Provides a hook for periodic cleanup. Currently entries are only
-    /// cleared when completed or evicted by new sessions.
+    /// Should be called periodically (e.g., every 1 second from the runtime tick).
+    /// Entries that have not received a new fragment within `MAX_AGE_TICKS`
+    /// ticks are expired and their slots freed.
     pub fn age_entries(&mut self) {
-        // Future: track per-entry age and expire after timeout
+        // ~10 ticks at 1s per tick = 10 seconds timeout
+        const MAX_AGE_TICKS: u8 = 10;
+        for entry in self.entries.iter_mut() {
+            if entry.active && !entry.is_complete() {
+                entry.age = entry.age.saturating_add(1);
+                if entry.age >= MAX_AGE_TICKS {
+                    log::debug!(
+                        "[APS frag] Expiring stale reassembly: src=0x{:04X} counter={} ({}/{} blocks)",
+                        entry.src_addr,
+                        entry.aps_counter,
+                        entry.received_mask.count_ones(),
+                        entry.total_blocks,
+                    );
+                    entry.active = false;
+                }
+            }
+        }
     }
 }

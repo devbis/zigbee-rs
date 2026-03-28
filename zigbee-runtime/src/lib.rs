@@ -1167,6 +1167,43 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             });
         }
 
+        // ── Discover Attributes Extended (0x15) ─────────────────
+        if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && cmd_id == 0x15
+        {
+            if let Some(req) = zigbee_zcl::foundation::discover::DiscoverAttributesRequest::parse(
+                zcl_frame.payload.as_slice(),
+            ) && let Some(cr) = clusters
+                .iter()
+                .find(|cr| cr.endpoint == dst_ep && cr.cluster.cluster_id().0 == cluster_id)
+            {
+                let response = zigbee_zcl::foundation::discover::process_discover_extended_dyn(
+                    cr.cluster.attributes(),
+                    &req,
+                );
+                let mut payload_buf = [0u8; 128];
+                let payload_len = response.serialize(&mut payload_buf);
+                self.queue_global_response(
+                    src_addr,
+                    aps_indication.src_endpoint,
+                    dst_ep,
+                    cluster_id,
+                    zcl_frame.header.seq_number,
+                    0x16, // Discover Attributes Extended Response
+                    &payload_buf[..payload_len],
+                );
+            }
+            return Some(event_loop::StackEvent::CommandReceived {
+                src_addr,
+                endpoint: dst_ep,
+                cluster_id,
+                command_id: cmd_id,
+                seq_number: zcl_frame.header.seq_number,
+                payload: heapless::Vec::from_slice(zcl_frame.payload.as_slice())
+                    .unwrap_or_default(),
+            });
+        }
+
         // ── Cluster-specific command dispatch ────────────────────
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::ClusterSpecific {
             // Intercept Identify Query Response (cluster 0x0003, cmd 0x00, server→client)

@@ -149,6 +149,43 @@ impl IasZoneCluster {
         let _ = buf.extend_from_slice(&0u16.to_le_bytes()); // delay
         buf
     }
+
+    /// Build a Zone Enroll Request (command ID 0x01, server → client).
+    /// Returns the payload bytes: zone_type(2) + manufacturer_code(2)
+    /// The device sends this to CIE to request enrollment.
+    pub fn build_zone_enroll_request(&self, manufacturer_code: u16) -> heapless::Vec<u8, 4> {
+        let mut buf = heapless::Vec::new();
+        let zone_type = match self.store.get(ATTR_ZONE_TYPE) {
+            Some(ZclValue::Enum16(v)) => *v,
+            _ => 0,
+        };
+        let _ = buf.extend_from_slice(&zone_type.to_le_bytes());
+        let _ = buf.extend_from_slice(&manufacturer_code.to_le_bytes());
+        buf
+    }
+
+    /// Check if the zone is enrolled.
+    pub fn is_enrolled(&self) -> bool {
+        matches!(
+            self.store.get(ATTR_ZONE_STATE),
+            Some(ZclValue::Enum8(ZONE_STATE_ENROLLED))
+        )
+    }
+
+    /// Set the CIE IEEE address (written by the CIE during enrollment setup).
+    pub fn set_cie_address(&mut self, ieee: u64) {
+        let _ = self
+            .store
+            .set_raw(ATTR_IAS_CIE_ADDRESS, ZclValue::IeeeAddr(ieee));
+    }
+
+    /// Get the CIE IEEE address.
+    pub fn get_cie_address(&self) -> u64 {
+        match self.store.get(ATTR_IAS_CIE_ADDRESS) {
+            Some(ZclValue::IeeeAddr(v)) => *v,
+            _ => 0,
+        }
+    }
 }
 
 impl Cluster for IasZoneCluster {
@@ -193,6 +230,21 @@ impl Cluster for IasZoneCluster {
             }
             _ => Err(ZclStatus::UnsupClusterCommand),
         }
+    }
+
+    fn received_commands(&self) -> heapless::Vec<u8, 32> {
+        let mut v = heapless::Vec::new();
+        let _ = v.push(CMD_ZONE_ENROLL_RESPONSE.0);
+        let _ = v.push(CMD_INITIATE_NORMAL_OP_MODE.0);
+        let _ = v.push(CMD_INITIATE_TEST_MODE.0);
+        v
+    }
+
+    fn generated_commands(&self) -> heapless::Vec<u8, 32> {
+        let mut v = heapless::Vec::new();
+        let _ = v.push(CMD_ZONE_STATUS_CHANGE_NOTIFICATION.0);
+        let _ = v.push(CMD_ZONE_ENROLL_REQUEST.0);
+        v
     }
 
     fn attributes(&self) -> &dyn AttributeStoreAccess {
