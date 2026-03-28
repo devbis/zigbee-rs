@@ -124,11 +124,11 @@ impl Bl702Mac {
     }
 
     /// Construct an IEEE 802.15.4 Beacon Request MAC command frame.
-    fn beacon_request_frame(&mut self) -> [u8; 10] {
+    fn beacon_request_frame(&mut self) -> [u8; 8] {
         let seq = self.next_dsn();
-        // Frame Control: MAC command, no security, no frame pending,
+        // Frame Control: MAC command (0x03), no security, no frame pending,
         // no ack request, no PAN ID compression, dst=short, src=none
-        [0x03, 0x08, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00, 0x00]
+        [0x03, 0x08, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07]
     }
 
     /// Construct an IEEE 802.15.4 Association Request MAC command frame.
@@ -140,9 +140,10 @@ impl Bl702Mac {
         let mut frame = heapless::Vec::new();
         let seq = self.next_dsn();
 
-        // Frame Control: MAC command, no security, no pending,
-        // ack requested, PAN ID compression, dst=short, src=extended
-        let _ = frame.extend_from_slice(&[0x23, 0xC8, seq]);
+        // Frame Control: MAC command (type=3), no security, no pending,
+        // ack requested (bit 5), PAN ID compression (bit 6), dst=short, src=extended
+        // 0x63 = 0b_0110_0011 (low byte), 0xC8 = 0b_1100_1000 (high byte)
+        let _ = frame.extend_from_slice(&[0x63, 0xC8, seq]);
 
         // Destination PAN + address
         let dst_pan = coord_address.pan_id();
@@ -193,7 +194,9 @@ impl Bl702Mac {
             loop {
                 match self.driver.receive().await {
                     Ok(rx_frame) => {
-                        if let Some(desc) = self.parse_beacon(&rx_frame.data[..rx_frame.len]) {
+                        if let Some(desc) =
+                            Self::parse_beacon(&rx_frame.data[..rx_frame.len], rx_frame.lqi, channel)
+                        {
                             let _ = results.push(desc);
                         }
                     }
@@ -217,22 +220,46 @@ impl Bl702Mac {
     }
 
     /// Try to parse a received frame as a beacon and extract a PAN descriptor.
-    fn parse_beacon(&self, _frame_data: &[u8]) -> Option<PanDescriptor> {
-        // TODO: Parse IEEE 802.15.4 beacon frame format:
-        //   - Frame Control (2 bytes)
-        //   - Sequence Number (1 byte)
-        //   - Address fields (variable)
-        //   - Superframe Specification (2 bytes)
-        //   - GTS fields (variable)
-        //   - Pending Address fields (variable)
-        //   - Beacon Payload (variable)
-        //
-        // Extract: coordinator address, PAN ID, channel, LQI, superframe spec
-        // Return PanDescriptor on success.
-        //
-        // For now, this is a placeholder — full beacon parsing will be
-        // implemented when the radio driver is functional.
-        None
+    fn parse_beacon(frame_data: &[u8], lqi: u8, channel: u8) -> Option<PanDescriptor> {
+        if frame_data.len() < 5 {
+            return None;
+        }
+
+        let fc = u16::from_le_bytes([frame_data[0], frame_data[1]]);
+        let frame_type = fc & 0x07;
+
+        // Must be a beacon frame (type 0)
+        if frame_type != 0 {
+            return None;
+        }
+
+        // Superframe spec position depends on addressing
+        let superframe_offset = 3 + addressing_size(fc);
+        if frame_data.len() < superframe_offset + 2 {
+            return None;
+        }
+
+        let sf_raw =
+            u16::from_le_bytes([frame_data[superframe_offset], frame_data[superframe_offset + 1]]);
+        let superframe_spec = SuperframeSpec::from_raw(sf_raw);
+
+        // Zigbee beacon payload follows superframe + GTS(1) + pending(1)
+        let beacon_payload_offset = superframe_offset + 4;
+        if frame_data.len() < beacon_payload_offset + 15 {
+            return None;
+        }
+
+        let zigbee_beacon = parse_zigbee_beacon(&frame_data[beacon_payload_offset..]);
+        let coord_address = parse_source_address(frame_data, fc)?;
+
+        Some(PanDescriptor {
+            channel,
+            coord_address,
+            superframe_spec,
+            lqi,
+            security_use: (fc >> 3) & 1 != 0,
+            zigbee_beacon,
+        })
     }
 
     /// Build a raw 802.15.4 data frame for transmission.
@@ -374,8 +401,19 @@ impl MacDriver for Bl702Mac {
         &mut self,
         req: MlmeAssociateRequest,
     ) -> Result<MlmeAssociateConfirm, MacError> {
-        // Switch to coordinator's channel
-        self.driver.update_config(|cfg| cfg.channel = req.channel);
+        // Switch to coordinator's channel and PAN
+        self.channel = req.channel;
+        self.pan_id = req.coord_address.pan_id();
+        self.driver.update_config(|cfg| {
+            cfg.channel = req.channel;
+            cfg.pan_id = req.coord_address.pan_id().0;
+        });
+
+        log::info!(
+            "[BL702 MLME-ASSOC] Associating on ch {} with {:?}",
+            req.channel,
+            req.coord_address
+        );
 
         // Build and send association request
         let frame = self.association_request_frame(&req.coord_address, &req.capability_info);
@@ -384,32 +422,63 @@ impl MacDriver for Bl702Mac {
             .await
             .map_err(|_| MacError::RadioError)?;
 
-        // Wait for association response with timeout
-        let timeout = Timer::after(embassy_time::Duration::from_millis(500));
+        // Per IEEE 802.15.4 §5.3.2.1: wait, then poll with Data Request
+        Timer::after_millis(100).await;
+
+        // Send Data Request to poll for indirect Association Response
+        let data_req =
+            build_data_request(self.next_dsn(), &req.coord_address, &self.extended_address);
+        let _ = self.driver.transmit(&data_req).await;
+
+        // Wait for Association Response with generous timeout (3 seconds)
+        let timeout = Timer::after(embassy_time::Duration::from_millis(3000));
 
         let wait_response = async {
-            loop {
+            for _ in 0..10 {
                 match self.driver.receive().await {
                     Ok(rx_frame) => {
-                        // TODO: Parse association response MAC command (0x02)
-                        // Extract: assigned short address, association status
-                        //
-                        // For now check if we got any frame back
-                        if rx_frame.len > 0 {
-                            // Placeholder: would extract actual address from frame
+                        let data = &rx_frame.data[..rx_frame.len];
+                        if data.len() < 5 {
+                            continue;
+                        }
+                        let fc = u16::from_le_bytes([data[0], data[1]]);
+                        // Must be a MAC command frame (type 3)
+                        if fc & 0x07 != 3 {
+                            continue;
+                        }
+                        let cmd_offset = 3 + addressing_size(fc);
+                        if data.len() < cmd_offset + 4 {
+                            continue;
+                        }
+                        // Association Response = command ID 0x02
+                        if data[cmd_offset] == 0x02 {
+                            let short_addr = u16::from_le_bytes([
+                                data[cmd_offset + 1],
+                                data[cmd_offset + 2],
+                            ]);
+                            let status = match data[cmd_offset + 3] {
+                                0x00 => AssociationStatus::Success,
+                                0x01 => AssociationStatus::PanAtCapacity,
+                                _ => AssociationStatus::PanAccessDenied,
+                            };
+                            if status == AssociationStatus::Success {
+                                self.short_address = ShortAddress(short_addr);
+                                self.sync_radio_config();
+                            }
                             return Ok(MlmeAssociateConfirm {
-                                short_address: ShortAddress(0xFFFE),
-                                status: AssociationStatus::Success,
+                                short_address: ShortAddress(short_addr),
+                                status,
                             });
                         }
                     }
                     Err(_) => return Err(MacError::RadioError),
                 }
             }
+            Err(MacError::NoAck)
         };
 
         match select::select(timeout, wait_response).await {
-            select::Either::First(_) => Err(MacError::NoAck), // Timeout
+            select::Either::First(_) => Err(MacError::NoAck),
             select::Either::Second(result) => result,
         }
     }
@@ -569,33 +638,67 @@ impl MacDriver for Bl702Mac {
 
         match result {
             select::Either::Second(Ok(received)) => {
-                if received.len < 3 {
+                if received.len < 5 {
                     return Ok(None);
                 }
-                let frame_type = received.data[0] & 0x07;
-                if frame_type != 0x01 {
+                let data = &received.data[..received.len];
+                let fc = u16::from_le_bytes([data[0], data[1]]);
+                let frame_type = fc & 0x07;
+
+                // Only deliver data frames (type 1)
+                if frame_type != 1 {
                     return Ok(None);
                 }
-                Ok(MacFrame::from_slice(&received.data[..received.len]))
+
+                let header_len = 3 + addressing_size(fc);
+                if data.len() <= header_len {
+                    return Ok(None);
+                }
+
+                Ok(MacFrame::from_slice(&data[header_len..]))
             }
             _ => Ok(None),
         }
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
-        let ack_request = req.tx_options.ack_tx;
+        let ack_requested = req.tx_options.ack_tx;
+        let frame = self.build_data_frame(&req.dst_address, req.payload, ack_requested);
 
-        let frame = self.build_data_frame(&req.dst_address, req.payload, ack_request);
+        // Unslotted CSMA-CA (IEEE 802.15.4-2011 §5.1.1.4)
+        let mut be = self.min_be;
+        let mut nb: u8 = 0;
+        let symbol_period_us: u64 = 16;
+        let unit_backoff_symbols: u64 = 20;
 
-        // Fire-and-forget: try up to 3 times (no ACK verification)
-        for attempt in 0..3u8 {
+        loop {
+            let max_val = (1u32 << be) - 1;
+            let random = (self.dsn as u32)
+                .wrapping_mul(1103515245)
+                .wrapping_add(12345);
+            let backoff = (random % (max_val + 1)) as u64;
+            let delay_us = backoff * unit_backoff_symbols * symbol_period_us;
+            if delay_us > 0 {
+                Timer::after_micros(delay_us).await;
+            }
+
             match self.driver.transmit(&frame).await {
                 Ok(_) => break,
-                Err(_) if attempt < 2 => {
-                    Timer::after_millis(2).await;
-                    continue;
+                Err(_) => {
+                    nb += 1;
+                    be = core::cmp::min(be + 1, self.max_be);
+                    if nb > self.max_csma_backoffs {
+                        return Err(MacError::ChannelAccessFailure);
+                    }
                 }
-                Err(_) => return Err(MacError::RadioError),
+            }
+        }
+
+        // Best-effort retransmit for ACK-requested frames
+        if ack_requested {
+            for retransmit in 0..4u8 {
+                Timer::after_millis(3 + retransmit as u64 * 2).await;
+                let _ = self.driver.transmit(&frame).await;
             }
         }
 
@@ -606,55 +709,87 @@ impl MacDriver for Bl702Mac {
     }
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
+        const RX_TIMEOUT_MS: u64 = 5000;
+        let deadline =
+            embassy_time::Instant::now() + embassy_time::Duration::from_millis(RX_TIMEOUT_MS);
+
         loop {
-            let rx_frame = self
-                .driver
-                .receive()
-                .await
-                .map_err(|_| MacError::RadioError)?;
-
-            if rx_frame.len == 0 {
-                continue;
+            let now = embassy_time::Instant::now();
+            if now >= deadline {
+                return Err(MacError::NoData);
             }
+            let remaining = deadline - now;
 
-            // TODO: Full 802.15.4 frame parsing to extract:
-            //   - Frame type (filter for data frames)
-            //   - Source/destination addresses
-            //   - Payload
-            //   - Security fields
-            //
-            // For now, return a minimal indication with raw data.
-            // This will be replaced with proper frame parsing.
+            let rx_result =
+                select::select(self.driver.receive(), Timer::after(remaining)).await;
 
-            let data = &rx_frame.data[..rx_frame.len];
+            match rx_result {
+                select::Either::Second(_) => {
+                    return Err(MacError::NoData);
+                }
+                select::Either::First(Err(_)) => {
+                    continue;
+                }
+                select::Either::First(Ok(rx_frame)) => {
+                    let data = &rx_frame.data[..rx_frame.len];
 
-            // Minimal frame parsing: need at least frame control (2) + seq (1)
-            if data.len() < 3 {
-                continue;
+                    if data.len() < 5 {
+                        continue;
+                    }
+
+                    let fc = u16::from_le_bytes([data[0], data[1]]);
+                    let frame_type = fc & 0x07;
+
+                    // Only deliver data frames (type 1)
+                    if frame_type != 1 {
+                        continue;
+                    }
+
+                    let header_len = 3 + addressing_size(fc);
+                    if data.len() <= header_len {
+                        continue;
+                    }
+
+                    let src = parse_source_address(data, fc)
+                        .unwrap_or(MacAddress::Short(PanId(0), ShortAddress(0)));
+                    let dst = parse_dest_address(data, fc)
+                        .unwrap_or(MacAddress::Short(PanId(0), ShortAddress(0)));
+
+                    // Software address filtering
+                    if !self.promiscuous {
+                        let accepted = match &dst {
+                            MacAddress::Short(pan, addr) => {
+                                (pan.0 == self.pan_id.0 || pan.0 == 0xFFFF)
+                                    && (addr.0 == self.short_address.0 || addr.0 == 0xFFFF)
+                            }
+                            MacAddress::Extended(pan, addr) => {
+                                (pan.0 == self.pan_id.0 || pan.0 == 0xFFFF)
+                                    && *addr == self.extended_address
+                            }
+                        };
+                        if !accepted {
+                            continue;
+                        }
+                    }
+
+                    log::info!(
+                        "[BL702 RX] Accepted frame {} bytes, LQI {}",
+                        data.len(),
+                        rx_frame.lqi
+                    );
+
+                    let payload_data = &data[header_len..];
+                    if let Some(mac_frame) = MacFrame::from_slice(payload_data) {
+                        return Ok(McpsDataIndication {
+                            src_address: src,
+                            dst_address: dst,
+                            lqi: rx_frame.lqi,
+                            payload: mac_frame,
+                            security_use: (fc >> 3) & 1 != 0,
+                        });
+                    }
+                }
             }
-
-            let frame_type = data[0] & 0x07;
-            if frame_type != 0x01 {
-                // Not a data frame — skip
-                continue;
-            }
-
-            // Extract payload (skip header — simplified, assumes short addressing)
-            // A proper implementation would parse the full MAC header.
-            let header_len = 9; // FC(2) + Seq(1) + DstPAN(2) + DstAddr(2) + SrcAddr(2) minimum
-            if data.len() <= header_len {
-                continue;
-            }
-
-            let payload = MacFrame::from_slice(&data[header_len..]).unwrap_or_else(MacFrame::new);
-
-            return Ok(McpsDataIndication {
-                src_address: MacAddress::Short(self.pan_id, ShortAddress(0x0000)),
-                dst_address: MacAddress::Short(self.pan_id, self.short_address),
-                lqi: rx_frame.lqi,
-                payload,
-                security_use: false,
-            });
         }
     }
 
@@ -692,4 +827,120 @@ fn build_data_request(
     let _ = frame.extend_from_slice(own_extended);
     let _ = frame.push(0x04); // Data Request command ID
     frame
+}
+
+// --- IEEE 802.15.4 frame parsing utilities ---
+
+/// Calculate addressing field size from Frame Control word.
+fn addressing_size(fc: u16) -> usize {
+    let dst_mode = (fc >> 10) & 0x03;
+    let src_mode = (fc >> 14) & 0x03;
+    let pan_compress = (fc >> 6) & 1 != 0;
+
+    let mut size = 0;
+    // Destination
+    match dst_mode {
+        0x02 => size += 2 + 2, // PAN(2) + Short(2)
+        0x03 => size += 2 + 8, // PAN(2) + Extended(8)
+        _ => {}
+    }
+    // Source
+    match src_mode {
+        0x02 => size += if pan_compress { 2 } else { 4 }, // Short ± PAN
+        0x03 => size += if pan_compress { 8 } else { 10 }, // Extended ± PAN
+        _ => {}
+    }
+    size
+}
+
+/// Parse source address from raw MAC frame.
+fn parse_source_address(data: &[u8], fc: u16) -> Option<MacAddress> {
+    let dst_mode = (fc >> 10) & 0x03;
+    let src_mode = (fc >> 14) & 0x03;
+    let pan_compress = (fc >> 6) & 1 != 0;
+
+    // Skip past FC(2) + Seq(1) + dst addressing
+    let mut offset = 3;
+    let dst_pan = if dst_mode >= 2 && data.len() > offset + 1 {
+        let pan = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        offset += 2;
+        Some(pan)
+    } else {
+        None
+    };
+    match dst_mode {
+        0x02 => offset += 2,
+        0x03 => offset += 8,
+        _ => {}
+    }
+
+    // Source PAN
+    let src_pan = if !pan_compress && src_mode >= 2 && data.len() > offset + 1 {
+        let pan = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        offset += 2;
+        pan
+    } else {
+        dst_pan.unwrap_or(0xFFFF)
+    };
+
+    match src_mode {
+        0x02 if data.len() >= offset + 2 => {
+            let addr = u16::from_le_bytes([data[offset], data[offset + 1]]);
+            Some(MacAddress::Short(PanId(src_pan), ShortAddress(addr)))
+        }
+        0x03 if data.len() >= offset + 8 => {
+            let mut ext = [0u8; 8];
+            ext.copy_from_slice(&data[offset..offset + 8]);
+            Some(MacAddress::Extended(PanId(src_pan), ext))
+        }
+        _ => None,
+    }
+}
+
+/// Parse destination address from raw MAC frame.
+fn parse_dest_address(data: &[u8], fc: u16) -> Option<MacAddress> {
+    let dst_mode = (fc >> 10) & 0x03;
+    let offset = 3; // After FC(2) + Seq(1)
+
+    if data.len() < offset + 2 {
+        return None;
+    }
+    let pan = u16::from_le_bytes([data[offset], data[offset + 1]]);
+    let addr_offset = offset + 2;
+
+    match dst_mode {
+        0x02 if data.len() >= addr_offset + 2 => {
+            let addr = u16::from_le_bytes([data[addr_offset], data[addr_offset + 1]]);
+            Some(MacAddress::Short(PanId(pan), ShortAddress(addr)))
+        }
+        0x03 if data.len() >= addr_offset + 8 => {
+            let mut ext = [0u8; 8];
+            ext.copy_from_slice(&data[addr_offset..addr_offset + 8]);
+            Some(MacAddress::Extended(PanId(pan), ext))
+        }
+        _ => None,
+    }
+}
+
+/// Parse Zigbee beacon payload from raw bytes (at least 15 bytes).
+fn parse_zigbee_beacon(data: &[u8]) -> ZigbeeBeaconPayload {
+    let protocol_id = data[0];
+    let nwk_info = u16::from_le_bytes([data[1], data[2]]);
+
+    let mut extended_pan_id = [0u8; 8];
+    extended_pan_id.copy_from_slice(&data[3..11]);
+    let mut tx_offset = [0u8; 3];
+    tx_offset.copy_from_slice(&data[11..14]);
+
+    ZigbeeBeaconPayload {
+        protocol_id,
+        stack_profile: (nwk_info & 0x0F) as u8,
+        protocol_version: ((nwk_info >> 4) & 0x0F) as u8,
+        router_capacity: (nwk_info >> 10) & 1 != 0,
+        device_depth: ((nwk_info >> 11) & 0x0F) as u8,
+        end_device_capacity: (nwk_info >> 15) & 1 != 0,
+        extended_pan_id,
+        tx_offset,
+        update_id: data[14],
+    }
 }
