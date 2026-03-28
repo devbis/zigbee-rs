@@ -15,6 +15,6 @@ fn main() {
     // Link the Bouffalo lmac154 static library (downloaded in CI or placed manually)
     if let Ok(lib_dir) = env::var("LMAC154_LIB_DIR") {
         println!("cargo:rustc-link-search=native={}", lib_dir);
+        println!("cargo:rustc-link-lib=static=lmac154");
     }
-    println!("cargo:rustc-link-lib=static=lmac154");
 }
