@@ -267,7 +267,10 @@ impl Phy6222Driver {
         reg_write(RF_PHY_BASE + 0x10C, 0x0489_8000); // i_pll_ctrl7
 
         // VCO coarse tuning
-        reg_write(RF_PHY_BASE + 0x80, reg_read(RF_PHY_BASE + 0x80) | 0x0000_24CC);
+        reg_write(
+            RF_PHY_BASE + 0x80,
+            reg_read(RF_PHY_BASE + 0x80) | 0x0000_24CC,
+        );
 
         // RX front-end (boost TIA current)
         reg_write(RF_PHY_BASE + 0xDC, 0x01A6_FC2F);
@@ -306,7 +309,10 @@ impl Phy6222Driver {
         // RX-to-TX turnaround
         reg_write(LL_HW_BASE + 0x1C, 192 * hclk_per_us);
         // TX/RX settle time
-        reg_write(LL_HW_BASE + 0x08, (80 * hclk_per_us) << 16 | (80 * hclk_per_us));
+        reg_write(
+            LL_HW_BASE + 0x08,
+            (80 * hclk_per_us) << 16 | (80 * hclk_per_us),
+        );
     }
 
     /// Set Zigbee CRC format on both TX and RX paths.
@@ -432,11 +438,19 @@ impl Phy6222Driver {
         // Trigger!
         reg_write(LL_HW_BASE + 0x00, 0x0001);
 
-        log::trace!("phy6222: tx {} bytes on ch{}", frame.len(), self.config.channel);
+        log::trace!(
+            "phy6222: tx {} bytes on ch{}",
+            frame.len(),
+            self.config.channel
+        );
 
         // Wait for TX completion IRQ
         let ok = TX_DONE.wait().await;
-        if ok { Ok(()) } else { Err(RadioError::HardwareError) }
+        if ok {
+            Ok(())
+        } else {
+            Err(RadioError::HardwareError)
+        }
     }
 
     /// Receive the next IEEE 802.15.4 frame (async).

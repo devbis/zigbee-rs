@@ -106,10 +106,12 @@ impl MacDriver for Phy6222Mac {
 
             match req.scan_type {
                 ScanType::Ed => {
-                    let (rssi, _busy) =
-                        self.driver.energy_detect().map_err(Self::map_radio_err)?;
+                    let (rssi, _busy) = self.driver.energy_detect().map_err(Self::map_radio_err)?;
                     let ed = ((rssi as i16 + 100).clamp(0, 255)) as u8;
-                    let _ = energy_list.push(EdValue { channel: ch, energy: ed });
+                    let _ = energy_list.push(EdValue {
+                        channel: ch,
+                        energy: ed,
+                    });
                 }
                 ScanType::Active => {
                     let seq = self.next_bsn();
@@ -172,7 +174,10 @@ impl MacDriver for Phy6222Mac {
             &req.capability_info,
         );
 
-        self.driver.transmit(&frame).await.map_err(Self::map_radio_err)?;
+        self.driver
+            .transmit(&frame)
+            .await
+            .map_err(Self::map_radio_err)?;
 
         Timer::after(embassy_time::Duration::from_millis(500)).await;
 
@@ -213,10 +218,7 @@ impl MacDriver for Phy6222Mac {
         Err(MacError::Unsupported)
     }
 
-    async fn mlme_disassociate(
-        &mut self,
-        _req: MlmeDisassociateRequest,
-    ) -> Result<(), MacError> {
+    async fn mlme_disassociate(&mut self, _req: MlmeDisassociateRequest) -> Result<(), MacError> {
         self.short_address = ShortAddress(0xFFFF);
         self.pan_id = PanId(0xFFFF);
         self.driver.update_config(|c| {
@@ -329,8 +331,12 @@ impl MacDriver for Phy6222Mac {
                 self.promiscuous = v;
                 self.driver.update_config(|c| c.promiscuous = v);
             }
-            (MacDsn, PibValue::U8(v)) => { self.dsn = v; }
-            (MacBsn, PibValue::U8(v)) => { self.bsn = v; }
+            (MacDsn, PibValue::U8(v)) => {
+                self.dsn = v;
+            }
+            (MacBsn, PibValue::U8(v)) => {
+                self.bsn = v;
+            }
             (PhyTransmitPower, PibValue::U8(v)) => {
                 self.driver.update_config(|c| c.tx_power = v as i8);
             }
@@ -342,7 +348,10 @@ impl MacDriver for Phy6222Mac {
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
         let seq = self.next_dsn();
         let frame = build_data_request(seq, self.pan_id, self.coord_short_address);
-        self.driver.transmit(&frame).await.map_err(Self::map_radio_err)?;
+        self.driver
+            .transmit(&frame)
+            .await
+            .map_err(Self::map_radio_err)?;
 
         let result = select::select(
             self.driver.receive(),
@@ -351,9 +360,7 @@ impl MacDriver for Phy6222Mac {
         .await;
 
         match result {
-            select::Either::First(Ok(rx)) => {
-                Ok(MacFrame::from_slice(&rx.data[..rx.len]))
-            }
+            select::Either::First(Ok(rx)) => Ok(MacFrame::from_slice(&rx.data[..rx.len])),
             _ => Ok(None),
         }
     }
@@ -419,14 +426,7 @@ impl MacDriver for Phy6222Mac {
 
 fn build_beacon_request(seq: u8) -> [u8; 8] {
     let fc: u16 = 0x0803;
-    [
-        fc as u8,
-        (fc >> 8) as u8,
-        seq,
-        0xFF, 0xFF,
-        0xFF, 0xFF,
-        0x07,
-    ]
+    [fc as u8, (fc >> 8) as u8, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07]
 }
 
 fn build_association_request(
@@ -564,7 +564,11 @@ fn parse_beacon_frame(data: &[u8], channel: u8) -> Option<PanDescriptor> {
                 epid
             },
             tx_offset: [data[offset + 11], data[offset + 12], data[offset + 13]],
-            update_id: if data.len() > offset + 14 { data[offset + 14] } else { 0 },
+            update_id: if data.len() > offset + 14 {
+                data[offset + 14]
+            } else {
+                0
+            },
         }
     } else {
         ZigbeeBeaconPayload {
@@ -671,13 +675,17 @@ fn parse_association_response(data: &[u8]) -> Option<(ShortAddress, u8)> {
     let pan_compress = (fc >> 6) & 0x01;
 
     let mut offset = 3;
-    if dst_mode > 0 { offset += 2; }
+    if dst_mode > 0 {
+        offset += 2;
+    }
     match dst_mode {
         2 => offset += 2,
         3 => offset += 8,
         _ => {}
     }
-    if src_mode > 0 && pan_compress == 0 { offset += 2; }
+    if src_mode > 0 && pan_compress == 0 {
+        offset += 2;
+    }
     match src_mode {
         2 => offset += 2,
         3 => offset += 8,
