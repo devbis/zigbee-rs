@@ -234,7 +234,7 @@ Download firmware artifacts from the [Actions tab](https://github.com/faronov/zi
 - **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
-- **OTA** — cluster defined but no actual firmware upgrade flow implemented
+- **OTA** — full upgrade flow implemented (OTA cluster + OtaManager + FirmwareWriter trait) but not yet tested on real hardware
 
 ## Documentation
 
