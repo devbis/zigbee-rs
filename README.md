@@ -130,7 +130,7 @@ cargo build --release   # no stubs, no vendor blobs needed
 | **ESP32-H2** | ✅ esp-ieee802154 | `riscv32imac-unknown-none-elf` | Native 802.15.4 radio |
 | **nRF52840** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
 | **nRF52833** | ✅ nrf-radio | `thumbv7em-none-eabihf` | 802.15.4 radio peripheral |
-| **BL702** | ✅ lmac154 FFI | `riscv32imac-unknown-none-elf` | Vendor libs (`liblmac154.a` + `libbl702_rf.a`) included |
+| **BL702** | ✅ lmac154 FFI | `riscv32imac-unknown-none-elf` | Requires vendor libs (`liblmac154.a` + `libbl702_rf.a`) from Bouffalo SDK |
 | **CC2340** | ⚡ ZBOSS FFI | `thumbv6m-none-eabi` | TI SimpleLink SDK stubs (50+ RTOS deps) |
 | **Telink B91** | ⚡ Telink FFI | `riscv32imac-unknown-none-elf` | Telink SDK stubs |
 | **Telink TLSR8258** | ⚡ Telink FFI | `riscv32-unknown-none-elf` | Telink SDK stubs (tc32 ISA) |
@@ -203,7 +203,7 @@ zigbee-rs/
 │   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop)
 │   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs)
 │   ├── nrf52840-bridge/       # nRF52840 coordinator bridge
-│   ├── bl702-sensor/          # BL702 (vendor libs included)
+│   ├── bl702-sensor/          # BL702 (requires vendor libs from Bouffalo SDK)
 │   ├── cc2340-sensor/         # TI CC2340R5 (stubs)
 │   ├── telink-b91-sensor/     # Telink B91 (stubs)
 │   ├── telink-tlsr8258-sensor/# Telink TLSR8258 (stubs)
