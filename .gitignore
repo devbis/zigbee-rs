@@ -8,3 +8,4 @@
 *.bak
 *.diag
 *.sensor
+/docs/book/book/

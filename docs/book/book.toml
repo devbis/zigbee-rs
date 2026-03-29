@@ -1,0 +1,16 @@
+[book]
+authors = ["zigbee-rs contributors"]
+language = "en"
+src = "src"
+title = "The zigbee-rs Book"
+description = "Comprehensive guide to building Zigbee PRO devices in Rust"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/nickkuk/zigbee-rs"
+edit-url-template = "https://github.com/nickkuk/zigbee-rs/edit/main/docs/book/{path}"
+site-url = "/zigbee-rs/book/"

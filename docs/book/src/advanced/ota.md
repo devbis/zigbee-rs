@@ -1,0 +1,323 @@
+# OTA Updates
+
+The Over-the-Air (OTA) Upgrade cluster (cluster ID `0x0019`) lets you update
+device firmware over the Zigbee network. zigbee-rs implements the OTA client
+state machine and provides a `FirmwareWriter` trait that platform backends
+implement to write the downloaded image to flash.
+
+---
+
+## OTA Upgrade Cluster Overview
+
+The OTA cluster is defined in `zigbee_zcl::clusters::ota`. It defines
+attributes that track upgrade state and commands that drive the download
+protocol.
+
+### Attributes
+
+```rust
+pub const ATTR_UPGRADE_SERVER_ID:       AttributeId = AttributeId(0x0000);
+pub const ATTR_FILE_OFFSET:             AttributeId = AttributeId(0x0001);
+pub const ATTR_CURRENT_FILE_VERSION:    AttributeId = AttributeId(0x0002);
+pub const ATTR_CURRENT_STACK_VERSION:   AttributeId = AttributeId(0x0003);
+pub const ATTR_DOWNLOADED_FILE_VERSION: AttributeId = AttributeId(0x0004);
+pub const ATTR_DOWNLOADED_STACK_VERSION: AttributeId = AttributeId(0x0005);
+pub const ATTR_IMAGE_UPGRADE_STATUS:    AttributeId = AttributeId(0x0006);
+pub const ATTR_MANUFACTURER_ID:         AttributeId = AttributeId(0x0007);
+pub const ATTR_IMAGE_TYPE_ID:           AttributeId = AttributeId(0x0008);
+pub const ATTR_MIN_BLOCK_PERIOD:        AttributeId = AttributeId(0x0009);
+```
+
+### Commands
+
+| Direction | Command | ID | Purpose |
+|-----------|---------|---:|---------|
+| Client → Server | `QueryNextImageRequest` | 0x01 | Ask if a new image is available |
+| Server → Client | `QueryNextImageResponse` | 0x02 | Respond with image info or "no update" |
+| Client → Server | `ImageBlockRequest` | 0x03 | Request a data block at a given offset |
+| Server → Client | `ImageBlockResponse` | 0x05 | Deliver a block (or tell client to wait) |
+| Server → Client | `ImageNotify` | 0x00 | Proactively tell client an update exists |
+| Client → Server | `UpgradeEndRequest` | 0x06 | Report download success or failure |
+| Server → Client | `UpgradeEndResponse` | 0x07 | Tell client when to activate |
+
+### Image Upgrade Status Values
+
+```rust
+pub const STATUS_NORMAL:               u8 = 0x00;  // idle
+pub const STATUS_DOWNLOAD_IN_PROGRESS: u8 = 0x01;
+pub const STATUS_DOWNLOAD_COMPLETE:    u8 = 0x02;
+pub const STATUS_WAITING_TO_UPGRADE:   u8 = 0x03;
+pub const STATUS_COUNT_DOWN:           u8 = 0x04;
+pub const STATUS_WAIT_FOR_MORE:        u8 = 0x05;
+```
+
+---
+
+## OTA Image Format
+
+OTA images use a standard header defined in `zigbee_zcl::clusters::ota_image`.
+The file starts with a fixed header, followed by optional fields, followed by
+one or more sub-elements (the actual firmware binary, signatures, etc.).
+
+### Header Structure
+
+```rust
+pub struct OtaImageHeader {
+    pub magic: u32,                    // must be 0x0BEEF11E
+    pub header_version: u16,           // 0x0100 for ZCL 7+
+    pub header_length: u16,            // total header size in bytes
+    pub field_control: OtaHeaderFieldControl,
+    pub manufacturer_code: u16,
+    pub image_type: u16,               // manufacturer-specific
+    pub file_version: u32,             // new firmware version
+    pub stack_version: u16,
+    pub header_string: [u8; 32],       // human-readable description
+    pub total_image_size: u32,         // header + payload
+
+    // Optional fields (controlled by field_control bits)
+    pub security_credential_version: Option<u8>,
+    pub min_hardware_version: Option<u16>,
+    pub max_hardware_version: Option<u16>,
+}
+```
+
+The minimum header size is **56 bytes** (`OTA_HEADER_MIN_SIZE`). The magic
+number `0x0BEEF11E` is checked during parsing to reject corrupt or non-OTA
+files.
+
+### Field Control Bits
+
+```rust
+pub struct OtaHeaderFieldControl {
+    pub security_credential: bool,  // bit 0: credential version present
+    pub device_specific: bool,      // bit 1: device-specific file
+    pub hardware_versions: bool,    // bit 2: HW version range present
+}
+```
+
+### Sub-Elements
+
+After the header, the image contains sub-elements, each with a 6-byte header
+(2-byte tag + 4-byte length):
+
+```rust
+pub struct OtaSubElement {
+    pub tag: OtaTagId,
+    pub length: u32,
+}
+
+pub enum OtaTagId {
+    UpgradeImage   = 0x0000,  // the actual firmware binary
+    EcdsaCert      = 0x0001,  // signing certificate
+    EcdsaSignature = 0x0002,  // ECDSA signature
+    ImageIntegrity = 0x0003,  // hash for integrity check
+    PictureData    = 0x0004,  // optional picture data
+}
+```
+
+The `UpgradeImage` sub-element contains the raw firmware binary that gets
+written to the device's update flash slot.
+
+---
+
+## Upgrade Flow
+
+The OTA client state machine (`OtaState`) drives the entire process:
+
+```text
+                    ┌───────┐
+                    │ Idle  │
+                    └───┬───┘
+                        │ QueryNextImageRequest
+                        ▼
+                  ┌───────────┐
+                  │ QuerySent │
+                  └─────┬─────┘
+           server has    │    no update
+           new image     │    available
+              ┌──────────┴──────────┐
+              ▼                     ▼
+     ┌──────────────┐          (back to Idle)
+     │ Downloading  │
+     │  offset=0    │◄─────────────┐
+     │  total=N     │              │
+     └──────┬───────┘    ┌─────────────────┐
+            │            │  WaitForData    │
+            │ block resp │  (server busy)  │
+            ├───────────►│  delay N secs   │
+            │            └─────────────────┘
+            │ all blocks
+            ▼
+     ┌───────────┐
+     │ Verifying │  ── verify hash/size
+     └─────┬─────┘
+            │
+            ▼
+  ┌────────────────────┐
+  │ WaitingActivate    │  ── UpgradeEndRequest sent
+  └────────┬───────────┘
+           │ UpgradeEndResponse (activate now)
+           ▼
+     ┌──────────┐
+     │   Done   │  ── reboot and run new firmware
+     └──────────┘
+```
+
+### OtaState Enum
+
+```rust
+pub enum OtaState {
+    Idle,
+    QuerySent,
+    Downloading { offset: u32, total_size: u32 },
+    Verifying,
+    WaitingActivate,
+    WaitForData {
+        delay_secs: u32,
+        elapsed: u32,
+        download_offset: u32,
+        download_total: u32,
+    },
+    Done,
+    Failed,
+}
+```
+
+### OtaAction — What the Runtime Should Do Next
+
+After processing each OTA command, the engine returns an `OtaAction`:
+
+```rust
+pub enum OtaAction {
+    SendQuery(QueryNextImageRequest),
+    SendBlockRequest(ImageBlockRequest),
+    WriteBlock { offset: u32, data: heapless::Vec<u8, 64> },
+    SendEndRequest(UpgradeEndRequest),
+    ActivateImage,
+    Wait(u32),
+    None,
+}
+```
+
+The runtime event loop dispatches these actions to the MAC layer (for sending
+ZCL commands) or to the `FirmwareWriter` (for writing blocks to flash).
+
+### Block Size
+
+The default block size is **48 bytes** (`DEFAULT_BLOCK_SIZE`), chosen to fit
+within a single MAC frame without requiring APS fragmentation. On networks with
+reliable links, this can be tuned up to ~64 bytes.
+
+### Rate Limiting (WaitForData)
+
+If the OTA server is busy or needs to throttle downloads, it responds with a
+`WaitForData` status instead of image data. The client pauses for the specified
+number of seconds, then resumes from the saved offset.
+
+---
+
+## FirmwareWriter Trait
+
+The `FirmwareWriter` trait (`zigbee_runtime::firmware_writer`) abstracts the
+platform-specific flash operations needed to store a downloaded firmware image:
+
+```rust
+pub trait FirmwareWriter {
+    /// Erase the firmware update slot, preparing it for writes.
+    fn erase_slot(&mut self) -> Result<(), FirmwareError>;
+
+    /// Write a block of data at the given offset within the update slot.
+    fn write_block(&mut self, offset: u32, data: &[u8]) -> Result<(), FirmwareError>;
+
+    /// Verify the written image (size check + optional hash).
+    fn verify(
+        &mut self,
+        expected_size: u32,
+        expected_hash: Option<&[u8]>,
+    ) -> Result<(), FirmwareError>;
+
+    /// Mark the new image as pending activation (bootloader swap on reboot).
+    fn activate(&mut self) -> Result<(), FirmwareError>;
+
+    /// Return the maximum image size this slot can hold.
+    fn slot_size(&self) -> u32;
+
+    /// Abort an in-progress update and revert.
+    fn abort(&mut self) -> Result<(), FirmwareError>;
+}
+```
+
+### FirmwareError
+
+```rust
+pub enum FirmwareError {
+    EraseFailed,
+    WriteFailed,
+    VerifyFailed,   // hash mismatch or size mismatch
+    OutOfRange,     // offset beyond slot boundary
+    ImageTooLarge,  // image exceeds slot_size()
+    ActivateFailed, // boot flag not set
+    HardwareError,
+}
+```
+
+### Platform Implementations
+
+| Platform | Slot Location | Notes |
+|----------|--------------|-------|
+| nRF52840 | Secondary flash bank via NVMC | Dual-bank swap with nRF bootloader |
+| ESP32 | OTA partition via `esp-storage` | ESP-IDF OTA partition table |
+| BL702 | XIP flash via `bl702-pac` | Single-bank with staging area |
+| Mock | RAM buffer (`heapless::Vec<u8, 262144>`) | For host testing — 256 KB max |
+
+### MockFirmwareWriter (for Testing)
+
+```rust
+use zigbee_runtime::firmware_writer::MockFirmwareWriter;
+
+let mut writer = MockFirmwareWriter::new(128_000);  // 128 KB slot
+
+writer.erase_slot().unwrap();
+writer.write_block(0, &firmware_chunk_0).unwrap();
+writer.write_block(chunk_0_len, &firmware_chunk_1).unwrap();
+writer.verify(total_size, None).unwrap();
+writer.activate().unwrap();
+
+assert!(writer.is_activated());
+assert_eq!(writer.bytes_written(), total_size);
+```
+
+The mock writer enforces sequential writes (offset must equal the number of
+bytes already written) and requires `erase_slot()` before any writes, just
+like real flash hardware.
+
+---
+
+## Integration with Bootloaders
+
+OTA is a two-part process: the Zigbee stack downloads and writes the image,
+then the **bootloader** handles the swap and boot.
+
+### Typical Flow
+
+1. `FirmwareWriter::erase_slot()` — erase the secondary/staging flash area.
+2. `FirmwareWriter::write_block()` — called once per OTA block (48 bytes
+   each, potentially thousands of calls for a large image).
+3. `FirmwareWriter::verify()` — check the written size and optional hash.
+4. `FirmwareWriter::activate()` — set a boot flag or swap marker telling the
+   bootloader to run the new image on next boot.
+5. **Reboot** — the runtime triggers a system reset.
+6. **Bootloader** — detects the pending update flag, validates the new image
+   (CRC, signature), and swaps it into the primary slot.
+
+### Bootloader Examples
+
+| Platform | Bootloader | Swap Method |
+|----------|-----------|-------------|
+| nRF52840 | MCUboot / nRF Bootloader | Dual-bank swap |
+| ESP32 | ESP-IDF bootloader | OTA partition switch |
+| BL702 | BL702 ROM bootloader | XIP remap |
+
+> **Rollback:** If the new firmware fails to start (e.g., crashes in a loop),
+> most bootloaders support automatic rollback — they detect that the new image
+> never confirmed itself and revert to the previous working image.
