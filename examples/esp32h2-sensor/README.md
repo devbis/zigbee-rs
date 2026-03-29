@@ -1,11 +1,11 @@
-# ESP32-C6 Zigbee Temperature & Humidity Sensor
+# ESP32-H2 Zigbee Temperature & Humidity Sensor
 
-A `no_std` Zigbee 3.0 end device for the **ESP32-C6** that reports simulated
+A `no_std` Zigbee 3.0 end device for the **ESP32-H2** that reports simulated
 temperature and humidity readings every 30 seconds.
 
 ## Hardware Requirements
 
-- ESP32-C6 development board (built-in IEEE 802.15.4 radio)
+- ESP32-H2 development board (built-in IEEE 802.15.4 + BLE 5 radio)
 - USB cable for flashing and serial monitor
 - BOOT button (GPIO9) used for join/leave control
 
@@ -27,7 +27,7 @@ cargo +esp build -Z build-std=core,alloc --target riscv32imac-unknown-none-elf -
 ## Flash & Monitor
 
 ```sh
-espflash flash --monitor target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
+espflash flash --monitor target/riscv32imac-unknown-none-elf/release/esp32h2-sensor
 ```
 
 Or use the configured runner:
@@ -38,7 +38,7 @@ cargo +esp run -Z build-std=core,alloc --target riscv32imac-unknown-none-elf --r
 
 ## What It Demonstrates
 
-- Initialising the ESP32-C6 IEEE 802.15.4 radio with `esp-radio`
+- Initialising the ESP32-H2 IEEE 802.15.4 radio with `esp-radio`
 - Building a Zigbee device with the `ZigbeeDevice` builder API
 - Registering ZCL endpoint 1 (Home Automation profile, device type 0x0302)
   with **Basic**, **Temperature Measurement**, and **Relative Humidity** clusters
@@ -55,7 +55,7 @@ cargo +esp run -Z build-std=core,alloc --target riscv32imac-unknown-none-elf --r
 ## Project Structure
 
 ```
-esp32c6-sensor/
+esp32h2-sensor/
 ├── .cargo/config.toml   # Target, runner, rustflags, build-std
 ├── Cargo.toml            # Dependencies (esp-hal 1.0, esp-radio 0.17, zigbee-rs crates)
 └── src/

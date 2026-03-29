@@ -1,44 +1,68 @@
-# nRF52840 Zigbee Weather Sensor
+# nRF52840 Zigbee Temperature Sensor
 
-Embassy-based firmware that reads a BME280 over I2C and exposes
-temperature, humidity, and pressure via Zigbee ZCL clusters.
+An async Embassy-based Zigbee 3.0 end device for the **Nordic nRF52840** that
+reads real temperature from the on-chip TEMP peripheral and reports simulated
+humidity. Uses `defmt` + RTT for logging.
+
+## Hardware Requirements
+
+- nRF52840-DK (PCA10056) or any nRF52840 board with a debug probe
+- Button 1 (P0.11, active low) for join/leave control
+- Debug probe (J-Link on-board for DK, or external probe-rs-compatible)
 
 ## Prerequisites
 
-- Rust nightly with the `thumbv7em-none-eabihf` target:
-  ```
-  rustup target add thumbv7em-none-eabihf
-  ```
-- **probe-rs** for flashing and defmt log output:
-  ```
-  cargo install probe-rs-tools
-  ```
-- nRF52840-DK (or any board with J-Link / CMSIS-DAP debug probe)
+- Rust stable toolchain
+- `probe-rs`: `cargo install probe-rs-tools`
+- Target: `thumbv7em-none-eabihf` (configured in `.cargo/config.toml`)
 
-## Wiring (BME280)
+No vendor libraries, SoftDevice, or binary blobs are needed — the project
+drives the 802.15.4 radio directly via `embassy-nrf`.
 
-| BME280 pin | nRF52840 pin |
-|------------|--------------|
-| SDA        | P0.26        |
-| SCL        | P0.27        |
-| VCC        | 3.3 V        |
-| GND        | GND          |
-
-## Build & Flash
+## Build
 
 ```sh
 cargo build --release
-cargo run --release   # flashes via probe-rs and shows defmt logs
 ```
 
-## Alternative Sensors
+## Flash & Run
 
-| Sensor | Crate   | I2C address | Notes                         |
-|--------|---------|-------------|-------------------------------|
-| SHT31  | `sht3x` | 0x44        | Temp + humidity, no pressure  |
-| SHT40  | `sht4x` | 0x44        | Higher accuracy successor     |
-| SHTC3  | `shtcx` | 0x70        | Ultra-low-power, fast wakeup  |
-| BMP280 | `bme280`| 0x76        | Temp + pressure (no humidity) |
+```sh
+probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-sensor
+```
 
-To switch sensors, replace the `bme280` dependency in `Cargo.toml` with the
-appropriate crate and adjust the driver initialisation in `src/main.rs`.
+Or use the configured runner:
+
+```sh
+cargo run --release
+```
+
+## What It Demonstrates
+
+- Embassy async event loop with `select3` (radio receive, button press, timer)
+- On-chip TEMP sensor reading via `embassy_nrf::temp::Temp`
+- Building a Zigbee device with `ZigbeeDevice` builder API
+- ZCL endpoint 1 (Home Automation, device type 0x0302) with **Basic**,
+  **Temperature Measurement**, and **Relative Humidity** server clusters
+- Processing incoming MAC frames and generating ZCL attribute reports
+- Button-driven network join/leave via `UserAction::Toggle`
+- `defmt` structured logging over RTT
+
+## Operation
+
+1. Power on → device starts idle (not joined)
+2. Press Button 1 → initiates BDB commissioning (network steering)
+3. Once joined → reads temperature every 30 s, ticks the Zigbee stack
+4. Press Button 1 again → leaves the network
+
+## Project Structure
+
+```
+nrf52840-sensor/
+├── .cargo/config.toml   # Target, runner (probe-rs), DEFMT_LOG level
+├── Cargo.toml            # Dependencies (embassy-nrf 0.3, zigbee-rs crates)
+├── build.rs              # Linker script flags (-Tlink.x -Tdefmt.x)
+├── memory.x              # Memory layout: 1 MB Flash, 256 KB RAM
+└── src/
+    └── main.rs           # Async entry point (#[embassy_executor::main])
+```
