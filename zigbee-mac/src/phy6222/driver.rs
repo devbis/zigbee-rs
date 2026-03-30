@@ -331,12 +331,36 @@ impl Phy6222Driver {
     }
 
     /// Single-point TP calibration at a given RF channel index.
-    fn rf_tp_cal(&self, _rf_chn: u8) -> u8 {
-        // Simplified calibration — reads VCO coarse tuning result.
-        // In production firmware this would trigger the PLL lock sequence
-        // and read back the calibration capacitor value from 0x40030094.
-        // For initial bring-up, use mid-range defaults.
-        0x20
+    ///
+    /// Triggers VCO coarse tuning at the given RF channel and reads back
+    /// the calibration capacitor value. Falls back to 0x20 if the read
+    /// returns an out-of-range value.
+    fn rf_tp_cal(&self, rf_chn: u8) -> u8 {
+        // Set the target RF channel for calibration
+        reg_write(BB_HW_BASE + 0xB4, rf_chn as u32);
+
+        // Trigger VCO coarse calibration
+        let old = reg_read(RF_PHY_BASE + 0x80);
+        reg_write(RF_PHY_BASE + 0x80, old | 0x0000_0400); // cal_en bit
+
+        // Wait for calibration to settle (~50µs per PHY6222 SDK)
+        for _ in 0..800 {
+            core::hint::spin_loop();
+        }
+
+        // Read back calibration cap value from VCO tune register
+        let cal_reg = reg_read(RF_PHY_BASE + 0x94);
+        let cap = (cal_reg & 0xFF) as u8;
+
+        // Clear cal_en
+        reg_write(RF_PHY_BASE + 0x80, old);
+
+        // Sanity check: valid cap range is roughly 0x05..0x3F
+        if cap >= 0x05 && cap <= 0x3F {
+            cap
+        } else {
+            0x20 // fallback default
+        }
     }
 
     /// Set TX power (0–10 dBm, 5-bit DAC).
@@ -522,6 +546,42 @@ impl Phy6222Driver {
         let busy = rssi_raw > -60; // CCA threshold: -60 dBm (typical)
 
         Ok((rssi_raw, busy))
+    }
+
+    /// Perform Clear Channel Assessment (async, IEEE 802.15.4 CCA mode 1).
+    ///
+    /// Briefly enables the receiver to measure RF energy on the current channel.
+    /// Returns `true` if the channel is busy (energy above threshold).
+    pub async fn clear_channel_assessment(&mut self) -> Result<bool, RadioError> {
+        if !self.initialized {
+            return Err(RadioError::NotInitialized);
+        }
+
+        // Set SRX mode with a short timeout
+        reg_write(LL_HW_BASE + 0x04, 0x01_00_01);
+        reg_write(LL_HW_BASE + 0x38, 0x07);
+        reg_write(LL_HW_BASE + 0x28, 0x0800); // short RX window
+
+        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
+        reg_write(LL_HW_BASE + 0x0C, LIRQ_MD | LIRQ_RTO);
+
+        // Trigger RX
+        reg_write(LL_HW_BASE + 0x00, 0x0001);
+
+        // Wait 128µs (8 symbol periods) for RSSI to settle
+        embassy_time::Timer::after_micros(128).await;
+
+        // Read RSSI from foot word
+        let foot0 = reg_read(RF_PHY_BASE + 0xE4);
+        let rssi = ((foot0 >> 24) & 0xFF) as i8;
+
+        // Abort RX
+        reg_write(LL_HW_BASE + 0x00, 0x0000);
+        reg_write(LL_HW_BASE + 0x14, LL_HW_IRQ_MASK);
+
+        // CCA threshold: -60 dBm (typical for 802.15.4)
+        let busy = rssi > -60;
+        Ok(busy)
     }
 
     /// Enable continuous receive mode.

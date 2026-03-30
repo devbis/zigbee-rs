@@ -88,6 +88,119 @@ impl Phy6222Mac {
             RadioError::RxTimeout => MacError::NoData,
         }
     }
+
+    /// Simple PRNG: deterministic hash from seed byte.
+    fn prng(seed: u8) -> u32 {
+        (seed as u32).wrapping_mul(1103515245).wrapping_add(12345)
+    }
+
+    /// Unslotted CSMA-CA + TX + ACK wait + retries.
+    ///
+    /// Implements IEEE 802.15.4-2011 §5.1.1.4 (unslotted CSMA-CA) with
+    /// optional ACK reception and retry loop per `macMaxFrameRetries`.
+    async fn csma_ca_transmit(
+        &mut self,
+        frame: &[u8],
+        ack_requested: bool,
+    ) -> Result<(), MacError> {
+        let max_retries = if ack_requested {
+            self.max_frame_retries
+        } else {
+            0
+        };
+        // 802.15.4 timing constants for 2.4 GHz
+        const SYMBOL_PERIOD_US: u64 = 16; // 62.5 ksym/s
+        const UNIT_BACKOFF_SYMBOLS: u64 = 20; // aUnitBackoffPeriod
+
+        for attempt in 0..=max_retries {
+            // ── Unslotted CSMA-CA ──
+            let mut nb: u8 = 0;
+            let mut be = self.min_be;
+
+            let channel_clear = loop {
+                // Random backoff: 0 to (2^BE - 1) unit backoff periods
+                let max_val = (1u32 << be) - 1;
+                let seed = self.dsn.wrapping_add(nb).wrapping_add(attempt);
+                let random = Self::prng(seed);
+                let backoff = (random % (max_val + 1)) as u64;
+                let delay_us = backoff * UNIT_BACKOFF_SYMBOLS * SYMBOL_PERIOD_US;
+                if delay_us > 0 {
+                    Timer::after_micros(delay_us).await;
+                }
+
+                // CCA
+                let busy = self
+                    .driver
+                    .clear_channel_assessment()
+                    .await
+                    .map_err(Self::map_radio_err)?;
+
+                if !busy {
+                    break true;
+                }
+
+                nb += 1;
+                be = core::cmp::min(be + 1, self.max_be);
+                if nb > self.max_csma_backoffs {
+                    break false;
+                }
+            };
+
+            if !channel_clear {
+                if attempt == max_retries {
+                    return Err(MacError::ChannelAccessFailure);
+                }
+                continue;
+            }
+
+            // ── TX ──
+            self.driver
+                .transmit(frame)
+                .await
+                .map_err(Self::map_radio_err)?;
+
+            if !ack_requested {
+                return Ok(());
+            }
+
+            // ── ACK wait ──
+            // Spec: aTurnaroundTime (192µs) + ACK frame duration (~352µs).
+            // Allow 1.5ms total for software overhead.
+            let seq = frame[2];
+            let ack_result = select::select(self.driver.receive(), Timer::after_micros(1500)).await;
+
+            if let select::Either::First(Ok(rx)) = ack_result {
+                if rx.len >= 3 {
+                    let fc = u16::from_le_bytes([rx.data[0], rx.data[1]]);
+                    let frame_type = fc & 0x07;
+                    let ack_seq = rx.data[2];
+                    if frame_type == 0x02 && ack_seq == seq {
+                        return Ok(());
+                    }
+                }
+            }
+
+            // No valid ACK — retry if attempts remain
+            if attempt == max_retries {
+                return Err(MacError::NoAck);
+            }
+            log::debug!(
+                "phy6222: no ACK for seq={}, retry {}/{}",
+                seq,
+                attempt + 1,
+                max_retries
+            );
+        }
+
+        Err(MacError::NoAck)
+    }
+
+    /// Send a 3-byte IEEE 802.15.4 ACK frame for the given sequence number.
+    async fn send_ack(&mut self, seq: u8) {
+        // ACK frame: FC=0x0002 (type=ACK, no pending, no AR), seq
+        let ack = [0x02u8, 0x00, seq];
+        let _ = self.driver.transmit(&ack).await;
+    }
 }
 
 impl MacDriver for Phy6222Mac {
@@ -174,10 +287,8 @@ impl MacDriver for Phy6222Mac {
             &req.capability_info,
         );
 
-        self.driver
-            .transmit(&frame)
-            .await
-            .map_err(Self::map_radio_err)?;
+        // Use CSMA-CA for the association request (ACK requested)
+        self.csma_ca_transmit(&frame, true).await?;
 
         Timer::after(embassy_time::Duration::from_millis(500)).await;
 
@@ -348,10 +459,9 @@ impl MacDriver for Phy6222Mac {
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
         let seq = self.next_dsn();
         let frame = build_data_request(seq, self.pan_id, self.coord_short_address);
-        self.driver
-            .transmit(&frame)
-            .await
-            .map_err(Self::map_radio_err)?;
+
+        // Use CSMA-CA for the data request (ACK requested)
+        self.csma_ca_transmit(&frame, true).await?;
 
         let result = select::select(
             self.driver.receive(),
@@ -360,7 +470,17 @@ impl MacDriver for Phy6222Mac {
         .await;
 
         match result {
-            select::Either::First(Ok(rx)) => Ok(MacFrame::from_slice(&rx.data[..rx.len])),
+            select::Either::First(Ok(rx)) => {
+                let data = &rx.data[..rx.len];
+                if data.len() >= 3 {
+                    let fc = u16::from_le_bytes([data[0], data[1]]);
+                    // Send ACK if requested
+                    if (fc >> 5) & 1 != 0 {
+                        self.send_ack(data[2]).await;
+                    }
+                }
+                Ok(MacFrame::from_slice(&rx.data[..rx.len]))
+            }
             _ => Ok(None),
         }
     }
@@ -370,6 +490,9 @@ impl MacDriver for Phy6222Mac {
             return Err(MacError::FrameTooLong);
         }
 
+        let msdu_handle = req.msdu_handle;
+        let ack_requested = req.tx_options.ack_tx;
+
         // Build MAC frame with proper header
         let seq = self.next_dsn();
         let mac_frame = build_data_frame(
@@ -378,36 +501,107 @@ impl MacDriver for Phy6222Mac {
             &req.dst_address,
             self.short_address,
             req.payload,
-            req.tx_options.ack_tx,
+            ack_requested,
         );
 
-        self.driver
-            .transmit(&mac_frame)
-            .await
-            .map_err(Self::map_radio_err)?;
+        // CSMA-CA + TX + ACK wait + retries
+        self.csma_ca_transmit(&mac_frame, ack_requested).await?;
 
         Ok(McpsDataConfirm {
-            msdu_handle: req.msdu_handle,
+            msdu_handle,
             timestamp: None,
         })
     }
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
-        let rx = self.driver.receive().await.map_err(Self::map_radio_err)?;
-        let data = &rx.data[..rx.len];
+        const RX_TIMEOUT_MS: u64 = 5000;
+        let deadline =
+            embassy_time::Instant::now() + embassy_time::Duration::from_millis(RX_TIMEOUT_MS);
 
-        // Parse minimal MAC header for addresses
-        let (src_address, dst_address, payload_offset, security_use) = parse_mac_addresses(data);
+        loop {
+            let now = embassy_time::Instant::now();
+            if now >= deadline {
+                return Err(MacError::NoData);
+            }
+            let remaining = deadline - now;
 
-        let mac_frame = MacFrame::from_slice(&data[payload_offset..]).unwrap_or_else(MacFrame::new);
+            let rx_result = select::select(self.driver.receive(), Timer::after(remaining)).await;
 
-        Ok(McpsDataIndication {
-            src_address,
-            dst_address,
-            lqi: rx.lqi,
-            payload: mac_frame,
-            security_use,
-        })
+            match rx_result {
+                select::Either::Second(_) => {
+                    return Err(MacError::NoData);
+                }
+                select::Either::First(Err(_)) => {
+                    continue;
+                }
+                select::Either::First(Ok(rx)) => {
+                    let data = &rx.data[..rx.len];
+
+                    if data.len() < 5 {
+                        continue;
+                    }
+
+                    let fc = u16::from_le_bytes([data[0], data[1]]);
+                    let frame_type = fc & 0x07;
+
+                    // Only deliver data frames (type 1) to upper layer
+                    if frame_type != 1 {
+                        continue;
+                    }
+
+                    // Send ACK if requested (bit 5 of FC)
+                    if (fc >> 5) & 1 != 0 {
+                        self.send_ack(data[2]).await;
+                    }
+
+                    let (src_address, dst_address, payload_offset, security_use) =
+                        parse_mac_addresses(data);
+
+                    // Software address filtering
+                    if !self.promiscuous {
+                        match &dst_address {
+                            MacAddress::Short(pan, addr) => {
+                                let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
+                                let addr_ok = addr.0 == self.short_address.0 || addr.0 == 0xFFFF;
+                                if !pan_ok || !addr_ok {
+                                    log::trace!(
+                                        "phy6222: filtered short dst pan=0x{:04X} addr=0x{:04X}",
+                                        pan.0,
+                                        addr.0
+                                    );
+                                    continue;
+                                }
+                            }
+                            MacAddress::Extended(pan, addr) => {
+                                let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
+                                let addr_ok = *addr == self.extended_address;
+                                if !pan_ok || !addr_ok {
+                                    log::trace!("phy6222: filtered ext dst pan=0x{:04X}", pan.0,);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    if data.len() <= payload_offset {
+                        continue;
+                    }
+
+                    let mac_frame =
+                        MacFrame::from_slice(&data[payload_offset..]).unwrap_or_else(MacFrame::new);
+
+                    log::trace!("phy6222: rx {} bytes lqi={}", rx.len, rx.lqi);
+
+                    return Ok(McpsDataIndication {
+                        src_address,
+                        dst_address,
+                        lqi: rx.lqi,
+                        payload: mac_frame,
+                        security_use,
+                    });
+                }
+            }
+        }
     }
 
     fn capabilities(&self) -> MacCapabilities {
