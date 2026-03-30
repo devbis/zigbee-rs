@@ -5,7 +5,7 @@ A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
 Embassy and other embedded async runtimes.
 
 ```text
-47,800+ lines of Rust · 161 source files · 9 crates · 33 ZCL clusters · 8 hardware platforms
+42,700+ lines of Rust · 131 source files · 9 crates · 45 ZCL clusters · 10 hardware platforms
 ```
 
 ## Architecture
@@ -16,7 +16,7 @@ Embassy and other embedded async runtimes.
 │           coordinator · router · re-exports           │
 ├──────────────────────────────────────────────────────┤
 │  zigbee-runtime   │  zigbee-bdb    │  zigbee-zcl     │
-│  builder, power,  │  commissioning │  33 clusters,    │
+│  builder, power,  │  commissioning │  45 clusters,    │
 │  NV storage,      │  steering,     │  foundation,     │
 │  device templates  │  formation     │  reporting       │
 ├───────────────────┴────────────────┴─────────────────┤
@@ -30,7 +30,7 @@ Embassy and other embedded async runtimes.
 │      frames · routing (AODV+tree) · security · NIB   │
 ├──────────────────────────────────────────────────────┤
 │                    zigbee-mac                          │
-│  MacDriver trait · 8 backends (see table below)      │
+│  MacDriver trait · 10 backends (see table below)     │
 ├──────────────────────────────────────────────────────┤
 │                   zigbee-types                         │
 │     IeeeAddress · ShortAddress · PanId · Channel     │
@@ -213,19 +213,21 @@ The build script links: `libdrivers_8258.a` from `$TELINK_SDK_DIR/platform/lib/`
 
 All 10 firmware targets build in CI and produce downloadable artifacts.
 
-## ZCL Clusters (33)
+## ZCL Clusters (45)
 
-**General:** Basic, Power Config, Identify, Groups, Scenes, On/Off, On/Off Switch Config,
-Level Control, Alarms, Time, Multistate Input, OTA Upgrade, Poll Control, Green Power,
-Diagnostics
+**General:** Basic, Power Config, Device Temp Config, Identify, Groups, Scenes, On/Off,
+On/Off Switch Config, Level Control, Alarms, Time, Analog Input, Analog Output, Analog
+Value, Binary Input, Binary Output, Binary Value, Multistate Input, OTA Upgrade, Poll
+Control, Green Power, Diagnostics
 
 **Closures:** Door Lock, Window Covering
 
 **HVAC:** Thermostat, Fan Control, Thermostat UI Config
 
-**Lighting:** Color Control
+**Lighting:** Color Control, Ballast Config
 
-**Measurement:** Illuminance, Temperature, Pressure, Flow, Humidity, Occupancy, Electrical
+**Measurement:** Illuminance, Illuminance Level, Temperature, Pressure, Flow, Humidity,
+Occupancy, Electrical, Carbon Dioxide, PM2.5, Soil Moisture
 
 **Security:** IAS Zone, IAS ACE, IAS WD
 
@@ -261,7 +263,7 @@ zigbee-rs/
 ├── zigbee-aps/                # Application Support (binding, groups)
 ├── zigbee-zdo/                # Device Objects (discovery, mgmt)
 ├── zigbee-bdb/                # Base Device Behavior (commissioning)
-├── zigbee-zcl/                # Zigbee Cluster Library (33 clusters)
+├── zigbee-zcl/                # Zigbee Cluster Library (45 clusters)
 ├── zigbee-runtime/            # Device builder, power, NV storage
 ├── zigbee/                    # Top-level: coordinator, router
 ├── tests/                     # Integration tests
@@ -281,7 +283,9 @@ zigbee-rs/
 │   ├── telink-b91-sensor/     # Telink B91 (stubs)
 │   ├── telink-tlsr8258-sensor/# Telink TLSR8258 (stubs)
 │   └── phy6222-sensor/        # PHY6222 — pure Rust, no vendor SDK!
-├── docs/flasher/              # ESP web flasher (GitHub Pages)
+├── docs/
+│   ├── book/                  # mdBook source → GitHub Pages
+│   └── flasher/               # ESP web flasher (GitHub Pages)
 └── BUILD.md                   # Comprehensive build guide
 ```
 
@@ -297,7 +301,7 @@ Every push builds **10 firmware targets** plus workspace checks:
 | Format | `cargo fmt --check` |
 | Doc | `cargo doc --workspace --no-deps` |
 | Build × 10 | Each platform produces a downloadable firmware artifact |
-| Deploy | Web flasher published to GitHub Pages |
+| Deploy | Book + web flasher published to GitHub Pages |
 
 Download firmware artifacts from the [Actions tab](https://github.com/faronov/zigbee-rs/actions).
 
@@ -311,8 +315,9 @@ Download firmware artifacts from the [Actions tab](https://github.com/faronov/zi
 
 ## Documentation
 
-See [BUILD.md](BUILD.md) for detailed instructions on building, flashing, sensor/display
-integration, debugging, and peripheral wiring.
+- **[The zigbee-rs Book](https://faronov.github.io/zigbee-rs/)** — online guide: architecture, platform setup, ZCL clusters, power management, OTA
+- **[BUILD.md](BUILD.md)** — detailed instructions for building, flashing, sensor/display integration, debugging, and peripheral wiring
+- **[API docs](https://docs.rs/zigbee-rs)** — generated from `cargo doc --workspace`
 
 ## License
 
