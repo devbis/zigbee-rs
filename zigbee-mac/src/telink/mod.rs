@@ -477,9 +477,10 @@ impl TelinkMac {
     }
 
     /// Send a 3-byte IEEE 802.15.4 ACK frame for the given sequence number.
-    async fn send_ack(&mut self, seq: u8) {
-        // ACK frame: FC=0x0002 (type=ACK, no pending, no AR), seq
-        let ack = [0x02u8, 0x00, seq];
+    /// If `frame_pending` is true, set the frame pending bit (bit 4 of FC).
+    async fn send_ack(&mut self, seq: u8, frame_pending: bool) {
+        let fc_low = if frame_pending { 0x12u8 } else { 0x02u8 };
+        let ack = [fc_low, 0x00, seq];
         let _ = self.driver.transmit(&ack).await;
     }
 
@@ -646,7 +647,7 @@ impl MacDriver for TelinkMac {
                         if data[cmd_offset] == 0x02 {
                             // Send ACK if requested
                             if (fc & 0x0020) != 0 {
-                                self.send_ack(data[2]).await;
+                                self.send_ack(data[2], false).await;
                             }
                             let short_addr =
                                 u16::from_le_bytes([data[cmd_offset + 1], data[cmd_offset + 2]]);
@@ -844,7 +845,14 @@ impl MacDriver for TelinkMac {
                 self.extended_address = v;
                 self.sync_radio_config();
             }
-            (MacRxOnWhenIdle, PibValue::Bool(v)) => self.rx_on_when_idle = v,
+            (MacRxOnWhenIdle, PibValue::Bool(v)) => {
+                self.rx_on_when_idle = v;
+                if v {
+                    self.driver.enable_rx();
+                } else {
+                    self.driver.disable_rx();
+                }
+            }
             (MacAssociationPermit, PibValue::Bool(v)) => self.association_permit = v,
             (MacAutoRequest, PibValue::Bool(v)) => self.auto_request = v,
             (MacDsn, PibValue::U8(v)) => self.dsn = v,
@@ -880,11 +888,19 @@ impl MacDriver for TelinkMac {
         let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
         let data_req = build_data_request(self.next_dsn(), &parent, &self.extended_address);
 
+        // Enable RX briefly for the poll exchange
+        self.driver.enable_rx();
+
         // Transmit Data Request via CSMA-CA (ACK requested)
         self.csma_ca_transmit(&data_req, true).await?;
 
         // Wait for response — parent may reply with data or empty ACK
         let result = select::select(Timer::after_millis(POLL_RESPONSE_WAIT_MS), self.driver.receive()).await;
+
+        // Disable RX after poll for sleepy devices
+        if !self.rx_on_when_idle {
+            self.driver.disable_rx();
+        }
 
         match result {
             select::Either::Second(Ok(received)) => {
@@ -902,7 +918,7 @@ impl MacDriver for TelinkMac {
 
                 // Send ACK if the polled response requests one
                 if (fc & 0x0020) != 0 && data.len() >= 3 {
-                    self.send_ack(data[2]).await;
+                    self.send_ack(data[2], false).await;
                 }
 
                 let header_len = 3 + addressing_size(fc);
@@ -917,11 +933,22 @@ impl MacDriver for TelinkMac {
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
+        if req.tx_options.indirect {
+            // Indirect transmission: coordinator should buffer for sleepy device.
+            // Currently direct-transmit only; indirect queue not yet implemented.
+            log::warn!("telink: indirect TX requested but not supported, sending directly");
+        }
+
         let ack_requested = req.tx_options.ack_tx;
         let frame = self.build_data_frame(&req.dst_address, req.payload, ack_requested);
 
         // CSMA-CA + TX + ACK wait + retries
         self.csma_ca_transmit(&frame, ack_requested).await?;
+
+        // Disable RX after TX for sleepy devices (saves power)
+        if !self.rx_on_when_idle {
+            self.driver.disable_rx();
+        }
 
         Ok(McpsDataConfirm {
             msdu_handle: req.msdu_handle,
@@ -1003,7 +1030,7 @@ impl MacDriver for TelinkMac {
 
                     // Send ACK if the received frame requests one
                     if (fc & 0x0020) != 0 && data.len() >= 3 {
-                        self.send_ack(data[2]).await;
+                        self.send_ack(data[2], false).await;
                     }
 
                     let payload_data = &data[header_len..];
