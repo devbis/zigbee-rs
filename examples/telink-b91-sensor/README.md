@@ -79,6 +79,25 @@ TelinkBDT --chip b91 --firmware target/riscv32imc-unknown-none-elf/release/telin
 - LED status indication
 - ZCL Temperature Measurement + Relative Humidity clusters
 
+## What Works vs. What's Stubbed
+
+### ✅ Implemented
+- **Time driver**: Reads the B91 32-bit stimer at `0x140200`, extends to
+  64-bit with wraparound detection, converts to microseconds at 16 MHz
+- **GPIO**: Real register-mapped I/O for group A (input, output, pull-up)
+- **RF ISR routing**: Dispatch function for RF interrupt → MAC driver callbacks
+- **Sleep**: RISC-V WFI instruction for light sleep; `light_sleep_ms()`
+  placeholder for Telink PM driver integration
+- **MAC driver**: Full Telink MAC with CSMA-CA, ED scan, indirect TX queue,
+  frame-pending bit, poll support
+
+### 🔧 Requires real hardware / SDK for full functionality
+- **Sensor data**: Synthetic temperature/humidity (no I²C sensor driver yet)
+- **Timer alarm**: `schedule_wake()` not yet wired to hardware compare
+  interrupt — Embassy uses polling mode
+- **Deep sleep**: `light_sleep_ms()` falls back to WFI; real suspend requires
+  Telink pm_sleep_wakeup() integration
+
 ## Project Structure
 
 ```

@@ -97,6 +97,26 @@ real TLSR8258 hardware.
 - ZCL Temperature Measurement + Relative Humidity clusters
 - Cross-compilation approach for non-standard ISA targets
 
+## What Works vs. What's Stubbed
+
+### ✅ Implemented
+- **Time driver**: Reads the TLSR8258 32-bit system timer at `0x740`, extends
+  to 64-bit with wraparound detection, converts to microseconds at 16 MHz
+- **GPIO**: Real register-mapped I/O for group A (input, output, pull-up)
+- **RF ISR routing**: Dispatch function for RF interrupt → MAC driver callbacks
+- **Sleep**: WFI instruction for light sleep; `light_sleep_ms()` placeholder
+  for Telink PM driver integration
+- **MAC driver**: Full Telink MAC with CSMA-CA, ED scan, indirect TX queue,
+  frame-pending bit, poll support
+
+### 🔧 Requires real hardware / SDK for full functionality
+- **Sensor data**: Synthetic temperature/humidity (no I²C sensor driver yet)
+- **Timer alarm**: `schedule_wake()` not yet wired to hardware compare
+  interrupt — Embassy uses polling mode
+- **Deep sleep**: `light_sleep_ms()` falls back to WFI; real suspend requires
+  Telink PM_LowPwrEnter() integration
+- **Build target**: Uses `thumbv6m-none-eabi` as stand-in for tc32
+
 ## Project Structure
 
 ```

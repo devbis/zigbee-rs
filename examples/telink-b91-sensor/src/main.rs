@@ -43,20 +43,38 @@ const REPORT_INTERVAL_SECS: u64 = 30;
 // ── Minimal GPIO helpers (B91 register-based) ──────────────────
 
 mod gpio {
-    const GPIO_BASE: u32 = 0x140300;
+    /// B91 GPIO group A base address.
+    const GPIO_PA_BASE: u32 = 0x140300;
+    /// Offset for input data register.
+    const GPIO_IN_OFFSET: u32 = 0x00;
+    /// Offset for output data register.
+    const GPIO_OUT_OFFSET: u32 = 0x04;
+    /// Offset for output enable register.
+    const GPIO_OEN_OFFSET: u32 = 0x08;
+    /// Offset for input enable register.
+    const GPIO_IEN_OFFSET: u32 = 0x0C;
+    /// Offset for pull-up enable register.
+    const GPIO_PU_OFFSET: u32 = 0x14;
 
     pub fn configure_input_pullup(pin: u8) {
-        // B91 GPIO configuration — simplified for compilation
-        let _ = (GPIO_BASE, pin);
+        unsafe {
+            let ien = (GPIO_PA_BASE + GPIO_IEN_OFFSET) as *mut u32;
+            core::ptr::write_volatile(ien, core::ptr::read_volatile(ien) | (1 << pin));
+            let pu = (GPIO_PA_BASE + GPIO_PU_OFFSET) as *mut u32;
+            core::ptr::write_volatile(pu, core::ptr::read_volatile(pu) | (1 << pin));
+        }
     }
 
     pub fn set_output(pin: u8) {
-        let _ = (GPIO_BASE, pin);
+        unsafe {
+            let oen = (GPIO_PA_BASE + GPIO_OEN_OFFSET) as *mut u32;
+            core::ptr::write_volatile(oen, core::ptr::read_volatile(oen) | (1 << pin));
+        }
     }
 
     pub fn write(pin: u8, high: bool) {
         unsafe {
-            let reg = (GPIO_BASE + 0x04) as *mut u32;
+            let reg = (GPIO_PA_BASE + GPIO_OUT_OFFSET) as *mut u32;
             let val = core::ptr::read_volatile(reg);
             if high {
                 core::ptr::write_volatile(reg, val | (1 << pin));
@@ -68,39 +86,63 @@ mod gpio {
 
     pub fn read_input(pin: u8) -> bool {
         unsafe {
-            let reg = (GPIO_BASE + 0x00) as *const u32;
+            let reg = (GPIO_PA_BASE + GPIO_IN_OFFSET) as *const u32;
             let val = core::ptr::read_volatile(reg);
             (val >> pin) & 1 == 1
         }
     }
 }
 
-// ── Minimal Embassy time driver ────────────────────────────────
+// ── Embassy time driver (reads B91 system timer) ───────────────
 
 mod time_driver {
     use embassy_time_driver::Driver;
 
-    struct TelinkTimeDriver;
+    /// B91 system timer register (32-bit, free-running).
+    /// Ticks at system clock rate. At 16 MHz → 16 ticks/µs.
+    const REG_STIMER_TICK: u32 = 0x140200;
 
-    impl TelinkTimeDriver {
+    /// System clock ticks per microsecond (16 MHz default).
+    const TICKS_PER_US: u64 = 16;
+
+    struct B91TimeDriver;
+
+    impl B91TimeDriver {
         const fn new() -> Self {
             Self
         }
+
+        fn read_sys_timer(&self) -> u32 {
+            unsafe { core::ptr::read_volatile(REG_STIMER_TICK as *const u32) }
+        }
     }
 
-    impl Driver for TelinkTimeDriver {
+    /// Track 64-bit time from the 32-bit hardware timer.
+    static mut LAST_RAW: u32 = 0;
+    static mut HIGH_BITS: u64 = 0;
+
+    impl Driver for B91TimeDriver {
         fn now(&self) -> u64 {
-            // Read from B91 system timer in real implementation
-            0
+            let raw = self.read_sys_timer();
+            // Extend 32-bit counter to 64-bit by detecting wraparound.
+            // Safe in single-core ISR-masked context.
+            unsafe {
+                if raw < LAST_RAW {
+                    HIGH_BITS += 1u64 << 32;
+                }
+                LAST_RAW = raw;
+                (HIGH_BITS | raw as u64) / TICKS_PER_US
+            }
         }
 
         fn schedule_wake(&self, _at: u64, _waker: &core::task::Waker) {
-            // Set alarm in system timer in real implementation
+            // TODO: configure B91 stimer compare interrupt
+            // to fire at the requested time. For now, Embassy polls.
         }
     }
 
     embassy_time_driver::time_driver_impl!(
-        static TIME_DRIVER: TelinkTimeDriver = TelinkTimeDriver::new()
+        static TIME_DRIVER: B91TimeDriver = B91TimeDriver::new()
     );
 }
 
@@ -114,6 +156,49 @@ mod pins {
     pub const BTN1: u8 = 2; // GPIO2 — button
     pub const LED1: u8 = 3; // GPIO3 — green LED
     pub const LED2: u8 = 4; // GPIO4 — blue LED
+}
+
+// ── RF interrupt routing ───────────────────────────────────────
+// On real hardware, the top-level IRQ handler must route RF
+// interrupts to the Telink MAC driver. The B91 uses PLIC; RF IRQ
+// is typically interrupt source #15 (ZB_RT).
+
+mod rf_irq {
+    // B91 PLIC: the riscv-rt trap handler dispatches by IRQ number.
+    // RF IRQ is typically source #15 (ZB_RT).
+    unsafe extern "C" {
+        fn rf_rx_irq_handler();
+        fn rf_tx_irq_handler();
+    }
+
+    /// Call from the RISC-V trap handler when RF IRQ fires.
+    #[allow(dead_code)]
+    pub unsafe fn dispatch_rf_irq() {
+        unsafe {
+            rf_rx_irq_handler();
+            rf_tx_irq_handler();
+        }
+    }
+}
+
+// ── Low-power sleep (for SED mode) ────────────────────────────
+
+mod sleep {
+    /// RISC-V WFI — halts CPU until next interrupt.
+    /// RAM and peripherals retained, minimal power savings.
+    #[inline]
+    pub fn wfi() {
+        unsafe { core::arch::asm!("wfi") };
+    }
+
+    /// Enter suspend mode with timer wakeup.
+    /// The real implementation would call Telink pm_sleep_wakeup().
+    #[allow(dead_code)]
+    pub fn light_sleep_ms(_ms: u32) {
+        // TODO: call into Telink PM driver for real low-power suspend
+        // pm_sleep_wakeup(SUSPEND_MODE, PM_WAKEUP_TIMER, tick);
+        wfi();
+    }
 }
 
 // ── Entry point ────────────────────────────────────────────────
