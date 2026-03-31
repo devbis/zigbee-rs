@@ -319,6 +319,117 @@ impl TelinkMac {
         frame
     }
 
+    /// Simple PRNG for CSMA-CA random backoff (LCG).
+    fn prng(seed: u8) -> u32 {
+        (seed as u32).wrapping_mul(1103515245).wrapping_add(12345)
+    }
+
+    /// Unslotted CSMA-CA + TX + ACK wait + retries.
+    ///
+    /// Implements IEEE 802.15.4-2011 §5.1.1.4 (unslotted CSMA-CA) with
+    /// optional ACK reception and retry loop per `macMaxFrameRetries`.
+    /// Reference: Telink ESL SDK `mac_csmaDelayCb` → `rf_performCCA` → `mac_doTx`.
+    async fn csma_ca_transmit(
+        &mut self,
+        frame: &[u8],
+        ack_requested: bool,
+    ) -> Result<(), MacError> {
+        let max_retries = if ack_requested {
+            self.max_frame_retries
+        } else {
+            0
+        };
+        // 802.15.4 timing constants for 2.4 GHz
+        const SYMBOL_PERIOD_US: u64 = 16; // 62.5 ksym/s
+        const UNIT_BACKOFF_SYMBOLS: u64 = 20; // aUnitBackoffPeriod
+
+        for attempt in 0..=max_retries {
+            // ── Unslotted CSMA-CA ──
+            let mut nb: u8 = 0;
+            let mut be = self.min_be;
+
+            let channel_clear = loop {
+                // Random backoff: 0 to (2^BE - 1) unit backoff periods
+                let max_val = (1u32 << be) - 1;
+                let seed = self.dsn.wrapping_add(nb).wrapping_add(attempt);
+                let random = Self::prng(seed);
+                let backoff = (random % (max_val + 1)) as u64;
+                let delay_us = backoff * UNIT_BACKOFF_SYMBOLS * SYMBOL_PERIOD_US;
+                if delay_us > 0 {
+                    Timer::after_micros(delay_us).await;
+                }
+
+                // CCA — use rf_performCCA via driver
+                match self.driver.cca() {
+                    Ok(idle) if idle => break true,
+                    Ok(_) => {
+                        // Channel busy — backoff and retry
+                        nb += 1;
+                        be = core::cmp::min(be + 1, self.max_be);
+                        if nb > self.max_csma_backoffs {
+                            break false;
+                        }
+                    }
+                    Err(_) => break false,
+                }
+            };
+
+            if !channel_clear {
+                if attempt == max_retries {
+                    return Err(MacError::ChannelAccessFailure);
+                }
+                continue;
+            }
+
+            // ── TX ──
+            self.driver
+                .transmit(frame)
+                .await
+                .map_err(|_| MacError::RadioError)?;
+
+            if !ack_requested {
+                return Ok(());
+            }
+
+            // ── ACK wait ──
+            // Spec: aTurnaroundTime (192µs) + ACK frame duration (~352µs).
+            // Allow 1.5ms total for software overhead.
+            let seq = frame[2];
+            let ack_result = select::select(self.driver.receive(), Timer::after_micros(1500)).await;
+
+            if let select::Either::First(Ok(rx)) = ack_result {
+                if rx.len >= 3 {
+                    let fc = u16::from_le_bytes([rx.data[0], rx.data[1]]);
+                    let frame_type = fc & 0x07;
+                    let ack_seq = rx.data[2];
+                    if frame_type == 0x02 && ack_seq == seq {
+                        return Ok(());
+                    }
+                }
+            }
+
+            // No valid ACK — retry if attempts remain
+            if attempt == max_retries {
+                return Err(MacError::NoAck);
+            }
+            log::debug!(
+                "telink: no ACK for seq={}, retry {}/{}",
+                seq,
+                attempt + 1,
+                max_retries
+            );
+        }
+
+        Err(MacError::NoAck)
+    }
+
+    /// Send a 3-byte IEEE 802.15.4 ACK frame for the given sequence number.
+    async fn send_ack(&mut self, seq: u8) {
+        // ACK frame: FC=0x0002 (type=ACK, no pending, no AR), seq
+        let ack = [0x02u8, 0x00, seq];
+        let _ = self.driver.transmit(&ack).await;
+    }
+
     /// Sync radio hardware config with current PIB state.
     fn sync_radio_config(&mut self) {
         self.driver.update_config(|cfg| {
@@ -411,20 +522,17 @@ impl MacDriver for TelinkMac {
             req.coord_address
         );
 
-        // Build and send association request
+        // Build and send association request (ACK requested)
         let frame = self.association_request_frame(&req.coord_address, &req.capability_info);
-        self.driver
-            .transmit(&frame)
-            .await
-            .map_err(|_| MacError::RadioError)?;
+        self.csma_ca_transmit(&frame, true).await?;
 
         // Per IEEE 802.15.4 §5.3.2.1: wait, then poll with Data Request
         Timer::after_millis(100).await;
 
-        // Send Data Request to poll for indirect Association Response
+        // Send Data Request to poll for indirect Association Response (ACK requested)
         let data_req =
             build_data_request(self.next_dsn(), &req.coord_address, &self.extended_address);
-        let _ = self.driver.transmit(&data_req).await;
+        self.csma_ca_transmit(&data_req, true).await?;
 
         // Wait for Association Response with generous timeout (3 seconds)
         let timeout = Timer::after(embassy_time::Duration::from_millis(3000));
@@ -448,6 +556,10 @@ impl MacDriver for TelinkMac {
                         }
                         // Association Response = command ID 0x02
                         if data[cmd_offset] == 0x02 {
+                            // Send ACK if requested
+                            if (fc & 0x0020) != 0 {
+                                self.send_ack(data[2]).await;
+                            }
                             let short_addr =
                                 u16::from_le_bytes([data[cmd_offset + 1], data[cmd_offset + 2]]);
                             let status = match data[cmd_offset + 3] {
@@ -621,11 +733,8 @@ impl MacDriver for TelinkMac {
         let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
         let data_req = build_data_request(self.next_dsn(), &parent, &self.extended_address);
 
-        // Transmit Data Request
-        self.driver
-            .transmit(&data_req)
-            .await
-            .map_err(|_| MacError::RadioError)?;
+        // Transmit Data Request via CSMA-CA (ACK requested)
+        self.csma_ca_transmit(&data_req, true).await?;
 
         // Wait for response — parent may reply with data or empty ACK
         let result = select::select(Timer::after_millis(500), self.driver.receive()).await;
@@ -644,6 +753,11 @@ impl MacDriver for TelinkMac {
                     return Ok(None);
                 }
 
+                // Send ACK if the polled response requests one
+                if (fc & 0x0020) != 0 && data.len() >= 3 {
+                    self.send_ack(data[2]).await;
+                }
+
                 let header_len = 3 + addressing_size(fc);
                 if data.len() <= header_len {
                     return Ok(None);
@@ -659,42 +773,8 @@ impl MacDriver for TelinkMac {
         let ack_requested = req.tx_options.ack_tx;
         let frame = self.build_data_frame(&req.dst_address, req.payload, ack_requested);
 
-        // Unslotted CSMA-CA (IEEE 802.15.4-2011 §5.1.1.4)
-        let mut be = self.min_be;
-        let mut nb: u8 = 0;
-        let symbol_period_us: u64 = 16;
-        let unit_backoff_symbols: u64 = 20;
-
-        loop {
-            let max_val = (1u32 << be) - 1;
-            let random = (self.dsn as u32)
-                .wrapping_mul(1103515245)
-                .wrapping_add(12345);
-            let backoff = (random % (max_val + 1)) as u64;
-            let delay_us = backoff * unit_backoff_symbols * symbol_period_us;
-            if delay_us > 0 {
-                Timer::after_micros(delay_us).await;
-            }
-
-            match self.driver.transmit(&frame).await {
-                Ok(_) => break,
-                Err(_) => {
-                    nb += 1;
-                    be = core::cmp::min(be + 1, self.max_be);
-                    if nb > self.max_csma_backoffs {
-                        return Err(MacError::ChannelAccessFailure);
-                    }
-                }
-            }
-        }
-
-        // Best-effort retransmit for ACK-requested frames
-        if ack_requested {
-            for retransmit in 0..4u8 {
-                Timer::after_millis(3 + retransmit as u64 * 2).await;
-                let _ = self.driver.transmit(&frame).await;
-            }
-        }
+        // CSMA-CA + TX + ACK wait + retries
+        self.csma_ca_transmit(&frame, ack_requested).await?;
 
         Ok(McpsDataConfirm {
             msdu_handle: req.msdu_handle,
@@ -770,6 +850,11 @@ impl MacDriver for TelinkMac {
                         data.len(),
                         rx_frame.lqi
                     );
+
+                    // Send ACK if the received frame requests one
+                    if (fc & 0x0020) != 0 && data.len() >= 3 {
+                        self.send_ack(data[2]).await;
+                    }
 
                     let payload_data = &data[header_len..];
                     if let Some(mac_frame) = MacFrame::from_slice(payload_data) {
