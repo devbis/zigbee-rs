@@ -500,7 +500,17 @@ impl MacDriver for TelinkMac {
                     energy_list,
                 })
             }
-            ScanType::Orphan => Err(MacError::Unsupported),
+            ScanType::Orphan => {
+                // Orphan scan: no specific action at MAC level for end devices.
+                // The coordinator role would send orphan notification — not yet supported.
+                self.sync_radio_config();
+
+                Ok(MlmeScanConfirm {
+                    scan_type: req.scan_type,
+                    pan_descriptors: heapless::Vec::new(),
+                    energy_list: heapless::Vec::new(),
+                })
+            }
         }
     }
 
@@ -591,28 +601,71 @@ impl MacDriver for TelinkMac {
 
     async fn mlme_associate_response(
         &mut self,
-        _rsp: MlmeAssociateResponse,
+        rsp: MlmeAssociateResponse,
     ) -> Result<(), MacError> {
-        // TODO: Build and send Association Response MAC command frame.
-        // Required for coordinator/router role to accept joining devices.
-        //
-        // Steps:
-        // 1. Build MAC command frame (type 0x02) with:
-        //    - Assigned short address (from rsp.short_address)
-        //    - Association status (success/denied)
-        // 2. Queue as indirect transmission (for the joining device to poll)
-        //    OR transmit directly if device is rx-on-when-idle
-        Err(MacError::Unsupported)
+        // Build Association Response MAC command frame (IEEE 802.15.4 §5.3.2)
+        let mut frame: heapless::Vec<u8, 32> = heapless::Vec::new();
+        let seq = self.next_dsn();
+
+        // Frame Control: MAC command, ACK req, PAN ID compression, dst=extended, src=extended
+        let _ = frame.extend_from_slice(&[0x63, 0xCC, seq]);
+
+        // Destination PAN + extended address of requesting device
+        let _ = frame.extend_from_slice(&self.pan_id.0.to_le_bytes());
+        let _ = frame.extend_from_slice(&rsp.device_address);
+
+        // Source: our extended address (PAN ID compressed)
+        let _ = frame.extend_from_slice(&self.extended_address);
+
+        // MAC command: Association Response (0x02)
+        let _ = frame.push(0x02);
+        // Assigned short address (LE)
+        let _ = frame.extend_from_slice(&rsp.short_address.0.to_le_bytes());
+        // Association status
+        let _ = frame.push(rsp.status as u8);
+
+        self.csma_ca_transmit(&frame, true).await?;
+        Ok(())
     }
 
-    async fn mlme_disassociate(&mut self, _req: MlmeDisassociateRequest) -> Result<(), MacError> {
-        // TODO: Build and send Disassociation Notification MAC command.
-        //
-        // Steps:
-        // 1. Build MAC command frame (type 0x03) with disassociate reason
-        // 2. Transmit to coordinator/device
-        // 3. Clear local addressing state
+    async fn mlme_disassociate(&mut self, req: MlmeDisassociateRequest) -> Result<(), MacError> {
+        // Build Disassociation Notification MAC command frame (IEEE 802.15.4 §5.3.3)
+        let mut frame: heapless::Vec<u8, 32> = heapless::Vec::new();
+        let seq = self.next_dsn();
 
+        // Frame Control: MAC command, ACK request, PAN ID compression, dst=short/ext, src=extended
+        match &req.device_address {
+            MacAddress::Short(_, _) => {
+                let _ = frame.extend_from_slice(&[0x63, 0xC8, seq]);
+            }
+            MacAddress::Extended(_, _) => {
+                let _ = frame.extend_from_slice(&[0x63, 0xCC, seq]);
+            }
+        }
+
+        // Destination PAN + address
+        let dst_pan = req.device_address.pan_id();
+        let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
+        match &req.device_address {
+            MacAddress::Short(_, addr) => {
+                let _ = frame.extend_from_slice(&addr.0.to_le_bytes());
+            }
+            MacAddress::Extended(_, addr) => {
+                let _ = frame.extend_from_slice(addr);
+            }
+        }
+
+        // Source: our extended address
+        let _ = frame.extend_from_slice(&self.extended_address);
+
+        // MAC command: Disassociation Notification (0x03) + reason
+        let _ = frame.push(0x03);
+        let _ = frame.push(req.reason as u8);
+
+        // Send via CSMA-CA (ACK requested)
+        let _ = self.csma_ca_transmit(&frame, true).await;
+
+        // Clear local addressing state regardless of TX result
         self.short_address = ShortAddress(0xFFFF);
         self.pan_id = PanId(0xFFFF);
         self.sync_radio_config();
@@ -677,6 +730,7 @@ impl MacDriver for TelinkMac {
             PhyChannelsSupported => Ok(PibValue::U32(zigbee_types::ChannelMask::ALL_2_4GHZ.0)),
             PhyCurrentPage => Ok(PibValue::U8(0)), // Page 0 = 2.4 GHz
             MacBeaconPayload => Ok(PibValue::Payload(self.beacon_payload.clone())),
+            MacCoordShortAddress => Ok(PibValue::ShortAddress(self.coord_short_address)),
             _ => Err(MacError::Unsupported),
         }
     }
