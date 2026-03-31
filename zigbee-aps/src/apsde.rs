@@ -1201,8 +1201,31 @@ impl<M: MacDriver> ApsLayer<M> {
                 let _ = self.security_mut().add_key(entry);
             }
             0x04 => {
-                // Application Link Key
-                log::info!("[APS] Transport-Key: App Link Key from 0x{:04X}", src.0,);
+                // Application Link Key (spec §4.4.9.2.4)
+                // Payload: key_type(1) + key(16) + partner_ieee(8) + initiator_flag(1)
+                if data.len() < 25 {
+                    log::warn!(
+                        "[APS] Transport-Key: App Link Key too short ({} bytes)",
+                        data.len()
+                    );
+                    return;
+                }
+                let mut partner_ieee = [0u8; 8];
+                partner_ieee.copy_from_slice(&data[17..25]);
+                log::info!(
+                    "[APS] Transport-Key: App Link Key from 0x{:04X}, partner={:02X?}",
+                    src.0,
+                    partner_ieee,
+                );
+                let entry = crate::security::ApsLinkKeyEntry {
+                    partner_address: partner_ieee,
+                    key,
+                    key_type: crate::security::ApsKeyType::ApplicationLinkKey,
+                    outgoing_frame_counter: 0,
+                    incoming_frame_counter: 0,
+                };
+                let _ = self.security_mut().add_key(entry);
+                log::info!("[APS] Application link key installed for partner {:02X?}", partner_ieee);
             }
             _ => {
                 log::debug!("[APS] Transport-Key: unknown key_type=0x{:02X}", key_type,);

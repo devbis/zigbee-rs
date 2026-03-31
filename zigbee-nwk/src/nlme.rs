@@ -732,6 +732,93 @@ impl<M: MacDriver> NwkLayer<M> {
         Ok(())
     }
 
+    // ── NLME-ORPHAN-RECOVERY ────────────────────────────────
+
+    /// Check whether the parent is still reachable.
+    ///
+    /// Returns `false` if the parent entry is missing from the neighbor
+    /// table or has an age value indicating staleness.
+    pub fn nlme_check_parent_alive(&self) -> bool {
+        if !self.joined {
+            return false;
+        }
+        match self.neighbors.parent() {
+            Some(entry) => entry.age < 255,
+            None => false,
+        }
+    }
+
+    /// Attempt to recover from parent loss via orphan rejoin.
+    ///
+    /// Scans for the original network (matched by extended PAN ID) and
+    /// attempts an NWK-level rejoin.  Channels are tried in order:
+    /// current → primary (11, 15, 20, 25) → all 2.4 GHz.
+    pub async fn nlme_orphan_recovery(&mut self) -> Result<ShortAddress, NwkStatus> {
+        self.joined = false;
+        log::info!("[NWK] Parent lost — starting orphan recovery");
+
+        let saved_ext_pan = self.nib.extended_pan_id;
+        let saved_channel = self.nib.logical_channel;
+
+        // Helper closure-like search: try discovery on a channel mask and
+        // rejoin the first network whose extended PAN ID matches.
+        // Phase 1 — current channel only
+        let current_mask = ChannelMask(1u32 << saved_channel);
+        if let Ok(addr) =
+            self.try_rejoin_on_mask(current_mask, &saved_ext_pan).await
+        {
+            return Ok(addr);
+        }
+
+        // Phase 2 — primary Touchlink channels (11, 15, 20, 25)
+        let primary_mask = ChannelMask(
+            (1u32 << 11) | (1u32 << 15) | (1u32 << 20) | (1u32 << 25),
+        );
+        if let Ok(addr) =
+            self.try_rejoin_on_mask(primary_mask, &saved_ext_pan).await
+        {
+            return Ok(addr);
+        }
+
+        // Phase 3 — all 2.4 GHz channels
+        if let Ok(addr) = self
+            .try_rejoin_on_mask(ChannelMask::ALL_2_4GHZ, &saved_ext_pan)
+            .await
+        {
+            return Ok(addr);
+        }
+
+        log::warn!("[NWK] Orphan recovery failed — network not found");
+        Err(NwkStatus::NoNetworks)
+    }
+
+    /// Scan on `mask` and attempt rejoin on the first network matching
+    /// `ext_pan`.
+    async fn try_rejoin_on_mask(
+        &mut self,
+        mask: ChannelMask,
+        ext_pan: &IeeeAddress,
+    ) -> Result<ShortAddress, NwkStatus> {
+        let networks = self.nlme_network_discovery(mask, 3).await?;
+        for net in &networks {
+            if net.extended_pan_id == *ext_pan {
+                match self.nlme_join(net, JoinMethod::Rejoin).await {
+                    Ok(addr) => {
+                        log::info!(
+                            "[NWK] Orphan recovery succeeded — addr=0x{:04X}",
+                            addr.0
+                        );
+                        return Ok(addr);
+                    }
+                    Err(e) => {
+                        log::debug!("[NWK] Rejoin attempt failed: {:?}", e);
+                    }
+                }
+            }
+        }
+        Err(NwkStatus::NoNetworks)
+    }
+
     // ── NLME-PERMIT-JOINING ─────────────────────────────────
 
     /// Open or close the network for joining.

@@ -211,4 +211,40 @@ impl<M: MacDriver> NwkLayer<M> {
         self.send_nwk_command(dest, NwkCommandId::RouteRecord, &payload[..offset])
             .await
     }
+
+    /// Drain and send all queued route replies.
+    ///
+    /// Call this after `process_incoming_nwk_frame` returns so that
+    /// deferred RREPs (generated in sync command handlers) get
+    /// transmitted asynchronously.
+    pub async fn process_pending_routing(&mut self) {
+        while let Some(pending) = self.pending_route_replies.pop() {
+            let rrep = RouteReply {
+                command_options: 0x00,
+                route_request_id: pending.route_request_id,
+                originator: pending.originator,
+                responder: pending.responder,
+                path_cost: pending.path_cost,
+                originator_ieee: None,
+                responder_ieee: None,
+            };
+            let mut payload = [0u8; 32];
+            let len = rrep.serialize(&mut payload);
+
+            if let Err(e) = self
+                .send_nwk_command(
+                    pending.next_hop,
+                    NwkCommandId::RouteReply,
+                    &payload[..len],
+                )
+                .await
+            {
+                log::warn!(
+                    "[NWK] Failed to send queued RREP to 0x{:04X}: {:?}",
+                    pending.next_hop.0,
+                    e
+                );
+            }
+        }
+    }
 }

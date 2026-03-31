@@ -90,6 +90,21 @@ pub enum DeviceType {
 /// let mac = MockMac::new([1,2,3,4,5,6,7,8]);
 /// let mut nwk = NwkLayer::new(mac, DeviceType::EndDevice);
 ///
+/// A deferred route reply or route-reply-forward to be sent asynchronously.
+#[derive(Debug, Clone)]
+pub struct PendingRouteReply {
+    /// Short address to send the RREP toward
+    pub next_hop: ShortAddress,
+    /// Originator of the original RREQ
+    pub originator: ShortAddress,
+    /// Responder (the node that can reach the destination)
+    pub responder: ShortAddress,
+    /// Accumulated path cost
+    pub path_cost: u8,
+    /// Route request ID from the original RREQ
+    pub route_request_id: u8,
+}
+
 /// // Discover networks
 /// let networks = nwk.nlme_network_discovery(ChannelMask::ALL_2_4GHZ, 3).await?;
 ///
@@ -108,6 +123,8 @@ pub struct NwkLayer<M: MacDriver> {
     /// true = non-sleepy (RFD/FFD that stays awake)
     /// false = sleepy end device (polls parent for data)
     rx_on_when_idle: bool,
+    /// Pending route replies to be sent asynchronously.
+    pending_route_replies: heapless::Vec<PendingRouteReply, 4>,
 }
 
 impl<M: MacDriver> NwkLayer<M> {
@@ -124,6 +141,7 @@ impl<M: MacDriver> NwkLayer<M> {
             device_type,
             joined: false,
             rx_on_when_idle,
+            pending_route_replies: heapless::Vec::new(),
         }
     }
 

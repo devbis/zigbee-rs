@@ -272,6 +272,45 @@ impl RoutingTable {
     pub fn iter(&self) -> impl Iterator<Item = &RouteEntry> {
         self.routes.iter().filter(|r| r.active)
     }
+
+    /// Mark routes with age exceeding `max_age` as [`RouteStatus::Inactive`].
+    pub fn expire_stale(&mut self, max_age: u16) {
+        for route in self.routes.iter_mut().filter(|r| r.active) {
+            if route.age > max_age {
+                route.status = RouteStatus::Inactive;
+                route.active = false;
+                log::debug!(
+                    "[NWK] Route to 0x{:04X} expired (age={})",
+                    route.destination.0,
+                    route.age,
+                );
+            }
+        }
+    }
+
+    /// Fail discoveries that have been active longer than `max_age` ticks.
+    pub fn expire_discoveries(&mut self, max_age: u32, current_time: u32) {
+        for disc in self.discoveries.iter_mut().filter(|d| d.active) {
+            let elapsed = current_time.wrapping_sub(disc.timestamp);
+            if elapsed > max_age {
+                disc.active = false;
+                // Update the corresponding route entry to DiscoveryFailed
+                if let Some(route) = self
+                    .routes
+                    .iter_mut()
+                    .find(|r| r.destination == disc.destination
+                        && r.status == RouteStatus::DiscoveryUnderway)
+                {
+                    route.status = RouteStatus::DiscoveryFailed;
+                }
+                log::debug!(
+                    "[NWK] Route discovery for 0x{:04X} timed out (elapsed={})",
+                    disc.destination.0,
+                    elapsed,
+                );
+            }
+        }
+    }
 }
 
 /// CSkip value calculation for tree addressing.

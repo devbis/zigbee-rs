@@ -523,8 +523,21 @@ impl<M: MacDriver> NwkLayer<M> {
             // Update route back to the originator via the sender
             let _ = self.routing.update_route(src, src, rreq.path_cost);
 
+            // Queue RREP to be sent asynchronously back toward the RREQ originator
+            let responder = if rreq.dst_addr == our_addr {
+                our_addr
+            } else {
+                rreq.dst_addr
+            };
+            let _ = self.pending_route_replies.push(crate::PendingRouteReply {
+                next_hop: src,
+                originator: src,
+                responder,
+                path_cost: rreq.path_cost,
+                route_request_id: rreq.route_request_id,
+            });
             log::info!(
-                "[NWK] RREQ destination 0x{:04X} reachable — should send RREP",
+                "[NWK] RREQ destination 0x{:04X} reachable — RREP queued",
                 rreq.dst_addr.0
             );
         } else if self.device_type != DeviceType::EndDevice {
@@ -581,10 +594,22 @@ impl<M: MacDriver> NwkLayer<M> {
         let our_addr = self.nib.network_address;
 
         if rrep.originator != our_addr {
-            // Not the originator — should forward RREP toward originator
+            // Not the originator — forward RREP toward originator via routing
+            let forward_hop = self
+                .routing
+                .next_hop(rrep.originator)
+                .unwrap_or(self.nib.parent_address);
+            let _ = self.pending_route_replies.push(crate::PendingRouteReply {
+                next_hop: forward_hop,
+                originator: rrep.originator,
+                responder: rrep.responder,
+                path_cost: rrep.path_cost,
+                route_request_id: rrep.route_request_id,
+            });
             log::debug!(
-                "[NWK] Forwarding RREP toward originator 0x{:04X}",
-                rrep.originator.0
+                "[NWK] Forwarding RREP toward originator 0x{:04X} via 0x{:04X}",
+                rrep.originator.0,
+                forward_hop.0,
             );
         } else {
             log::info!(
