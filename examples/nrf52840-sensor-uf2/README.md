@@ -72,7 +72,8 @@ cargo build --release --no-default-features --features board-nrf-dk
 - Sleepy End Device (SED) polling architecture — `device.poll()` instead of
   `device.receive()`
 - On-chip TEMP sensor + simulated humidity (default), or **real BME280 I2C
-  sensor** for temperature + humidity + pressure via `--features sensor-bme280`
+  sensor** (temp + humidity + pressure) via `--features sensor-bme280`, or
+  **real SHT31 I2C sensor** (temp + humidity) via `--features sensor-sht31`
 - Pressure Measurement cluster (0x0403) always advertised
 - RAM power-down of unused banks to reduce sleep current
 - LED status: solid ON = joined, double-blink = searching, OFF = idle
@@ -99,6 +100,27 @@ cargo build --release --no-default-features --features board-nrf-dk,sensor-bme28
 The async BME280 driver uses embassy's TWIM (I2C master) — fully non-blocking,
 so radio communication continues uninterrupted during sensor reads.
 
+## SHT31 External Sensor (optional)
+
+Wire a SHT31 breakout to the nRF52840 DK or ProMicro:
+
+| SHT31 Pin  | nRF52840 Pin | Notes |
+|------------|-------------|-------|
+| SDA        | P0.26       | I2C data |
+| SCL        | P0.27       | I2C clock |
+| VCC        | 3.3V        | |
+| GND        | GND         | |
+| ADDR       | GND         | Address 0x44 (or VCC for 0x45) |
+
+Build with the `sensor-sht31` feature:
+
+```sh
+cargo build --release --no-default-features --features board-nrf-dk,sensor-sht31
+```
+
+The async SHT31 driver uses embassy's TWIM (I2C master) — fully non-blocking,
+with CRC-8 verification on every read for data integrity.
+
 ## Operation
 
 1. Power on → LED solid ON for 3 s (boot signal), then auto-joins
@@ -116,5 +138,6 @@ nrf52840-sensor-uf2/
 ├── build.rs              # Generates memory.x per board feature, linker flags
 └── src/
     ├── bme280.rs         # Async BME280 I2C driver (used with sensor-bme280 feature)
+    ├── sht31.rs          # Async SHT31 I2C driver (used with sensor-sht31 feature)
     └── main.rs           # Async entry point with SED polling loop
 ```
