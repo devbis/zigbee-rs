@@ -99,7 +99,7 @@ zigbee-rs-fork/
 ├── zigbee/                 # Façade crate — re-exports the full stack
 │
 ├── examples/
-│   └── nrf52840-sensor/    # Embassy-based weather sensor (BME280 I2C)
+│   └── nrf52840-sensor/    # Embassy-based sensor (BME280/SHT31 I2C, on-chip TEMP)
 │
 └── tests/
     └── src/
@@ -340,9 +340,9 @@ bus initialization differs.
 
 | Sensor | Crate | Measures | I2C Addr | ZCL Clusters |
 |--------|-------|----------|----------|--------------|
-| SHT31 | `sht3x` | Temp + Humidity | 0x44 / 0x45 | 0x0402 + 0x0405 |
+| SHT31 | **built-in** (`sht31.rs`) | Temp + Humidity | 0x44 / 0x45 | 0x0402 + 0x0405 |
 | SHT40 | `sht4x` | Temp + Humidity | 0x44 | 0x0402 + 0x0405 |
-| BME280 | `bme280` | Temp + Humidity + Pressure | 0x76 / 0x77 | 0x0402 + 0x0405 + 0x0403 |
+| BME280 | **built-in** (`bme280.rs`) | Temp + Humidity + Pressure | 0x76 / 0x77 | 0x0402 + 0x0405 + 0x0403 |
 | BMP280 | `bmp280-rs` | Temp + Pressure | 0x76 / 0x77 | 0x0402 + 0x0403 |
 | HDC1080 | `hdc1080` | Temp + Humidity | 0x40 | 0x0402 + 0x0405 |
 | SHTC3 | `shtcx` | Temp + Humidity | 0x70 | 0x0402 + 0x0405 |
@@ -352,22 +352,29 @@ bus initialization differs.
 | MAX44009 | `max44009` | Illuminance | 0x4A / 0x4B | 0x0400 |
 | SCD40 | `scd4x` | CO₂ + Temp + Humidity | 0x62 | Custom + 0x0402 + 0x0405 |
 
-> The nRF52840-sensor example uses a **BME280** — see
-> `examples/nrf52840-sensor/README.md` for wiring.
+> The nRF52840-sensor example includes **built-in async drivers** for BME280 and SHT31 —
+> enable via `--features sensor-bme280` or `--features sensor-sht31`.
+> See `examples/nrf52840-sensor/README.md` for wiring and build instructions.
+> Both drivers are fully async (embassy TWIM DMA) and don't block the radio.
 
 ### Pattern: Reading Sensor → Updating ZCL Cluster
 
 ```rust
-// Read from any embedded-hal I2C sensor
-let measurement = sensor.read().await?;
+// Built-in async BME280 driver (examples/nrf52840-sensor/src/bme280.rs)
+if let Some(data) = bme280::read(&mut i2c, 0x76).await {
+    // Temperature: ZCL uses units of 0.01 °C (i16) — driver returns centidegrees
+    temp_cluster.set_temperature(data.temperature_centideg);
+    // Humidity: ZCL uses units of 0.01 % (u16) — driver returns centipercent
+    hum_cluster.set_humidity(data.humidity_centipct);
+    // Pressure: BME280 returns hPa as u16
+    press_cluster.set_pressure(data.pressure_hpa as i16);
+}
 
-// Update ZCL cluster attributes
-// Temperature: ZCL uses units of 0.01 °C (i16)
-temp_cluster.set_temperature((measurement.temperature * 100.0) as i16);
-// Humidity: ZCL uses units of 0.01 % (u16)
-humidity_cluster.set_humidity((measurement.humidity * 100.0) as u16);
-// Pressure: ZCL uses units of 0.1 hPa (u16)
-pressure_cluster.set_pressure((measurement.pressure * 10.0) as u16);
+// Built-in async SHT31 driver (examples/nrf52840-sensor/src/sht31.rs)
+if let Some(data) = sht31::read(&mut i2c, 0x44).await {
+    temp_cluster.set_temperature(data.temperature_centideg);
+    hum_cluster.set_humidity(data.humidity_centipct);
+}
 
 // The stack handles reporting changes to the coordinator automatically
 // based on the configured min/max reporting interval and reportable change.
@@ -484,17 +491,19 @@ use {defmt_rtt as _, panic_probe as _};
 use zigbee_mac::NrfMac;
 use zigbee_runtime::DeviceBuilder;
 
+// Embassy interrupt binding for I2C
+bind_interrupts!(struct Irqs { TWISPI0 => twim::InterruptHandler<peripherals::TWISPI0>; });
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = hal::init(Default::default());
 
     // 1. Set up I2C for the sensor
     let i2c_config = twim::Config::default();
-    let i2c = twim::Twim::new(p.TWISPI0, hal::Interrupt::take(hal::interrupt::SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0), p.P0_26, p.P0_27, i2c_config);
+    let mut i2c = twim::Twim::new(p.TWISPI0, Irqs, p.P0_26, p.P0_27, i2c_config);
 
-    // 2. Initialize sensor driver (embedded-hal compatible)
-    let mut sensor = bme280::BME280::new_primary(i2c);
-    sensor.init().unwrap();
+    // 2. Initialize sensor driver (async, no blocking)
+    bme280::init(&mut i2c, 0x76).await;
 
     // 3. Initialize the 802.15.4 radio
     let mac = NrfMac::new(p.RADIO);

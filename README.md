@@ -76,7 +76,12 @@ Or flash via the [web flasher](https://faronov.github.io/zigbee-rs/) (no tools n
 
 ```bash
 cd examples/nrf52840-sensor
+# Default (on-chip temp):
 cargo build --release
+# With BME280 sensor (temp + humidity + pressure):
+cargo build --release --features sensor-bme280
+# With SHT31 sensor (temp + humidity):
+cargo build --release --features sensor-sht31
 probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-sensor
 ```
 
@@ -274,8 +279,8 @@ zigbee-rs/
 │   ├── mock-sleepy-sensor/    # Host: SED demo
 │   ├── esp32c6-sensor/        # ESP32-C6 firmware
 │   ├── esp32h2-sensor/        # ESP32-H2 firmware
-│   ├── nrf52840-sensor/       # nRF52840-DK (probe-rs)
-│   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop)
+│   ├── nrf52840-sensor/       # nRF52840-DK (probe-rs) + BME280/SHT31 I2C sensors
+│   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop, simple demo)
 │   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs)
 │   ├── nrf52840-bridge/       # nRF52840 coordinator bridge
 │   ├── bl702-sensor/          # BL702 (requires vendor libs from Bouffalo SDK)

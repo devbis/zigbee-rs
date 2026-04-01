@@ -46,6 +46,7 @@ cargo run --release
   **Temperature Measurement** and **Relative Humidity** server clusters
 - Processing incoming MAC frames and generating ZCL attribute reports
 - Button-driven network join/leave via `UserAction::Toggle`
+- RAM power-down of unused banks (128 KB total, saves ~80 KB)
 - `defmt` structured logging over RTT
 
 ## Differences from nRF52840-sensor
@@ -53,6 +54,8 @@ cargo run --release
 - Uses `nrf52833` feature for `embassy-nrf` and `zigbee-mac`
 - Chip: nRF52833_xxAA (512 KB Flash, 128 KB RAM vs 1 MB / 256 KB)
 - Runner: `probe-rs run --chip nRF52833_xxAA`
+- No external sensor support (on-chip TEMP only) — see `nrf52840-sensor`
+  for BME280/SHT31 I2C sensor integration
 
 ## Operation
 

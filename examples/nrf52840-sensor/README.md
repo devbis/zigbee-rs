@@ -1,14 +1,26 @@
-# nRF52840 Zigbee Temperature Sensor
+# nRF52840 Zigbee Sensor (DK / J-Link)
 
-An async Embassy-based Zigbee 3.0 end device for the **Nordic nRF52840** that
-reads real temperature from the on-chip TEMP peripheral and reports simulated
-humidity. Uses `defmt` + RTT for logging.
+An async Embassy-based Zigbee 3.0 sleepy end device for the **Nordic nRF52840-DK**.
+Supports optional external I2C sensors (BME280, SHT31) via feature flags, with
+on-chip TEMP as the default fallback. Uses `defmt` + RTT for logging.
+
+## Features
+
+| Feature         | Sensor  | Clusters                    |
+|-----------------|---------|------------------------------|
+| *(default)*     | On-chip TEMP | Temp + fake humidity    |
+| `sensor-bme280` | BME280  | Temp + humidity + pressure   |
+| `sensor-sht31`  | SHT31   | Temp + humidity              |
+
+All variants include: Basic, Power Configuration, Battery voltage (SAADC),
+RAM power-down for unused banks, and auto-recovery on sensor failure.
 
 ## Hardware Requirements
 
 - nRF52840-DK (PCA10056) or any nRF52840 board with a debug probe
 - Button 1 (P0.11, active low) for join/leave control
 - Debug probe (J-Link on-board for DK, or external probe-rs-compatible)
+- (Optional) BME280 or SHT31 breakout wired to I2C (see below)
 
 ## Prerequisites
 
@@ -22,7 +34,14 @@ drives the 802.15.4 radio directly via `embassy-nrf`.
 ## Build
 
 ```sh
+# Default (on-chip temp + fake humidity):
 cargo build --release
+
+# With BME280 (temp + humidity + pressure):
+cargo build --release --features sensor-bme280
+
+# With SHT31 (temp + humidity):
+cargo build --release --features sensor-sht31
 ```
 
 ## Flash & Run
@@ -37,22 +56,41 @@ Or use the configured runner:
 cargo run --release
 ```
 
+## I2C Sensor Wiring (BME280 / SHT31)
+
+| Sensor Pin | nRF52840 Pin | Notes |
+|------------|-------------|-------|
+| SDA        | P0.26       | I2C data |
+| SCL        | P0.27       | I2C clock |
+| VCC        | 3.3V        | |
+| GND        | GND         | |
+| ADDR (SHT31) | GND      | Address 0x44 (or VCC for 0x45) |
+
+BME280 I2C address: 0x76 (SDO→GND) or 0x77 (SDO→VCC).
+
+Both drivers are **fully async** — they use embassy's TWIM (DMA-based I2C master)
+and yield during transfers, so the Zigbee radio continues processing uninterrupted.
+
 ## What It Demonstrates
 
 - Embassy async event loop with `select3` (radio receive, button press, timer)
-- On-chip TEMP sensor reading via `embassy_nrf::temp::Temp`
+- On-chip TEMP sensor or async external I2C sensor (BME280 / SHT31)
 - Building a Zigbee device with `ZigbeeDevice` builder API
 - ZCL endpoint 1 (Home Automation, device type 0x0302) with **Basic**,
-  **Temperature Measurement**, and **Relative Humidity** server clusters
+  **Power Configuration**, **Temperature Measurement**, **Relative Humidity**,
+  and optionally **Pressure Measurement** (BME280 only) server clusters
+- Automatic sensor recovery on read failure (re-init next cycle)
 - Processing incoming MAC frames and generating ZCL attribute reports
 - Button-driven network join/leave via `UserAction::Toggle`
-- `defmt` structured logging over RTT
+- RAM power-down of unused banks (~190 KB saved on nRF52840)
+- Battery voltage monitoring via SAADC (VDD internal divider)
+- `log` → `defmt` bridge for stack-internal logging via RTT
 
 ## Operation
 
 1. Power on → device starts idle (not joined)
 2. Press Button 1 → initiates BDB commissioning (network steering)
-3. Once joined → reads temperature every 30 s, ticks the Zigbee stack
+3. Once joined → reads sensors every 30 s, reports to coordinator
 4. Press Button 1 again → leaves the network
 
 ## Project Structure
@@ -60,9 +98,11 @@ cargo run --release
 ```
 nrf52840-sensor/
 ├── .cargo/config.toml   # Target, runner (probe-rs), DEFMT_LOG level
-├── Cargo.toml            # Dependencies (embassy-nrf 0.3, zigbee-rs crates)
+├── Cargo.toml            # Features (sensor-bme280, sensor-sht31), deps
 ├── build.rs              # Linker script flags (-Tlink.x -Tdefmt.x)
 ├── memory.x              # Memory layout: 1 MB Flash, 256 KB RAM
 └── src/
+    ├── bme280.rs         # Async BME280 I2C driver (feature: sensor-bme280)
+    ├── sht31.rs          # Async SHT31 I2C driver (feature: sensor-sht31)
     └── main.rs           # Async entry point (#[embassy_executor::main])
 ```
