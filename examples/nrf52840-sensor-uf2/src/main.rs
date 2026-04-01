@@ -34,20 +34,12 @@
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
 use embassy_nrf::saadc::{self, ChannelConfig, Saadc, VddInput};
-#[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
 use embassy_nrf::temp::Temp;
-#[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-use embassy_nrf::twim::{self, Twim};
 use embassy_nrf::{self as _, bind_interrupts, gpio, peripherals, radio};
 use embassy_time::{Duration, Instant, Timer};
 
 use defmt::*;
 use {defmt_rtt as _, panic_probe as _};
-
-#[cfg(feature = "sensor-bme280")]
-mod bme280;
-#[cfg(feature = "sensor-sht31")]
-mod sht31;
 
 // Bridge `log` crate → defmt so stack-internal log::info!/debug!/warn!/error! appear in RTT output.
 struct DefmtLogger;
@@ -74,35 +66,18 @@ use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
-use zigbee_zcl::clusters::pressure::PressureCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
 const REPORT_INTERVAL_SECS: u64 = 15;
 const FAST_POLL_MS: u64 = 250; // Fast poll during interview (250ms)
 const SLOW_POLL_SECS: u64 = 10; // Normal poll interval (10s)
 const FAST_POLL_DURATION_SECS: u64 = 120; // Max fast-poll window (safety timeout)
-const EXPECTED_REPORT_CLUSTERS: usize = 4; // PowerConfig + Temp + Pressure + Humidity
+const EXPECTED_REPORT_CLUSTERS: usize = 3; // PowerConfig + Temp + Humidity
 
-#[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-const I2C_SENSOR_ADDR: u8 = {
-    #[cfg(feature = "sensor-bme280")]
-    { 0x76 } // BME280 primary address (0x77 if SDO pulled high)
-    #[cfg(all(feature = "sensor-sht31", not(feature = "sensor-bme280")))]
-    { 0x44 } // SHT31 primary address (0x45 if ADDR pin high)
-};
-
-#[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
 bind_interrupts!(struct Irqs {
     RADIO => radio::InterruptHandler<peripherals::RADIO>;
     TEMP => embassy_nrf::temp::InterruptHandler;
     SAADC => saadc::InterruptHandler;
-});
-
-#[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-bind_interrupts!(struct Irqs {
-    RADIO => radio::InterruptHandler<peripherals::RADIO>;
-    SAADC => saadc::InterruptHandler;
-    TWISPI0 => twim::InterruptHandler<peripherals::TWISPI0>;
 });
 
 /// Disable SoftDevice S140 via SVC call (ProMicro / nice!nano only).
@@ -215,33 +190,8 @@ async fn main(_spawner: Spawner) {
     let mut led = create_led(&mut p);
     let mut button = create_button(&mut p);
 
-    // On-chip temperature sensor (fallback when no external I2C sensor)
-    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
+    // On-chip temperature sensor
     let mut temp_sensor = Temp::new(p.TEMP, Irqs);
-
-    // I2C sensor: async driver, non-blocking (SDA=P0.26, SCL=P0.27)
-    #[cfg(any(feature = "sensor-bme280", feature = "sensor-sht31"))]
-    let mut i2c = {
-        let mut cfg = twim::Config::default();
-        cfg.frequency = twim::Frequency::K400;
-        Twim::new(p.TWISPI0, Irqs, p.P0_26, p.P0_27, cfg)
-    };
-    #[cfg(feature = "sensor-bme280")]
-    let mut bme280_ok = bme280::init(&mut i2c, I2C_SENSOR_ADDR).await;
-    #[cfg(feature = "sensor-bme280")]
-    if bme280_ok {
-        info!("BME280 ready (I2C: P0.26 SDA, P0.27 SCL)");
-    } else {
-        warn!("BME280 not found — check wiring (SDA=P0.26, SCL=P0.27, addr=0x76)");
-    }
-    #[cfg(feature = "sensor-sht31")]
-    let mut sht31_ok = sht31::init(&mut i2c, I2C_SENSOR_ADDR).await;
-    #[cfg(feature = "sensor-sht31")]
-    if sht31_ok {
-        info!("SHT31 ready (I2C: P0.26 SDA, P0.27 SCL)");
-    } else {
-        warn!("SHT31 not found — check wiring (SDA=P0.26, SCL=P0.27, addr=0x44)");
-    }
 
     // SAADC for battery voltage (VDD via internal divider)
     let saadc_config = saadc::Config::default();
@@ -257,25 +207,23 @@ async fn main(_spawner: Spawner) {
 
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
     let mut mac = zigbee_mac::nrf::NrfMac::new(radio);
-    mac.set_tx_power(8); // Max TX power (+8 dBm) for better coordinator reach
+    mac.set_tx_power(8);
 
     info!("Radio ready");
 
     let mut basic_cluster = BasicCluster::new(
         b"Zigbee-RS",
         b"nRF52840-Sensor",
-        b"20260328",
+        b"20260401",
         b"0.1.0",
     );
     basic_cluster.set_power_source(0x03); // Battery
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
-    let mut press_cluster = PressureCluster::new(3000, 11000); // 300.0–1100.0 hPa
     let mut power_cluster = PowerConfigCluster::new();
     power_cluster.set_battery_size(4);     // AAA
     power_cluster.set_battery_quantity(2); // 2× AAA
     power_cluster.set_battery_rated_voltage(15); // 1.5V per cell
-    #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
     let mut hum_tick: u32 = 0;
 
     let mut device = ZigbeeDevice::builder(mac)
@@ -292,7 +240,6 @@ async fn main(_spawner: Spawner) {
             ep.cluster_server(0x0000) // Basic
                 .cluster_server(0x0001) // Power Configuration
                 .cluster_server(0x0402) // Temperature Measurement
-                .cluster_server(0x0403) // Pressure Measurement
                 .cluster_server(0x0405) // Relative Humidity
         })
         .build();
@@ -309,7 +256,6 @@ async fn main(_spawner: Spawner) {
         ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-        ClusterRef { endpoint: 1, cluster: &mut press_cluster },
         ClusterRef { endpoint: 1, cluster: &mut power_cluster },
     ];
     if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
@@ -320,55 +266,15 @@ async fn main(_spawner: Spawner) {
 
     // ── Read sensors once so clusters have real values for ZHA interview ──
     {
-        // BME280: real temperature + humidity + pressure
-        #[cfg(feature = "sensor-bme280")]
-        {
-            if bme280_ok {
-                if let Some(data) = bme280::read(&mut i2c, I2C_SENSOR_ADDR).await {
-                    temp_cluster.set_temperature(data.temperature_centideg);
-                    hum_cluster.set_humidity(data.humidity_centipct);
-                    press_cluster.set_pressure(data.pressure_hpa as i16);
-                    info!(
-                        "Initial: T={}.{:02}°C H={}.{:02}% P={}hPa",
-                        data.temperature_centideg / 100,
-                        (data.temperature_centideg % 100).unsigned_abs(),
-                        data.humidity_centipct / 100,
-                        data.humidity_centipct % 100,
-                        data.pressure_hpa,
-                    );
-                }
-            }
-        }
-        // SHT31: real temperature + humidity (no pressure)
-        #[cfg(feature = "sensor-sht31")]
-        {
-            if sht31_ok {
-                if let Some(data) = sht31::read(&mut i2c, I2C_SENSOR_ADDR).await {
-                    temp_cluster.set_temperature(data.temperature_centideg);
-                    hum_cluster.set_humidity(data.humidity_centipct);
-                    info!(
-                        "Initial: T={}.{:02}°C H={}.{:02}%",
-                        data.temperature_centideg / 100,
-                        (data.temperature_centideg % 100).unsigned_abs(),
-                        data.humidity_centipct / 100,
-                        data.humidity_centipct % 100,
-                    );
-                }
-            }
-        }
-        // No I2C sensor: on-chip temp + fake humidity
-        #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
-        {
-            let raw_temp = temp_sensor.read().await;
-            let temp_hundredths = (raw_temp.to_bits() * 100 / 4) as i16;
-            temp_cluster.set_temperature(temp_hundredths);
-            hum_cluster.set_humidity(5000u16);
-            info!(
-                "Initial: T={}.{:02}°C (on-chip)",
-                temp_hundredths / 100,
-                (temp_hundredths % 100).unsigned_abs(),
-            );
-        }
+        let raw_temp = temp_sensor.read().await;
+        let temp_hundredths = (raw_temp.to_bits() * 100 / 4) as i16;
+        temp_cluster.set_temperature(temp_hundredths);
+        hum_cluster.set_humidity(5000u16);
+        info!(
+            "Initial: T={}.{:02}°C (on-chip)",
+            temp_hundredths / 100,
+            (temp_hundredths % 100).unsigned_abs(),
+        );
 
         // Battery voltage via SAADC (VDD, 12-bit, internal ref 0.6V, gain 1/6 → 3.6V range)
         let mut buf = [0i16; 1];
@@ -463,7 +369,6 @@ async fn main(_spawner: Spawner) {
                             ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut press_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                         ]).await;
                     }
@@ -484,7 +389,6 @@ async fn main(_spawner: Spawner) {
                             ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut press_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                         ];
                         if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
@@ -512,7 +416,6 @@ async fn main(_spawner: Spawner) {
                             ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                            ClusterRef { endpoint: 1, cluster: &mut press_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                         ]).await;
                     }
@@ -529,73 +432,20 @@ async fn main(_spawner: Spawner) {
             if elapsed_s >= REPORT_INTERVAL_SECS {
                 last_report = now2;
 
-                // BME280: real temperature + humidity + pressure (async I2C)
-                #[cfg(feature = "sensor-bme280")]
-                {
-                    if !bme280_ok {
-                        bme280_ok = bme280::init(&mut i2c, I2C_SENSOR_ADDR).await;
-                        if bme280_ok { info!("BME280 recovered"); }
-                    }
-                    if bme280_ok {
-                        if let Some(data) = bme280::read(&mut i2c, I2C_SENSOR_ADDR).await {
-                            temp_cluster.set_temperature(data.temperature_centideg);
-                            hum_cluster.set_humidity(data.humidity_centipct);
-                            press_cluster.set_pressure(data.pressure_hpa as i16);
-                            info!(
-                                "T={}.{:02}°C H={}.{:02}% P={}hPa",
-                                data.temperature_centideg / 100,
-                                (data.temperature_centideg % 100).unsigned_abs(),
-                                data.humidity_centipct / 100,
-                                data.humidity_centipct % 100,
-                                data.pressure_hpa,
-                            );
-                        } else {
-                            warn!("BME280 read failed");
-                        }
-                    }
-                }
-
-                // SHT31: real temperature + humidity (async I2C)
-                #[cfg(feature = "sensor-sht31")]
-                {
-                    if !sht31_ok {
-                        sht31_ok = sht31::init(&mut i2c, I2C_SENSOR_ADDR).await;
-                        if sht31_ok { info!("SHT31 recovered"); }
-                    }
-                    if sht31_ok {
-                        if let Some(data) = sht31::read(&mut i2c, I2C_SENSOR_ADDR).await {
-                            temp_cluster.set_temperature(data.temperature_centideg);
-                            hum_cluster.set_humidity(data.humidity_centipct);
-                            info!(
-                                "T={}.{:02}°C H={}.{:02}%",
-                                data.temperature_centideg / 100,
-                                (data.temperature_centideg % 100).unsigned_abs(),
-                                data.humidity_centipct / 100,
-                                data.humidity_centipct % 100,
-                            );
-                        } else {
-                            warn!("SHT31 read failed");
-                        }
-                    }
-                }
-
-                // No I2C sensor: on-chip temp + fake humidity
-                #[cfg(not(any(feature = "sensor-bme280", feature = "sensor-sht31")))]
-                {
-                    let raw_temp = temp_sensor.read().await;
-                    let temp_hundredths = (raw_temp.to_bits() * 100 / 4) as i16;
-                    hum_tick = hum_tick.wrapping_add(1);
-                    let hum_hundredths = 5000u16 + ((hum_tick % 100) as u16).wrapping_mul(10);
-                    temp_cluster.set_temperature(temp_hundredths);
-                    hum_cluster.set_humidity(hum_hundredths);
-                    info!(
-                        "T={}.{:02}°C H={}.{:02}% (on-chip)",
-                        temp_hundredths / 100,
-                        (temp_hundredths % 100).unsigned_abs(),
-                        hum_hundredths / 100,
-                        hum_hundredths % 100,
-                    );
-                }
+                // On-chip temp + fake humidity
+                let raw_temp = temp_sensor.read().await;
+                let temp_hundredths = (raw_temp.to_bits() * 100 / 4) as i16;
+                hum_tick = hum_tick.wrapping_add(1);
+                let hum_hundredths = 5000u16 + ((hum_tick % 100) as u16).wrapping_mul(10);
+                temp_cluster.set_temperature(temp_hundredths);
+                hum_cluster.set_humidity(hum_hundredths);
+                info!(
+                    "T={}.{:02}°C H={}.{:02}% (on-chip)",
+                    temp_hundredths / 100,
+                    (temp_hundredths % 100).unsigned_abs(),
+                    hum_hundredths / 100,
+                    hum_hundredths % 100,
+                );
 
                 // Battery voltage via SAADC
                 let mut buf = [0i16; 1];
@@ -616,7 +466,6 @@ async fn main(_spawner: Spawner) {
                 ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                ClusterRef { endpoint: 1, cluster: &mut press_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut power_cluster },
             ]).await {
                 if log_event(e, &mut led) {
@@ -657,7 +506,6 @@ async fn main(_spawner: Spawner) {
                     ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
-                    ClusterRef { endpoint: 1, cluster: &mut press_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                 ]).await;
                 // If join succeeded during tick, activate fast-poll for interview

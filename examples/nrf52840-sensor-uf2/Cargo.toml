@@ -10,9 +10,6 @@ board-promicro  = []  # TENSTAR ROBOT ProMicro nRF52840 / nice!nano (SoftDevice 
 board-mdk       = []  # Makerdiary nRF52840 MDK USB Dongle (no SoftDevice)
 board-nrf-dongle = [] # Nordic PCA10059 nRF52840 Dongle (no SoftDevice)
 board-nrf-dk     = [] # Nordic nRF52840 DK (PCA10056) — no bootloader, J-Link debug
-# External I2C sensor (pick one; SDA=P0.26, SCL=P0.27):
-sensor-bme280   = []  # Bosch BME280 temperature + humidity + pressure
-sensor-sht31    = []  # Sensirion SHT31 temperature + humidity
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
