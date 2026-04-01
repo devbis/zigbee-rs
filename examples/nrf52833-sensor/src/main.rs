@@ -44,6 +44,43 @@ bind_interrupts!(struct Irqs {
     SAADC => saadc::InterruptHandler;
 });
 
+/// Power down unused RAM sections to reduce sleep current.
+/// nRF52833 has 128 KB RAM: banks 0–7 (8×8KB, 2 sections each) + bank 8 (64KB, 2×32KB sections).
+fn power_down_unused_ram() {
+    extern "C" {
+        static __sheap: u8;
+    }
+    struct RamBank { start: u32, section_count: u8, section_size: u32 }
+    const BANKS: [RamBank; 9] = [
+        RamBank { start: 0x2000_0000, section_count: 2, section_size: 0x1000 },
+        RamBank { start: 0x2000_2000, section_count: 2, section_size: 0x1000 },
+        RamBank { start: 0x2000_4000, section_count: 2, section_size: 0x1000 },
+        RamBank { start: 0x2000_6000, section_count: 2, section_size: 0x1000 },
+        RamBank { start: 0x2000_8000, section_count: 2, section_size: 0x1000 },
+        RamBank { start: 0x2000_A000, section_count: 2, section_size: 0x1000 },
+        RamBank { start: 0x2000_C000, section_count: 2, section_size: 0x1000 },
+        RamBank { start: 0x2000_E000, section_count: 2, section_size: 0x1000 },
+        RamBank { start: 0x2001_0000, section_count: 2, section_size: 0x8000 },
+    ];
+    let ram_used_end = unsafe { &__sheap as *const u8 as u32 };
+    let stack_bottom: u32 = 0x2002_0000 - 8 * 1024; // 128 KB RAM top
+    let power = 0x4000_0000u32;
+    let mut total_saved: u32 = 0;
+    for (bank_idx, bank) in BANKS.iter().enumerate() {
+        for section in 0..bank.section_count {
+            let section_start = bank.start + (section as u32) * bank.section_size;
+            let section_end = section_start + bank.section_size;
+            if section_start >= ram_used_end && section_end <= stack_bottom {
+                let powerclr = (power + 0x900 + (bank_idx as u32) * 0x10 + 0x08) as *mut u32;
+                let mask = (1u32 << section) | (1u32 << (section + 16));
+                unsafe { core::ptr::write_volatile(powerclr, mask) };
+                total_saved += bank.section_size;
+            }
+        }
+    }
+    info!("RAM power-down: used={} KB, saved={} KB", ram_used_end.wrapping_sub(0x2000_0000) / 1024, total_saved / 1024);
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     // HFCLK from external crystal — REQUIRED for 802.15.4 radio
