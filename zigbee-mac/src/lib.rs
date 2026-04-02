@@ -27,6 +27,7 @@ extern crate alloc;
 
 pub mod pib;
 pub mod primitives;
+pub mod frames;
 
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod esp;
