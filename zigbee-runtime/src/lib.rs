@@ -31,6 +31,7 @@ pub mod builder;
 pub mod event_loop;
 pub mod firmware_writer;
 pub mod nv_storage;
+pub mod log_nv;
 #[cfg(feature = "ota")]
 pub mod ota;
 pub mod power;
