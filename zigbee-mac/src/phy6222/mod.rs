@@ -40,6 +40,9 @@ pub struct Phy6222Mac {
     max_be: u8,
     max_frame_retries: u8,
     promiscuous: bool,
+    /// Buffer for frames received during association (e.g. Transport-Key).
+    /// Returned by the next mlme_poll() call.
+    pending_assoc_frame: Option<([u8; 128], usize)>,
 }
 
 impl Phy6222Mac {
@@ -68,6 +71,7 @@ impl Phy6222Mac {
             max_be: 5,
             max_frame_retries: 3,
             promiscuous: false,
+            pending_assoc_frame: None,
         }
     }
 
@@ -285,28 +289,51 @@ impl MacDriver for Phy6222Mac {
                     let beacon_req = build_beacon_request(seq);
                     let _ = self.driver.transmit(&beacon_req).await;
 
-                    let result = select::select(
-                        self.driver.receive(),
-                        Timer::after(embassy_time::Duration::from_millis(scan_duration_ms)),
-                    )
-                    .await;
+                    // Collect multiple beacons within the scan duration window
+                    let deadline = embassy_time::Instant::now()
+                        + embassy_time::Duration::from_millis(scan_duration_ms);
+                    while !pan_descriptors.is_full() {
+                        let now = embassy_time::Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let remaining = deadline - now;
+                        let result = select::select(
+                            self.driver.receive(),
+                            Timer::after(remaining),
+                        )
+                        .await;
 
-                    if let select::Either::First(Ok(frame)) = result {
-                        if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
-                            let _ = pan_descriptors.push(pd);
+                        if let select::Either::First(Ok(frame)) = result {
+                            if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
+                                let _ = pan_descriptors.push(pd);
+                            }
+                        } else {
+                            break;
                         }
                     }
                 }
                 ScanType::Passive => {
-                    let result = select::select(
-                        self.driver.receive(),
-                        Timer::after(embassy_time::Duration::from_millis(scan_duration_ms)),
-                    )
-                    .await;
+                    let deadline = embassy_time::Instant::now()
+                        + embassy_time::Duration::from_millis(scan_duration_ms);
+                    while !pan_descriptors.is_full() {
+                        let now = embassy_time::Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let remaining = deadline - now;
+                        let result = select::select(
+                            self.driver.receive(),
+                            Timer::after(remaining),
+                        )
+                        .await;
 
-                    if let select::Either::First(Ok(frame)) = result {
-                        if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
-                            let _ = pan_descriptors.push(pd);
+                        if let select::Either::First(Ok(frame)) = result {
+                            if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
+                                let _ = pan_descriptors.push(pd);
+                            }
+                        } else {
+                            break;
                         }
                     }
                 }
@@ -344,36 +371,149 @@ impl MacDriver for Phy6222Mac {
         // Use CSMA-CA for the association request (ACK requested)
         self.csma_ca_transmit(&frame, true).await?;
 
-        Timer::after(embassy_time::Duration::from_millis(500)).await;
+        // Wait for association response — poll coordinator multiple times
+        Timer::after(embassy_time::Duration::from_millis(200)).await;
 
-        let result = select::select(
-            self.driver.receive(),
-            Timer::after(embassy_time::Duration::from_secs(5)),
-        )
-        .await;
+        let mut confirm: Option<MlmeAssociateConfirm> = None;
 
-        match result {
-            select::Either::First(Ok(rx)) => {
-                if let Some((addr, status_byte)) = parse_association_response(&rx.data[..rx.len]) {
-                    let status = match status_byte {
-                        0x00 => AssociationStatus::Success,
-                        0x01 => AssociationStatus::PanAtCapacity,
-                        _ => AssociationStatus::PanAccessDenied,
-                    };
-                    if status_byte == 0 {
-                        self.short_address = addr;
-                        self.driver.update_config(|c| c.short_address = addr.0);
+        // Try up to 5 polls, waiting up to 1.5s each
+        for poll_attempt in 0..5u8 {
+            if poll_attempt > 0 {
+                Timer::after(embassy_time::Duration::from_millis(500)).await;
+            }
+
+            // Send Data Request to poll for association response
+            let data_req = build_data_request_ieee(
+                self.next_dsn(),
+                &req.coord_address,
+                &self.extended_address,
+            );
+            let _ = self.csma_ca_transmit(&data_req, true).await;
+
+            let deadline =
+                embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
+
+            for _ in 0..20u8 {
+                let now = embassy_time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline - now;
+
+                let result =
+                    select::select(self.driver.receive(), Timer::after(remaining)).await;
+
+                match result {
+                    select::Either::Second(_) => break,
+                    select::Either::First(Err(_)) => continue,
+                    select::Either::First(Ok(rx)) => {
+                        let data = &rx.data[..rx.len];
+                        if data.len() < 3 {
+                            continue;
+                        }
+                        let fc = u16::from_le_bytes([data[0], data[1]]);
+                        let frame_type = fc & 0x07;
+
+                        // ACK — skip
+                        if frame_type == 0x02 {
+                            continue;
+                        }
+
+                        // Send ACK if requested
+                        if (fc >> 5) & 1 != 0 {
+                            self.send_ack(data[2]).await;
+                        }
+
+                        // Check for Association Response (MAC command, type 3)
+                        if frame_type == 0x03 {
+                            if let Some((addr, status_byte)) =
+                                parse_association_response(data)
+                            {
+                                let status = match status_byte {
+                                    0x00 => AssociationStatus::Success,
+                                    0x01 => AssociationStatus::PanAtCapacity,
+                                    _ => AssociationStatus::PanAccessDenied,
+                                };
+                                if status_byte == 0 {
+                                    self.short_address = addr;
+                                    self.driver.update_config(|c| c.short_address = addr.0);
+                                }
+                                confirm = Some(MlmeAssociateConfirm {
+                                    short_address: addr,
+                                    status,
+                                });
+                                break;
+                            }
+                        }
+
+                        // Data frame received during association — save it
+                        // (likely Transport-Key from coordinator)
+                        if frame_type == 0x01 && self.pending_assoc_frame.is_none() {
+                            let (_, _, payload_offset, _) = parse_mac_addresses(data);
+                            if data.len() > payload_offset {
+                                let payload = &data[payload_offset..];
+                                let mut buf = [0u8; 128];
+                                let copy_len = payload.len().min(128);
+                                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                                self.pending_assoc_frame = Some((buf, copy_len));
+                                log::info!(
+                                    "phy6222: saved post-assoc frame ({} bytes)",
+                                    copy_len
+                                );
+                            }
+                        }
                     }
-                    Ok(MlmeAssociateConfirm {
-                        short_address: addr,
-                        status,
-                    })
-                } else {
-                    Err(MacError::NoBeacon)
                 }
             }
-            _ => Err(MacError::NoBeacon),
+
+            if confirm.is_some() {
+                break;
+            }
         }
+
+        // After getting assoc response, listen briefly for more frames (Transport-Key)
+        if confirm.is_some() && self.pending_assoc_frame.is_none() {
+            let deadline =
+                embassy_time::Instant::now() + embassy_time::Duration::from_millis(2000);
+            for _ in 0..20u8 {
+                let now = embassy_time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline - now;
+                let result =
+                    select::select(self.driver.receive(), Timer::after(remaining)).await;
+                if let select::Either::First(Ok(rx)) = result {
+                    let data = &rx.data[..rx.len];
+                    if data.len() >= 3 {
+                        let fc = u16::from_le_bytes([data[0], data[1]]);
+                        if (fc >> 5) & 1 != 0 {
+                            self.send_ack(data[2]).await;
+                        }
+                        let frame_type = fc & 0x07;
+                        if frame_type == 0x01 {
+                            let (_, _, payload_offset, _) = parse_mac_addresses(data);
+                            if data.len() > payload_offset {
+                                let payload = &data[payload_offset..];
+                                let mut buf = [0u8; 128];
+                                let copy_len = payload.len().min(128);
+                                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                                self.pending_assoc_frame = Some((buf, copy_len));
+                                log::info!(
+                                    "phy6222: saved post-assoc frame ({} bytes)",
+                                    copy_len
+                                );
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        confirm.ok_or(MacError::NoBeacon)
     }
 
     async fn mlme_associate_response(
@@ -511,32 +651,124 @@ impl MacDriver for Phy6222Mac {
     }
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
-        let seq = self.next_dsn();
-        let frame = build_data_request(seq, self.pan_id, self.coord_short_address);
+        // Return any frame saved during association first (e.g. Transport-Key)
+        if let Some((buf, len)) = self.pending_assoc_frame.take() {
+            log::info!(
+                "[MAC:Poll] Returning saved association frame ({} bytes)",
+                len
+            );
+            return Ok(MacFrame::from_slice(&buf[..len]));
+        }
 
-        // Use CSMA-CA for the data request (ACK requested)
-        self.csma_ca_transmit(&frame, true).await?;
+        let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
+        let has_short = self.short_address.0 != 0xFFFF && self.short_address.0 != 0xFFFE;
 
-        let result = select::select(
-            self.driver.receive(),
-            Timer::after(embassy_time::Duration::from_millis(100)),
-        )
-        .await;
+        // 2 passes: SHORT address first (most indirect frames), then IEEE (Transport-Key)
+        let passes: u8 = if has_short { 2 } else { 1 };
 
-        match result {
-            select::Either::First(Ok(rx)) => {
-                let data = &rx.data[..rx.len];
-                if data.len() >= 3 {
-                    let fc = u16::from_le_bytes([data[0], data[1]]);
-                    // Send ACK if requested
-                    if (fc >> 5) & 1 != 0 {
-                        self.send_ack(data[2]).await;
+        for pass in 0..passes {
+            let data_req = if pass == 0 && has_short {
+                build_data_request(self.next_dsn(), self.pan_id, self.coord_short_address)
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .collect::<heapless::Vec<u8, 24>>()
+            } else {
+                build_data_request_ieee(
+                    self.next_dsn(),
+                    &parent,
+                    &self.extended_address,
+                )
+            };
+
+            if self.csma_ca_transmit(&data_req, true).await.is_err() {
+                continue;
+            }
+
+            // Wait up to 1500ms with up to 40 RX attempts per pass
+            let deadline =
+                embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
+
+            let mut got_none = false;
+            for _rx_attempt in 0..40u8 {
+                let now = embassy_time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline - now;
+
+                let rx_result =
+                    select::select(self.driver.receive(), Timer::after(remaining)).await;
+
+                match rx_result {
+                    select::Either::Second(_) => break, // timeout
+                    select::Either::First(Err(_)) => continue,
+                    select::Either::First(Ok(rx)) => {
+                        let data = &rx.data[..rx.len];
+                        if data.len() < 3 {
+                            continue;
+                        }
+                        let fc = u16::from_le_bytes([data[0], data[1]]);
+                        let frame_type = fc & 0x07;
+
+                        // ACK frame — check frame_pending bit
+                        if frame_type == 0x02 {
+                            let frame_pending = (data[0] >> 4) & 1 != 0;
+                            if !frame_pending {
+                                got_none = true;
+                                break;
+                            }
+                            continue; // ACK with pending=1, keep waiting for data
+                        }
+
+                        // Only accept data frames (type 1)
+                        if frame_type != 0x01 {
+                            continue;
+                        }
+
+                        // Verify MAC destination matches us or broadcast
+                        let (_src, dst, payload_offset, _security_use) =
+                            parse_mac_addresses(data);
+                        match &dst {
+                            MacAddress::Short(_, d) => {
+                                let for_us = d.0 == self.short_address.0
+                                    || d.0 == 0xFFFF
+                                    || d.0 == 0xFFFD
+                                    || d.0 == 0xFFFC;
+                                if !for_us {
+                                    continue;
+                                }
+                            }
+                            MacAddress::Extended(_, e) => {
+                                if *e != self.extended_address {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Send ACK if requested
+                        if (fc >> 5) & 1 != 0 {
+                            self.send_ack(data[2]).await;
+                        }
+
+                        if data.len() <= payload_offset {
+                            continue;
+                        }
+
+                        let mac_frame = MacFrame::from_slice(&data[payload_offset..])
+                            .unwrap_or_else(MacFrame::new);
+
+                        return Ok(Some(mac_frame));
                     }
                 }
-                Ok(MacFrame::from_slice(&rx.data[..rx.len]))
             }
-            _ => Ok(None),
+
+            if got_none {
+                return Ok(None);
+            }
         }
+
+        Ok(None)
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
@@ -616,7 +848,10 @@ impl MacDriver for Phy6222Mac {
                         match &dst_address {
                             MacAddress::Short(pan, addr) => {
                                 let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
-                                let addr_ok = addr.0 == self.short_address.0 || addr.0 == 0xFFFF;
+                                let addr_ok = addr.0 == self.short_address.0
+                                    || addr.0 == 0xFFFF
+                                    || addr.0 == 0xFFFD
+                                    || addr.0 == 0xFFFC;
                                 if !pan_ok || !addr_ok {
                                     log::trace!(
                                         "phy6222: filtered short dst pan=0x{:04X} addr=0x{:04X}",
@@ -730,6 +965,44 @@ fn build_data_request(seq: u8, pan_id: PanId, coord: ShortAddress) -> [u8; 10] {
         0xFF,
         0x04,
     ]
+}
+
+/// Build a Data Request MAC command with IEEE (extended) source address.
+/// Used for poll pass 2 to catch Transport-Key queued by coordinator for our IEEE.
+fn build_data_request_ieee(
+    seq: u8,
+    coord: &MacAddress,
+    own_ieee: &IeeeAddress,
+) -> heapless::Vec<u8, 24> {
+    let mut frame: heapless::Vec<u8, 24> = heapless::Vec::new();
+    // FC: command(0x03), dst=short(0x08), src=extended(0xC0), AR(0x20), PAN compress(0x40)
+    let fc: u16 = 0xCC63;
+    let _ = frame.push(fc as u8);
+    let _ = frame.push((fc >> 8) as u8);
+    let _ = frame.push(seq);
+    // Dst PAN + addr
+    match coord {
+        MacAddress::Short(pan, addr) => {
+            let _ = frame.push(pan.0 as u8);
+            let _ = frame.push((pan.0 >> 8) as u8);
+            let _ = frame.push(addr.0 as u8);
+            let _ = frame.push((addr.0 >> 8) as u8);
+        }
+        MacAddress::Extended(pan, ext) => {
+            let _ = frame.push(pan.0 as u8);
+            let _ = frame.push((pan.0 >> 8) as u8);
+            for b in ext {
+                let _ = frame.push(*b);
+            }
+        }
+    }
+    // Src IEEE (no src PAN — PAN compress)
+    for b in own_ieee {
+        let _ = frame.push(*b);
+    }
+    // Command: Data Request (0x04)
+    let _ = frame.push(0x04);
+    frame
 }
 
 fn build_data_frame(
