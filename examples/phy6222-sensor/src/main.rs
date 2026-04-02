@@ -30,6 +30,9 @@ mod stubs;
 mod time_driver;
 mod vectors;
 mod flash_nv;
+#[allow(dead_code)]
+mod i2c;
+mod adc;
 
 use cortex_m as _;
 use panic_halt as _;
@@ -199,9 +202,13 @@ async fn main(_spawner: Spawner) {
         let temp: i16 = 2250;
         temp_cluster.set_temperature(temp);
         hum_cluster.set_humidity(5000u16);
-        power_cluster.set_battery_voltage(30); // 3.0V
-        power_cluster.set_battery_percentage(200); // 100% (ZCL 0.5% units)
-        log::info!("[PHY6222] Initial: T=22.50°C H=50.00% Batt=100%");
+
+        // Real battery voltage via ADC
+        let batt_mv = adc::read_battery_mv(adc::AdcChannel::P11);
+        let batt_pct = adc::mv_to_percent(batt_mv);
+        power_cluster.set_battery_voltage((batt_mv / 100) as u8);
+        power_cluster.set_battery_percentage(batt_pct * 2); // ZCL 0.5% units
+        log::info!("[PHY6222] Initial: T=22.50°C H=50.00% Batt={}mV ({}%)", batt_mv, batt_pct);
     }
 
     // ── Main loop state ──
@@ -347,7 +354,7 @@ async fn main(_spawner: Spawner) {
             if elapsed_s >= REPORT_INTERVAL_SECS {
                 last_report = now2;
 
-                // Simulated sensors (replace with I2C/ADC when drivers are ready)
+                // Simulated temp/humidity (replace with I2C sensor when available)
                 let temp_hundredths: i16 = 2250 + ((hum_tick % 50) as i16 - 25);
                 hum_tick = hum_tick.wrapping_add(1);
                 let hum_hundredths: u16 = 5000 + ((hum_tick % 100) as u16) * 10;
@@ -361,9 +368,12 @@ async fn main(_spawner: Spawner) {
                     hum_hundredths % 100,
                 );
 
-                // Simulated battery (3.0V, 100%)
-                power_cluster.set_battery_voltage(30);
-                power_cluster.set_battery_percentage(200);
+                // Real battery voltage via ADC
+                let batt_mv = adc::read_battery_mv(adc::AdcChannel::P11);
+                let batt_pct = adc::mv_to_percent(batt_mv);
+                power_cluster.set_battery_voltage((batt_mv / 100) as u8);
+                power_cluster.set_battery_percentage(batt_pct * 2);
+                log::info!("[PHY6222] Battery: {}mV ({}%)", batt_mv, batt_pct);
             }
 
             // Tick the runtime
