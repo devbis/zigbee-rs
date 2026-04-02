@@ -297,16 +297,74 @@ impl MacDriver for EspMac<'_> {
         );
         self.transmit_frame(&frame).await?;
 
-        // Per IEEE 802.15.4 §5.3.2.1: wait, then poll with Data Request
-        Timer::after_millis(100).await;
+        // Poll for Association Response with retries
+        Timer::after_millis(200).await;
 
-        // Send Data Request to poll for indirect Association Response
-        let data_req =
-            build_data_request(self.next_dsn(), &req.coord_address, &self.extended_address);
-        self.transmit_frame(&data_req).await?;
+        let mut confirm: Option<MlmeAssociateConfirm> = None;
 
-        // Wait for Association Response with generous timeout (3 seconds)
-        self.wait_assoc_response(3000).await
+        for poll_attempt in 0..5u8 {
+            if poll_attempt > 0 {
+                Timer::after_millis(500).await;
+            }
+
+            // Send Data Request to poll for indirect response
+            let data_req = build_data_request(
+                self.next_dsn(),
+                &req.coord_address,
+                &self.extended_address,
+            );
+            let _ = self.transmit_frame(&data_req).await;
+
+            // Wait for response
+            match self.wait_assoc_response(1500).await {
+                Ok(c) => {
+                    confirm = Some(c);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        // After getting assoc response, listen for post-assoc frames (Transport-Key)
+        if confirm.is_some() && self.pending_assoc_frame.is_none() {
+            let deadline = Instant::now() + Duration::from_millis(2000);
+            self.driver.start_receive();
+
+            while Instant::now() < deadline {
+                if let Some(Ok(rx)) = self.driver.poll_receive() {
+                    let data = &rx.data[..rx.len];
+                    if data.len() >= 3 {
+                        let fc = u16::from_le_bytes([data[0], data[1]]);
+                        let frame_type = fc & 0x07;
+
+                        // Send ACK if requested
+                        if (fc >> 5) & 1 != 0 {
+                            let ack = [0x02u8, 0x00, data[2]];
+                            let _ = self.driver.transmit(&ack);
+                        }
+
+                        // Save data frames (likely Transport-Key)
+                        if frame_type == 0x01 {
+                            let header_len = 3 + addressing_size(fc);
+                            if data.len() > header_len {
+                                let payload = &data[header_len..];
+                                let mut buf = [0u8; 128];
+                                let copy_len = payload.len().min(128);
+                                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                                self.pending_assoc_frame = Some((buf, copy_len));
+                                log::info!("[ESP] Saved post-assoc frame ({} bytes)", copy_len);
+                                break;
+                            }
+                        }
+                    }
+                    self.driver.start_receive();
+                } else {
+                    Timer::after_micros(200).await;
+                }
+            }
+        }
+
+        confirm.ok_or(MacError::NoBeacon)
     }
 
     async fn mlme_associate_response(
@@ -417,7 +475,11 @@ impl MacDriver for EspMac<'_> {
             (PibAttribute::MacMaxBe, PibValue::U8(v)) => self.max_be = *v,
             (PibAttribute::MacMaxFrameRetries, PibValue::U8(v)) => self.max_frame_retries = *v,
             (PibAttribute::MacPromiscuousMode, PibValue::Bool(v)) => self.promiscuous = *v,
-            (PibAttribute::PhyTransmitPower, PibValue::I8(v)) => self.tx_power = *v,
+            (PibAttribute::PhyTransmitPower, PibValue::I8(v)) => {
+                self.tx_power = *v;
+                // TX power is applied through driver config if the radio supports it
+                log::debug!("[ESP] TX power set to {} dBm", *v);
+            }
             (PibAttribute::MacCoordShortAddress, PibValue::ShortAddress(v)) => {
                 self.coord_short_address = *v;
             }
@@ -530,60 +592,95 @@ impl MacDriver for EspMac<'_> {
         let msdu_handle = req.msdu_handle;
         let ack_requested = req.tx_options.ack_tx;
         let mut frame_buf = [0u8; 127];
+        let seq = self.next_dsn();
         let len = build_data_frame(
             &mut frame_buf,
-            self.next_dsn(),
+            seq,
             self.short_address,
             self.pan_id,
             &self.extended_address,
             &req,
         )?;
 
-        // Unslotted CSMA-CA (IEEE 802.15.4-2011 §5.1.1.4)
-        let mut be = self.min_be;
-        let mut nb: u8 = 0;
-        let symbol_period_us: u64 = 16; // 2.4 GHz = 62.5 ksym/s
-        let unit_backoff_symbols: u64 = 20; // aUnitBackoffPeriod
+        let max_retries = if ack_requested { self.max_frame_retries } else { 0 };
 
-        loop {
-            let max_val = (1u32 << be) - 1;
-            let random = (self.dsn as u32)
-                .wrapping_mul(1103515245)
-                .wrapping_add(12345);
-            let backoff = (random % (max_val + 1)) as u64;
-            let delay_us = backoff * unit_backoff_symbols * symbol_period_us;
-            if delay_us > 0 {
-                Timer::after_micros(delay_us).await;
-            }
+        for attempt in 0..=max_retries {
+            // Unslotted CSMA-CA
+            let mut be = self.min_be;
+            let mut nb: u8 = 0;
+            let symbol_period_us: u64 = 16;
+            let unit_backoff_symbols: u64 = 20;
 
-            match self.driver.transmit(&frame_buf[..len]) {
-                Ok(()) => {
-                    Timer::after_micros(200).await;
-                    break;
+            let channel_clear = loop {
+                let max_val = (1u32 << be) - 1;
+                let random = (seq as u32)
+                    .wrapping_add(nb as u32)
+                    .wrapping_add(attempt as u32)
+                    .wrapping_mul(1103515245)
+                    .wrapping_add(12345);
+                let backoff = (random % (max_val + 1)) as u64;
+                let delay_us = backoff * unit_backoff_symbols * symbol_period_us;
+                if delay_us > 0 {
+                    Timer::after_micros(delay_us).await;
                 }
-                Err(_) => {
-                    nb += 1;
-                    be = core::cmp::min(be + 1, self.max_be);
-                    if nb > self.max_csma_backoffs {
-                        return Err(MacError::ChannelAccessFailure);
+
+                // Try transmit (CCA implicit)
+                match self.driver.transmit(&frame_buf[..len]) {
+                    Ok(()) => break true,
+                    Err(_) => {
+                        nb += 1;
+                        be = core::cmp::min(be + 1, self.max_be);
+                        if nb > self.max_csma_backoffs {
+                            break false;
+                        }
                     }
                 }
+            };
+
+            if !channel_clear {
+                if attempt == max_retries {
+                    return Err(MacError::ChannelAccessFailure);
+                }
+                continue;
+            }
+
+            if !ack_requested {
+                return Ok(McpsDataConfirm { msdu_handle, timestamp: None });
+            }
+
+            // Wait for ACK (turnaround + ACK duration ≈ 1.5ms)
+            self.driver.start_receive();
+            let ack_deadline = Instant::now() + Duration::from_millis(2);
+            let mut got_ack = false;
+
+            while Instant::now() < ack_deadline {
+                if let Some(Ok(rx)) = self.driver.poll_receive() {
+                    let data = &rx.data[..rx.len];
+                    if data.len() >= 3 {
+                        let fc = u16::from_le_bytes([data[0], data[1]]);
+                        let frame_type = fc & 0x07;
+                        if frame_type == 0x02 && data[2] == seq {
+                            got_ack = true;
+                            break;
+                        }
+                    }
+                    self.driver.start_receive();
+                } else {
+                    Timer::after_micros(100).await;
+                }
+            }
+
+            if got_ack {
+                return Ok(McpsDataConfirm { msdu_handle, timestamp: None });
+            }
+
+            // No ACK — retry if attempts remain
+            if attempt < max_retries {
+                log::debug!("[ESP] No ACK seq={}, retry {}/{}", seq, attempt + 1, max_retries);
             }
         }
 
-        // Best-effort retransmit for ACK-requested frames
-        if ack_requested {
-            for retransmit in 0..4u8 {
-                Timer::after_millis(3 + retransmit as u64 * 2).await;
-                let _ = self.driver.transmit(&frame_buf[..len]);
-                Timer::after_micros(200).await;
-            }
-        }
-
-        Ok(McpsDataConfirm {
-            msdu_handle,
-            timestamp: None,
-        })
+        Err(MacError::NoAck)
     }
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
@@ -652,6 +749,12 @@ impl MacDriver for EspMac<'_> {
                     received.lqi
                 );
 
+                // Send software ACK if requested (FC bit 5)
+                if (fc >> 5) & 1 != 0 {
+                    let ack_frame = [0x02u8, 0x00, data[2]]; // ACK type, seq
+                    let _ = self.driver.transmit(&ack_frame);
+                }
+
                 let payload_data = &data[header_len..];
                 if let Some(mac_frame) = MacFrame::from_slice(payload_data) {
                     return Ok(McpsDataIndication {
@@ -671,7 +774,7 @@ impl MacDriver for EspMac<'_> {
 
     fn capabilities(&self) -> MacCapabilities {
         MacCapabilities {
-            coordinator: true,
+            coordinator: false,
             router: true,
             hardware_security: false,
             max_payload: 102,
