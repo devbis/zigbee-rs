@@ -5,7 +5,7 @@ A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
 Embassy and other embedded async runtimes.
 
 ```text
-42,700+ lines of Rust · 131 source files · 9 crates · 45 ZCL clusters · 10 hardware platforms
+51,500+ lines of Rust · 166 source files · 9 crates · 45 ZCL clusters · 10 hardware platforms · 270 tests
 ```
 
 ## Architecture
@@ -84,6 +84,9 @@ cargo build --release --features sensor-bme280
 cargo build --release --features sensor-sht31
 probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-sensor
 ```
+
+> **Flash NV storage** — network state is saved to internal flash (last 8 KB) and automatically
+> restored on power-up. No re-pairing after power cycles!
 
 ### nRF52840 firmware (nice!nano / ProMicro — UF2 drag-and-drop)
 
@@ -279,7 +282,7 @@ zigbee-rs/
 │   ├── mock-sleepy-sensor/    # Host: SED demo
 │   ├── esp32c6-sensor/        # ESP32-C6 firmware
 │   ├── esp32h2-sensor/        # ESP32-H2 firmware
-│   ├── nrf52840-sensor/       # nRF52840-DK (probe-rs) + BME280/SHT31 I2C sensors
+│   ├── nrf52840-sensor/       # nRF52840-DK (probe-rs) + BME280/SHT31 + flash NV
 │   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop, simple demo)
 │   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs)
 │   ├── nrf52840-bridge/       # nRF52840 coordinator bridge
