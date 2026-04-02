@@ -46,6 +46,8 @@ pub struct EspMac<'a> {
     max_frame_retries: u8,
     promiscuous: bool,
     tx_power: i8,
+    /// Buffer for frames received during association (e.g. Transport-Key).
+    pending_assoc_frame: Option<([u8; 128], usize)>,
 }
 
 impl<'a> EspMac<'a> {
@@ -71,6 +73,7 @@ impl<'a> EspMac<'a> {
             max_frame_retries: 3,
             promiscuous: false,
             tx_power: 0,
+            pending_assoc_frame: None,
         }
     }
 
@@ -424,46 +427,103 @@ impl MacDriver for EspMac<'_> {
     }
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
-        // Build and send MAC Data Request to parent (coordinator)
+        // Return any frame saved during association first (e.g. Transport-Key)
+        if let Some((buf, len)) = self.pending_assoc_frame.take() {
+            log::info!("[ESP:Poll] Returning saved assoc frame ({} bytes)", len);
+            return Ok(MacFrame::from_slice(&buf[..len]));
+        }
+
         let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
-        let data_req = build_data_request(self.next_dsn(), &parent, &self.extended_address);
-        self.transmit_frame(&data_req).await?;
+        let has_short = self.short_address.0 != 0xFFFF && self.short_address.0 != 0xFFFE;
 
-        // Wait for response with polling
-        self.driver.start_receive();
-        let deadline = Instant::now() + Duration::from_millis(500);
+        // 2 passes: SHORT address first, then IEEE address
+        let passes: u8 = if has_short { 2 } else { 1 };
 
-        loop {
-            if Instant::now() >= deadline {
+        for pass in 0..passes {
+            let data_req = if pass == 0 && has_short {
+                build_data_request_short(self.next_dsn(), &parent, self.short_address)
+            } else {
+                build_data_request(self.next_dsn(), &parent, &self.extended_address)
+            };
+
+            if self.transmit_frame(&data_req).is_err() {
+                continue;
+            }
+
+            self.driver.start_receive();
+            let deadline = Instant::now() + Duration::from_millis(1500);
+
+            let mut got_none = false;
+            for _rx_attempt in 0..40u8 {
+                if Instant::now() >= deadline {
+                    break;
+                }
+
+                if let Some(result) = self.driver.poll_receive() {
+                    let received = match result {
+                        Ok(r) => r,
+                        Err(_) => { self.driver.start_receive(); continue; }
+                    };
+                    if received.len < 3 {
+                        self.driver.start_receive();
+                        continue;
+                    }
+                    let data = &received.data[..received.len];
+                    let fc = u16::from_le_bytes([data[0], data[1]]);
+                    let frame_type = fc & 0x07;
+
+                    // ACK — check frame_pending bit
+                    if frame_type == 0x02 {
+                        let frame_pending = (data[0] >> 4) & 1 != 0;
+                        if !frame_pending {
+                            got_none = true;
+                            break;
+                        }
+                        self.driver.start_receive();
+                        continue;
+                    }
+
+                    // Only accept data frames
+                    if frame_type != 0x01 {
+                        self.driver.start_receive();
+                        continue;
+                    }
+
+                    // Verify destination matches us or broadcast
+                    if let Some(dst) = parse_dest_address(data, fc) {
+                        let for_us = match &dst {
+                            MacAddress::Short(_, d) => {
+                                d.0 == self.short_address.0
+                                    || d.0 == 0xFFFF
+                                    || d.0 == 0xFFFD
+                                    || d.0 == 0xFFFC
+                            }
+                            MacAddress::Extended(_, e) => *e == self.extended_address,
+                        };
+                        if !for_us {
+                            self.driver.start_receive();
+                            continue;
+                        }
+                    }
+
+                    let header_len = 3 + addressing_size(fc);
+                    if data.len() <= header_len {
+                        self.driver.start_receive();
+                        continue;
+                    }
+
+                    return Ok(MacFrame::from_slice(&data[header_len..]));
+                } else {
+                    Timer::after_micros(200).await;
+                }
+            }
+
+            if got_none {
                 return Ok(None);
             }
-            if let Some(result) = self.driver.poll_receive() {
-                let received = result.map_err(|_| MacError::RadioError)?;
-                if received.len < 5 {
-                    self.driver.start_receive();
-                    continue;
-                }
-                let data = &received.data[..received.len];
-                let fc = u16::from_le_bytes([data[0], data[1]]);
-                let frame_type = fc & 0x07;
-
-                // Only deliver data frames (type 1)
-                if frame_type != 1 {
-                    self.driver.start_receive();
-                    continue;
-                }
-
-                let header_len = 3 + addressing_size(fc);
-                if data.len() <= header_len {
-                    return Ok(None);
-                }
-
-                let payload_data = &data[header_len..];
-                return Ok(MacFrame::from_slice(payload_data));
-            } else {
-                Timer::after_micros(200).await;
-            }
         }
+
+        Ok(None)
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
@@ -570,7 +630,10 @@ impl MacDriver for EspMac<'_> {
                     let accepted = match &dst {
                         MacAddress::Short(pan, addr) => {
                             (pan.0 == self.pan_id.0 || pan.0 == 0xFFFF)
-                                && (addr.0 == self.short_address.0 || addr.0 == 0xFFFF)
+                                && (addr.0 == self.short_address.0
+                                    || addr.0 == 0xFFFF
+                                    || addr.0 == 0xFFFD
+                                    || addr.0 == 0xFFFC)
                         }
                         MacAddress::Extended(pan, addr) => {
                             (pan.0 == self.pan_id.0 || pan.0 == 0xFFFF)
@@ -831,6 +894,30 @@ fn build_data_request(
     }
     let _ = frame.extend_from_slice(own_extended);
     let _ = frame.push(0x04); // Data Request command ID
+    frame
+}
+
+/// Build a Data Request with SHORT source address (for poll pass 1).
+fn build_data_request_short(
+    seq: u8,
+    coord: &MacAddress,
+    own_short: ShortAddress,
+) -> heapless::Vec<u8, 24> {
+    let mut frame = heapless::Vec::new();
+    // FC: command, ACK, PAN compress, dst=short, src=short
+    let _ = frame.extend_from_slice(&[0x63, 0x88, seq]);
+    let dst_pan = coord.pan_id();
+    let _ = frame.extend_from_slice(&dst_pan.0.to_le_bytes());
+    match coord {
+        MacAddress::Short(_, addr) => {
+            let _ = frame.extend_from_slice(&addr.0.to_le_bytes());
+        }
+        MacAddress::Extended(_, addr) => {
+            let _ = frame.extend_from_slice(addr);
+        }
+    }
+    let _ = frame.extend_from_slice(&own_short.0.to_le_bytes());
+    let _ = frame.push(0x04);
     frame
 }
 
