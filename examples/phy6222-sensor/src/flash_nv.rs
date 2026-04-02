@@ -1,0 +1,449 @@
+//! Flash-backed NV storage for PHY6222/6252 — pure Rust, no vendor SDK.
+//!
+//! Uses the last 2 flash sectors (8 KB) for persistent Zigbee state.
+//! Log-structured: items are appended sequentially, latest wins.
+//! When the active page fills, compact to the scratch page and swap.
+//!
+//! # Flash layout (PHY6222: 512 KB, sector = 4 KB)
+//! ```text
+//! Sector at 0x7E000: Active NV page (flash addr 0x1107E000)
+//! Sector at 0x7F000: Scratch page   (flash addr 0x1107F000)
+//! ```
+//!
+//! # PHY6222 Flash Hardware
+//! - Memory-mapped XIP at 0x11000000
+//! - SPIF controller at 0x4000C800
+//! - 4 KB sectors, erase = 0x20 command
+//! - Page program = 0x02 command (up to 256 bytes)
+//! - Must bypass cache for writes/erases
+//!
+//! # Item format (4-byte aligned)
+//! ```text
+//! [magic:2][id:2][len:2][pad:2][data:len][pad to 4B]
+//! ```
+
+use zigbee_runtime::nv_storage::{NvError, NvItemId, NvStorage};
+
+/// Flash base for XIP (memory-mapped reads).
+const FLASH_BASE: u32 = 0x1100_0000;
+
+/// NV page A: second-to-last 4 KB sector of 512 KB flash.
+const NV_PAGE_A: u32 = 0x0007_E000;
+/// NV page B: last 4 KB sector.
+const NV_PAGE_B: u32 = 0x0007_F000;
+
+/// Page size (4 KB sector).
+const PAGE_SIZE: usize = 4096;
+
+/// Magic bytes indicating a valid item header.
+const ITEM_MAGIC: u16 = 0xA55A;
+
+/// Header size: magic(2) + id(2) + len(2) + pad(2) = 8 bytes.
+const HEADER_SIZE: usize = 8;
+
+// ── SPIF register addresses ────────────────────────────────────
+
+const AP_SPIF_BASE: u32 = 0x4000_C800;
+const SPIF_CONFIG: u32 = AP_SPIF_BASE + 0x00;
+const SPIF_FCMD: u32 = AP_SPIF_BASE + 0x90;
+const SPIF_FCMD_ADDR: u32 = AP_SPIF_BASE + 0x94;
+const SPIF_FCMD_WRDATA: u32 = AP_SPIF_BASE + 0xA8;
+
+// Cache control
+const AP_CACHE_BASE: u32 = 0x4000_C000;
+const CACHE_CTRL0: u32 = AP_CACHE_BASE + 0x00;
+/// Cache bypass register (from PHY6222 SDK AP_PCR->CACHE_BYPASS).
+const CACHE_BYPASS_REG: u32 = 0x4000_0044;
+
+/// Flash-backed NV storage for PHY6222.
+pub struct FlashNvStorage {
+    /// Which page is currently active (A or B).
+    active_page: u32,
+    /// Current write offset within the active page.
+    write_offset: usize,
+}
+
+impl FlashNvStorage {
+    pub fn new() -> Self {
+        let mut s = Self {
+            active_page: NV_PAGE_A,
+            write_offset: 0,
+        };
+        s.init();
+        s
+    }
+
+    fn init(&mut self) {
+        let a_valid = self.page_has_data(NV_PAGE_A);
+        let b_valid = self.page_has_data(NV_PAGE_B);
+
+        match (a_valid, b_valid) {
+            (true, false) => self.active_page = NV_PAGE_A,
+            (false, true) => self.active_page = NV_PAGE_B,
+            (true, true) => {
+                self.active_page = NV_PAGE_A;
+                let _ = self.erase_sector(NV_PAGE_B);
+            }
+            (false, false) => self.active_page = NV_PAGE_A,
+        }
+
+        self.write_offset = self.find_write_offset(self.active_page);
+
+        log::debug!(
+            "[FlashNV] Active page=0x{:05X}, offset={}",
+            self.active_page,
+            self.write_offset
+        );
+    }
+
+    /// Check if a page has any valid NV data (read via XIP).
+    fn page_has_data(&self, page: u32) -> bool {
+        let hdr = self.flash_read_bytes(page, HEADER_SIZE);
+        let magic = u16::from_le_bytes([hdr[0], hdr[1]]);
+        magic == ITEM_MAGIC
+    }
+
+    /// Scan a page to find where the next write should go.
+    fn find_write_offset(&self, page: u32) -> usize {
+        let mut offset = 0;
+
+        while offset + HEADER_SIZE <= PAGE_SIZE {
+            let hdr = self.flash_read_bytes(page + offset as u32, HEADER_SIZE);
+            let magic = u16::from_le_bytes([hdr[0], hdr[1]]);
+            if magic != ITEM_MAGIC {
+                return offset;
+            }
+            let len = u16::from_le_bytes([hdr[4], hdr[5]]) as usize;
+            offset += HEADER_SIZE + align4(len);
+        }
+        offset
+    }
+
+    /// Read the latest value of an item by scanning the entire active page.
+    fn find_latest(&self, id: NvItemId, buf: &mut [u8]) -> Option<usize> {
+        let mut offset = 0;
+        let mut found_len = None;
+
+        while offset + HEADER_SIZE <= PAGE_SIZE {
+            let hdr = self.flash_read_bytes(self.active_page + offset as u32, HEADER_SIZE);
+            let magic = u16::from_le_bytes([hdr[0], hdr[1]]);
+            if magic != ITEM_MAGIC {
+                break;
+            }
+            let item_id = u16::from_le_bytes([hdr[2], hdr[3]]);
+            let len = u16::from_le_bytes([hdr[4], hdr[5]]) as usize;
+
+            if item_id == id as u16 {
+                if len == 0 {
+                    found_len = None; // deletion marker
+                } else if len <= buf.len() {
+                    let data = self.flash_read_bytes(
+                        self.active_page + (offset + HEADER_SIZE) as u32,
+                        len,
+                    );
+                    buf[..len].copy_from_slice(&data[..len]);
+                    found_len = Some(len);
+                }
+            }
+
+            offset += HEADER_SIZE + align4(len);
+        }
+
+        found_len
+    }
+
+    /// Append an item to the active page.
+    fn append_item(&mut self, id: NvItemId, data: &[u8]) -> Result<(), NvError> {
+        let aligned_len = align4(data.len());
+        let total = HEADER_SIZE + aligned_len;
+
+        if self.write_offset + total > PAGE_SIZE {
+            self.compact()?;
+            if self.write_offset + total > PAGE_SIZE {
+                return Err(NvError::Full);
+            }
+        }
+
+        // Build header + data buffer (must be 4-byte aligned)
+        let mut write_buf = [0xFFu8; 128 + HEADER_SIZE];
+        write_buf[0] = (ITEM_MAGIC & 0xFF) as u8;
+        write_buf[1] = (ITEM_MAGIC >> 8) as u8;
+        write_buf[2] = (id as u16 & 0xFF) as u8;
+        write_buf[3] = (id as u16 >> 8) as u8;
+        write_buf[4] = (data.len() as u16 & 0xFF) as u8;
+        write_buf[5] = (data.len() as u16 >> 8) as u8;
+        write_buf[6] = 0x00;
+        write_buf[7] = 0x00;
+        write_buf[HEADER_SIZE..HEADER_SIZE + data.len()].copy_from_slice(data);
+
+        let flash_addr = self.active_page + self.write_offset as u32;
+        self.flash_write(flash_addr, &write_buf[..total])?;
+
+        self.write_offset += total;
+        Ok(())
+    }
+
+    fn scratch_page(&self) -> u32 {
+        if self.active_page == NV_PAGE_A { NV_PAGE_B } else { NV_PAGE_A }
+    }
+
+    // ── Flash hardware access (pure Rust, direct registers) ──
+
+    /// Read bytes from flash via XIP memory mapping.
+    fn flash_read_bytes(&self, offset: u32, len: usize) -> [u8; 128] {
+        let mut buf = [0xFFu8; 128];
+        let addr = (FLASH_BASE | (offset & 0x7_FFFF)) as *const u8;
+        for i in 0..len.min(128) {
+            buf[i] = unsafe { core::ptr::read_volatile(addr.add(i)) };
+        }
+        buf
+    }
+
+    /// Erase a 4 KB flash sector.
+    fn erase_sector(&self, offset: u32) -> Result<(), NvError> {
+        self.enter_cache_bypass();
+
+        // Write Enable
+        self.spif_wait_idle();
+        reg_write(SPIF_FCMD, 0x0600_0001); // WREN
+        self.spif_wait_idle();
+        self.spif_wait_not_busy();
+
+        // Sector Erase (0x20)
+        reg_write(SPIF_FCMD_ADDR, offset);
+        // fcmd encoding: op=0x20, addrlen=3, no read/write data
+        reg_write(SPIF_FCMD, (0x20u32 << 24) | 0x8_0001 | (2 << 16)); // op + addr_en + addr_len=3
+        self.spif_wait_idle();
+        self.spif_wait_not_busy();
+
+        self.exit_cache_bypass();
+        self.cache_flush();
+        Ok(())
+    }
+
+    /// Write data to flash (page program, up to 256 bytes at a time).
+    fn flash_write(&self, offset: u32, data: &[u8]) -> Result<(), NvError> {
+        self.enter_cache_bypass();
+
+        let mut pos = 0;
+        while pos < data.len() {
+            // Page program: max 256 bytes, must not cross page boundary
+            let page_boundary = ((offset as usize + pos) | 0xFF) + 1;
+            let remaining_in_page = page_boundary - (offset as usize + pos);
+            let chunk_len = (data.len() - pos).min(remaining_in_page).min(256);
+
+            // Write Enable
+            self.spif_wait_idle();
+            reg_write(SPIF_FCMD, 0x0600_0001); // WREN
+            self.spif_wait_idle();
+            self.spif_wait_not_busy();
+
+            // Set address
+            reg_write(SPIF_FCMD_ADDR, offset + pos as u32);
+
+            // Write data to FIFO (4 bytes at a time via wrdata registers)
+            let mut i = 0;
+            while i < chunk_len {
+                let mut word = 0xFFFF_FFFFu32;
+                for b in 0..4 {
+                    if i + b < chunk_len {
+                        // Clear the byte position and set data
+                        word &= !(0xFF << (b * 8));
+                        word |= (data[pos + i + b] as u32) << (b * 8);
+                    }
+                }
+                reg_write(SPIF_FCMD_WRDATA + (i as u32 / 4) * 4, word);
+                i += 4;
+            }
+
+            // Page Program command (0x02)
+            let wr_words = ((chunk_len + 3) / 4) as u32;
+            // fcmd: op=0x02, addr_en, addr_len=3, wr_en, wr_len
+            let fcmd = (0x02u32 << 24)
+                | 0x8_0001         // addr_en + trigger
+                | (2 << 16)        // addr_len = 3 bytes (0-indexed = 2)
+                | 0x8000           // wr_en
+                | ((wr_words.saturating_sub(1)) << 12); // wr_len (0-indexed)
+            reg_write(SPIF_FCMD, fcmd);
+            self.spif_wait_idle();
+            self.spif_wait_not_busy();
+
+            pos += chunk_len;
+        }
+
+        self.exit_cache_bypass();
+        self.cache_flush();
+        Ok(())
+    }
+
+    /// Wait for SPIF controller to be idle.
+    fn spif_wait_idle(&self) {
+        for _ in 0..100_000u32 {
+            let fcmd = reg_read(SPIF_FCMD);
+            if fcmd & 0x02 == 0 {
+                // Also wait for config ready bit
+                let cfg = reg_read(SPIF_CONFIG);
+                if cfg & 0x8000_0000 != 0 {
+                    return;
+                }
+            }
+            cortex_m::asm::nop();
+        }
+    }
+
+    /// Wait for flash chip to finish write/erase (poll status register).
+    fn spif_wait_not_busy(&self) {
+        for _ in 0..1_000_000u32 {
+            // Read Status Register (RDSR = 0x05)
+            reg_write(SPIF_FCMD, (0x05u32 << 24) | 0x80_0001 | (1 << 20)); // op + rd_en + rd_len=2 + trigger
+            self.spif_wait_idle();
+            let status = reg_read(AP_SPIF_BASE + 0xA0) & 0xFF; // fcmd_rddata[0]
+            if status & 0x01 == 0 {
+                return; // WIP bit clear
+            }
+            cortex_m::asm::nop();
+        }
+    }
+
+    fn enter_cache_bypass(&self) {
+        cortex_m::interrupt::free(|_| {
+            reg_write(CACHE_CTRL0, 0x02);
+            reg_write(CACHE_BYPASS_REG, 1);
+        });
+    }
+
+    fn exit_cache_bypass(&self) {
+        cortex_m::interrupt::free(|_| {
+            reg_write(CACHE_CTRL0, 0x00);
+            reg_write(CACHE_BYPASS_REG, 0);
+        });
+    }
+
+    fn cache_flush(&self) {
+        cortex_m::interrupt::free(|_| {
+            reg_write(CACHE_CTRL0, 0x02);
+            for _ in 0..8 { cortex_m::asm::nop(); }
+            reg_write(CACHE_CTRL0, 0x03);
+            for _ in 0..8 { cortex_m::asm::nop(); }
+            reg_write(CACHE_CTRL0, 0x00);
+        });
+    }
+}
+
+impl NvStorage for FlashNvStorage {
+    fn read(&self, id: NvItemId, buf: &mut [u8]) -> Result<usize, NvError> {
+        self.find_latest(id, buf).ok_or(NvError::NotFound)
+    }
+
+    fn write(&mut self, id: NvItemId, data: &[u8]) -> Result<(), NvError> {
+        self.append_item(id, data)
+    }
+
+    fn delete(&mut self, id: NvItemId) -> Result<(), NvError> {
+        self.append_item(id, &[])
+    }
+
+    fn exists(&self, id: NvItemId) -> bool {
+        let mut buf = [0u8; 128];
+        self.read(id, &mut buf).is_ok()
+    }
+
+    fn item_length(&self, id: NvItemId) -> Result<usize, NvError> {
+        let mut buf = [0u8; 128];
+        self.read(id, &mut buf)
+    }
+
+    fn compact(&mut self) -> Result<(), NvError> {
+        let scratch = self.scratch_page();
+        self.erase_sector(scratch)?;
+
+        // Collect unique item IDs
+        let mut seen_ids: heapless::Vec<u16, 32> = heapless::Vec::new();
+        let mut offset = 0;
+
+        while offset + HEADER_SIZE <= PAGE_SIZE {
+            let hdr = self.flash_read_bytes(self.active_page + offset as u32, HEADER_SIZE);
+            let magic = u16::from_le_bytes([hdr[0], hdr[1]]);
+            if magic != ITEM_MAGIC { break; }
+            let item_id = u16::from_le_bytes([hdr[2], hdr[3]]);
+            if !seen_ids.contains(&item_id) {
+                let _ = seen_ids.push(item_id);
+            }
+            let len = u16::from_le_bytes([hdr[4], hdr[5]]) as usize;
+            offset += HEADER_SIZE + align4(len);
+        }
+
+        // Copy latest of each item to scratch
+        let old_active = self.active_page;
+        self.active_page = scratch;
+        self.write_offset = 0;
+
+        let mut data_buf = [0u8; 128];
+        for &item_id in seen_ids.iter() {
+            self.active_page = old_active;
+            if let Some(nv_id) = raw_to_nv_item_id(item_id) {
+                if let Some(len) = self.find_latest(nv_id, &mut data_buf) {
+                    self.active_page = scratch;
+                    let _ = self.append_item(nv_id, &data_buf[..len]);
+                    continue;
+                }
+            }
+            self.active_page = scratch;
+        }
+
+        self.active_page = scratch;
+        let _ = self.erase_sector(old_active);
+
+        log::debug!(
+            "[FlashNV] Compacted: {} items, offset={}",
+            seen_ids.len(),
+            self.write_offset
+        );
+
+        Ok(())
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────
+
+const fn align4(n: usize) -> usize {
+    (n + 3) & !3
+}
+
+fn reg_write(addr: u32, val: u32) {
+    unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
+}
+
+fn reg_read(addr: u32) -> u32 {
+    unsafe { core::ptr::read_volatile(addr as *const u32) }
+}
+
+fn raw_to_nv_item_id(raw: u16) -> Option<NvItemId> {
+    match raw {
+        0x0001 => Some(NvItemId::NwkPanId),
+        0x0002 => Some(NvItemId::NwkChannel),
+        0x0003 => Some(NvItemId::NwkShortAddress),
+        0x0004 => Some(NvItemId::NwkExtendedPanId),
+        0x0005 => Some(NvItemId::NwkIeeeAddress),
+        0x0006 => Some(NvItemId::NwkKey),
+        0x0007 => Some(NvItemId::NwkKeySeqNum),
+        0x0008 => Some(NvItemId::NwkFrameCounter),
+        0x0009 => Some(NvItemId::NwkDepth),
+        0x000A => Some(NvItemId::NwkParentAddress),
+        0x000B => Some(NvItemId::NwkUpdateId),
+        0x0020 => Some(NvItemId::ApsTrustCenterAddress),
+        0x0021 => Some(NvItemId::ApsLinkKey),
+        0x0022 => Some(NvItemId::ApsBindingTable),
+        0x0023 => Some(NvItemId::ApsGroupTable),
+        0x0040 => Some(NvItemId::BdbNodeIsOnNetwork),
+        0x0041 => Some(NvItemId::BdbCommissioningMode),
+        0x0042 => Some(NvItemId::BdbPrimaryChannelSet),
+        0x0043 => Some(NvItemId::BdbSecondaryChannelSet),
+        0x0044 => Some(NvItemId::BdbCommissioningGroupId),
+        0x0100 => Some(NvItemId::AppEndpoint1),
+        0x0101 => Some(NvItemId::AppEndpoint2),
+        0x0102 => Some(NvItemId::AppEndpoint3),
+        _ if raw >= 0x0200 => Some(NvItemId::AppCustomBase),
+        _ => None,
+    }
+}

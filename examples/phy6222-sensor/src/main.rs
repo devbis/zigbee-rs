@@ -29,6 +29,7 @@ mod stubs;
 
 mod time_driver;
 mod vectors;
+mod flash_nv;
 
 use cortex_m as _;
 use panic_halt as _;
@@ -130,6 +131,10 @@ async fn main(_spawner: Spawner) {
     let mac = Phy6222Mac::new();
     log::info!("[PHY6222] Radio ready");
 
+    // Flash NV storage (last 2 sectors of 512KB flash)
+    let mut nv = flash_nv::FlashNvStorage::new();
+    log::info!("[PHY6222] Flash NV storage ready");
+
     // ZCL clusters
     let mut basic_cluster = BasicCluster::new(
         b"Zigbee-RS",
@@ -167,9 +172,15 @@ async fn main(_spawner: Spawner) {
         })
         .build();
 
-    // Auto-join on boot
-    log::info!("[PHY6222] Auto-joining network…");
-    device.user_action(UserAction::Join);
+    // Restore previous network state from flash
+    let restored = device.restore_state(&nv);
+    if restored {
+        log::info!("[PHY6222] Restored state from flash — will rejoin");
+        device.user_action(UserAction::Rejoin);
+    } else {
+        log::info!("[PHY6222] No saved state — auto-joining…");
+        device.user_action(UserAction::Join);
+    }
     let mut clusters = [
         ClusterRef { endpoint: 1, cluster: &mut basic_cluster },
         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
@@ -177,7 +188,10 @@ async fn main(_spawner: Spawner) {
         ClusterRef { endpoint: 1, cluster: &mut power_cluster },
     ];
     if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
-        log_event(e);
+        if log_event(e) {
+            device.save_state(&mut nv);
+            log::info!("[PHY6222] Network state saved to flash");
+        }
     }
 
     // Set initial sensor values for ZHA interview
@@ -240,6 +254,8 @@ async fn main(_spawner: Spawner) {
 
             if held_long {
                 log::info!("[PHY6222] FACTORY RESET");
+                device.factory_reset(Some(&mut nv)).await;
+                log::info!("[PHY6222] NV cleared — rebooting");
                 for _ in 0..5u8 {
                     led_on();
                     Timer::after(Duration::from_millis(100)).await;
@@ -257,11 +273,22 @@ async fn main(_spawner: Spawner) {
                     ClusterRef { endpoint: 1, cluster: &mut power_cluster },
                 ];
                 if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
-                    if log_event(e) {
-                        fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
-                        annce_retries_left = 5;
-                        last_annce = Instant::now();
-                        interview_done = false;
+                    match e {
+                        StackEvent::Joined { .. } => {
+                            log_event(e);
+                            device.save_state(&mut nv);
+                            log::info!("[PHY6222] State saved to flash");
+                            fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
+                            annce_retries_left = 5;
+                            last_annce = Instant::now();
+                            interview_done = false;
+                        }
+                        StackEvent::Left => {
+                            log_event(e);
+                            device.factory_reset(Some(&mut nv)).await;
+                            log::info!("[PHY6222] NV cleared");
+                        }
+                        _ => { log_event(e); }
                     }
                 }
                 Timer::after(Duration::from_millis(300)).await;
@@ -393,6 +420,8 @@ async fn main(_spawner: Spawner) {
                     annce_retries_left = 5;
                     last_annce = Instant::now();
                     interview_done = false;
+                    device.save_state(&mut nv);
+                    log::info!("[PHY6222] State saved to flash");
                 }
             }
         }
