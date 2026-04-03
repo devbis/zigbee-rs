@@ -32,10 +32,12 @@ impl<'a> Ieee802154Driver<'a> {
     pub fn update_config(&mut self, update_fn: impl FnOnce(&mut Config)) {
         update_fn(&mut self.config);
         self.driver.set_config(self.config);
+        log::info!("[DRV] config: ch={}", self.config.channel);
     }
 
     /// Transmit a raw 802.15.4 frame (synchronous).
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
+        log::info!("[DRV] TX {} bytes on ch{}", frame.len(), self.config.channel);
         self.driver.transmit_raw(frame)
     }
 
@@ -45,21 +47,30 @@ impl<'a> Ieee802154Driver<'a> {
     }
 
     /// Poll for a received frame. Returns None if nothing available yet.
+    /// Returns the RAW frame (including MAC header) for proper parsing.
     pub fn poll_receive(&mut self) -> Option<Result<RxFrame, Error>> {
-        match self.driver.received() {
-            Some(Ok(received)) => {
+        // Use raw_received to get the full MAC frame including header
+        match self.driver.raw_received() {
+            Some(raw) => {
                 let mut rx = RxFrame {
                     data: [0u8; 127],
                     len: 0,
-                    lqi: received.lqi,
+                    lqi: 0,
                 };
-                let frame_data = &received.frame.payload;
-                let len = frame_data.len().min(127);
-                rx.data[..len].copy_from_slice(&frame_data[..len]);
+                // raw.data[0] = PHR (length including FCS)
+                // raw.data[1..] = PSDU (MAC frame WITHOUT FCS — CRC not in buffer)
+                let phr = raw.data[0] as usize;
+                let mac_len = if phr >= 2 { phr - 2 } else { 0 }; // subtract FCS
+                let len = mac_len.min(125);
+                if len > 0 {
+                    rx.data[..len].copy_from_slice(&raw.data[1..][..len]);
+                }
                 rx.len = len;
+                // RSSI is at raw.data[phr-1] (last byte before where FCS would be)
+                // Actually unclear — use 0 for now
+                rx.lqi = 128; // default mid-range LQI
                 Some(Ok(rx))
             }
-            Some(Err(e)) => Some(Err(e)),
             None => None,
         }
     }

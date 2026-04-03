@@ -127,14 +127,27 @@ impl<'a> EspMac<'a> {
     ) {
         let deadline = Instant::now() + Duration::from_micros(duration_us);
         self.driver.start_receive();
+        let mut rx_count = 0u32;
 
         loop {
             if Instant::now() >= deadline {
                 break;
             }
             if let Some(Ok(rx)) = self.driver.poll_receive() {
+                rx_count += 1;
                 let data = &rx.data[..rx.len];
+                let fc = if data.len() >= 2 { u16::from_le_bytes([data[0], data[1]]) } else { 0 };
+                let ftype = fc & 0x07;
+                // Log first few frames on each channel for debugging
+                if rx_count <= 3 {
+                    log::info!("[SCAN] ch{}: #{} fc=0x{:04X} type={} len={} hex={:02X?}",
+                        channel, rx_count, fc, ftype, rx.len,
+                        &data[..data.len().min(20)]);
+                }
                 if let Some(pd) = parse_beacon(channel, data, rx.lqi) {
+                    log::info!("[SCAN] ch{}: BEACON PAN=0x{:04X} permit={}",
+                        channel, pd.coord_address.pan_id().0,
+                        pd.superframe_spec.association_permit);
                     if descriptors.push(pd).is_err() {
                         break;
                     }
@@ -143,6 +156,12 @@ impl<'a> EspMac<'a> {
             } else {
                 Timer::after_micros(200).await;
             }
+        }
+        if rx_count == 0 {
+            log::info!("[SCAN] ch{}: no frames in {}us", channel, duration_us);
+        } else {
+            log::info!("[SCAN] ch{}: {} frames, {} beacons", channel, rx_count, 
+                descriptors.len());
         }
     }
 
@@ -213,9 +232,14 @@ impl MacDriver for EspMac<'_> {
             req.scan_duration
         );
 
+        // Enable promiscuous mode for scanning (accept beacon responses)
+        self.driver.update_config(|cfg| {
+            cfg.promiscuous = true;
+        });
+
         for ch in req.channel_mask.iter() {
             let ch_num = ch.number();
-            log::debug!("[ESP MLME-SCAN] Scanning ch {}…", ch_num);
+            log::info!("[SCAN] ch {}", ch_num);
             self.channel = ch_num;
             self.driver.update_config(|cfg| cfg.channel = ch_num);
 
@@ -251,6 +275,11 @@ impl MacDriver for EspMac<'_> {
                 }
             }
         }
+
+        // Restore normal mode after scan
+        self.driver.update_config(|cfg| {
+            cfg.promiscuous = false;
+        });
 
         if matches!(req.scan_type, ScanType::Active | ScanType::Passive)
             && pan_descriptors.is_empty()

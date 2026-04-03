@@ -39,6 +39,17 @@ use zigbee_zcl::clusters::humidity::HumidityCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
+// Bridge `log` crate → esp_println so stack-internal log::info! appears on serial
+struct EspLogger;
+impl log::Log for EspLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool { true }
+    fn log(&self, record: &log::Record) {
+        esp_println::println!("[{}] {}", record.level(), record.args());
+    }
+    fn flush(&self) {}
+}
+static LOGGER: EspLogger = EspLogger;
+
 const REPORT_INTERVAL_SECS: u64 = 30;
 const FAST_POLL_MS: u64 = 250;
 const SLOW_POLL_SECS: u64 = 10;
@@ -51,6 +62,10 @@ fn main() -> ! {
 
     // Initialize heap — required by zigbee-mac's alloc feature  
     esp_alloc::heap_allocator!(size: 32768);
+
+    // Initialize log → esp_println bridge
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
 
     esp_println::println!("[ESP32-C6] Booting...");
 
