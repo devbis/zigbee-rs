@@ -25,7 +25,7 @@ mod time_driver;
 mod flash_nv;
 
 use esp_backtrace as _;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::gpio::{Input, InputConfig, Pull};
 use esp_hal::tsens::{TemperatureSensor, Config as TsensConfig};
 
 use embassy_futures::block_on;
@@ -82,18 +82,10 @@ fn main() -> ! {
         InputConfig::default().with_pull(Pull::Up),
     );
 
-    // LED on GPIO8 (active low on most devkits)
-    let mut led = Output::new(peripherals.GPIO8, Level::High, OutputConfig::default());
-
-    // Boot signal: triple blink
-    block_on(async {
-        for _ in 0..3u8 {
-            led.set_low();
-            Timer::after(Duration::from_millis(100)).await;
-            led.set_high();
-            Timer::after(Duration::from_millis(100)).await;
-        }
-    });
+    // ESP32-C6-DevKitC-1 has a WS2812 RGB LED on GPIO8 — not a simple GPIO LED.
+    // For now, we just log status instead of blinking.
+    // To use an external LED, connect one to any free GPIO.
+    esp_println::println!("[ESP32-C6] Boot signal (no simple LED on devkit)");
 
     // IEEE 802.15.4 radio
     let ieee802154 = esp_radio::ieee802154::Ieee802154::new(peripherals.IEEE802154);
@@ -184,7 +176,6 @@ fn main() -> ! {
 
         let mut last_report = Instant::now();
         let mut fast_poll_until = if device.is_joined() {
-            led.set_low();
             Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS)
         } else {
             Instant::now()
@@ -219,9 +210,7 @@ fn main() -> ! {
                     device.factory_reset(Some(&mut nv)).await;
                     esp_println::println!("[ESP32-C6] NV cleared — rebooting");
                     for _ in 0..5u8 {
-                        led.set_low();
                         Timer::after(Duration::from_millis(100)).await;
-                        led.set_high();
                         Timer::after(Duration::from_millis(100)).await;
                     }
                     esp_hal::system::software_reset();
@@ -271,7 +260,6 @@ fn main() -> ! {
                             if !interview_done && device.configured_cluster_count(1) >= EXPECTED_REPORT_CLUSTERS {
                                 interview_done = true;
                                 fast_poll_until = Instant::now() + Duration::from_secs(5);
-                                led.set_high();
                                 esp_println::println!("[ESP32-C6] Interview done!");
                             }
                             let mut cls2 = [
@@ -323,13 +311,9 @@ fn main() -> ! {
                 // Not joined — blink and retry
                 let now2 = Instant::now();
                 if now2.duration_since(last_rejoin_attempt).as_secs() >= 1 {
-                    led.set_low();
                     Timer::after(Duration::from_millis(80)).await;
-                    led.set_high();
                     Timer::after(Duration::from_millis(120)).await;
-                    led.set_low();
                     Timer::after(Duration::from_millis(80)).await;
-                    led.set_high();
                 }
 
                 if now2.duration_since(last_rejoin_attempt).as_secs() >= 15 {
@@ -346,7 +330,6 @@ fn main() -> ! {
                     let _ = device.tick(0, &mut cls).await;
                     if device.is_joined() {
                         esp_println::println!("[ESP32-C6] Joined! addr=0x{:04X}", device.short_address());
-                        led.set_low();
                         fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                         annce_retries_left = 5;
                         last_annce = Instant::now();

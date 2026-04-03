@@ -776,6 +776,7 @@ dependencies = [
 name = "esp32c6-sensor"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
  "embassy-futures",
  "embassy-time",
  "embassy-time-driver",
