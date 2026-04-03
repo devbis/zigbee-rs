@@ -25,6 +25,7 @@ mod time_driver;
 
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::tsens::{TemperatureSensor, Config as TsensConfig};
 
 use embassy_futures::block_on;
 use embassy_time::{Duration, Instant, Timer};
@@ -99,6 +100,10 @@ fn main() -> ! {
     let mac = zigbee_mac::esp::EspMac::new(ieee802154, config);
     esp_println::println!("[ESP32-C6] Radio ready");
 
+    // On-chip temperature sensor
+    let temp_sensor = TemperatureSensor::new(peripherals.TSENS, TsensConfig::default())
+        .expect("temp sensor init failed");
+
     // ZCL clusters
     let mut basic_cluster = BasicCluster::new(
         b"Zigbee-RS",
@@ -106,13 +111,10 @@ fn main() -> ! {
         b"20260403",
         b"0.1.0",
     );
-    basic_cluster.set_power_source(0x03);
+    basic_cluster.set_power_source(0x04); // DC power (USB-powered devkit)
     let mut temp_cluster = TemperatureCluster::new(-4000, 12500);
     let mut hum_cluster = HumidityCluster::new(0, 10000);
     let mut power_cluster = PowerConfigCluster::new();
-    power_cluster.set_battery_size(4);
-    power_cluster.set_battery_quantity(2);
-    power_cluster.set_battery_rated_voltage(15);
 
     let mut hum_tick: u32 = 0;
 
@@ -136,10 +138,20 @@ fn main() -> ! {
         .build();
 
     // Initial sensor values
-    temp_cluster.set_temperature(2250);
-    hum_cluster.set_humidity(5000u16);
-    power_cluster.set_battery_voltage(33);
-    power_cluster.set_battery_percentage(200);
+    {
+        let raw_temp = temp_sensor.get_temperature();
+        // Convert to centidegrees: (raw * 0.4386 - offset*27.88 - 20.52) * 100
+        // Integer: (raw * 4386 - offset * 278800 - 205200) / 100
+        let temp_centi = ((raw_temp.raw_value as i32) * 4386
+            - (raw_temp.offset as i32) * 278800
+            - 205200) / 100;
+        temp_cluster.set_temperature(temp_centi as i16);
+        hum_cluster.set_humidity(5000u16); // No humidity sensor — fixed 50%
+        power_cluster.set_battery_voltage(33); // USB powered = 3.3V
+        power_cluster.set_battery_percentage(200); // 100%
+        esp_println::println!("[ESP32-C6] Temp: {}.{:02}°C (on-chip)",
+            temp_centi / 100, (temp_centi % 100).unsigned_abs());
+    }
 
     // Run the async SED loop synchronously via block_on
     block_on(async {
@@ -263,13 +275,16 @@ fn main() -> ! {
                 let elapsed_s = now2.duration_since(last_report).as_secs();
                 if elapsed_s >= REPORT_INTERVAL_SECS {
                     last_report = now2;
+                    let raw_temp = temp_sensor.get_temperature();
+                    let temp_centi = ((raw_temp.raw_value as i32) * 4386
+                        - (raw_temp.offset as i32) * 278800
+                        - 205200) / 100;
                     hum_tick = hum_tick.wrapping_add(1);
-                    let temp: i16 = 2250 + ((hum_tick % 50) as i16 - 25);
                     let hum: u16 = 5000 + ((hum_tick % 100) as u16) * 10;
-                    temp_cluster.set_temperature(temp);
+                    temp_cluster.set_temperature(temp_centi as i16);
                     hum_cluster.set_humidity(hum);
                     esp_println::println!("[ESP32-C6] T={}.{:02}°C H={}.{:02}%",
-                        temp / 100, (temp % 100).unsigned_abs(), hum / 100, hum % 100);
+                        temp_centi / 100, (temp_centi % 100).unsigned_abs(), hum / 100, hum % 100);
                 }
 
                 let tick_elapsed = elapsed_s.min(60) as u16;
