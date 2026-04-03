@@ -437,6 +437,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a513e167849a384b7f9b746e517604398518590a9142f4846a32e3c2a4de7b11"
 
 [[package]]
+name = "phy6222-hal"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "log",
+]
+
+[[package]]
 name = "phy6222-sensor"
 version = "0.1.0"
 dependencies = [
@@ -446,8 +454,10 @@ dependencies = [
  "embassy-futures",
  "embassy-time 0.5.1",
  "embassy-time-driver",
+ "heapless 0.8.0",
  "log",
  "panic-halt",
+ "phy6222-hal",
  "portable-atomic",
  "zigbee-aps",
  "zigbee-mac",
