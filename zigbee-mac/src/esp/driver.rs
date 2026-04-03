@@ -39,18 +39,18 @@ impl<'a> Ieee802154Driver<'a> {
     /// INCLUDING FCS. Since hardware auto-generates FCS, we add +2 to the
     /// length so the full frame data is transmitted.
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
-        // Build TX buffer: [length_including_fcs, ...frame_data...]
-        // We can't modify transmit_raw's behavior, so we build the buffer manually
-        // and use the raw ieee802154_transmit function indirectly.
-        // transmit_raw sets buffer[0] = frame.len(), but we need buffer[0] = frame.len() + 2
-        // Workaround: append 2 dummy bytes to the frame so transmit_raw sends the right length
+        // Append 2 dummy bytes — transmit_raw sets PHR = frame.len(),
+        // but hardware expects PHR including FCS. The extra bytes are
+        // overwritten by hardware-generated CRC on air.
         let mut padded = [0u8; 129];
         padded[..frame.len()].copy_from_slice(frame);
-        // The extra 2 bytes (zeroes) will be overwritten by hardware CRC anyway
         self.driver.transmit_raw(&padded[..frame.len() + 2])?;
-        // Wait for TX to complete
+        // Wait for TX to complete before returning.
+        // Too short: beacon request gets aborted by subsequent start_receive.
+        // Too long: miss ACK from coordinator (ACK arrives ~192µs after our frame).
+        // 2ms is a good compromise — TX completes, and ACK wait starts promptly.
         let start = esp_hal::time::Instant::now();
-        while start.elapsed() < esp_hal::time::Duration::from_millis(5) {
+        while start.elapsed() < esp_hal::time::Duration::from_millis(2) {
             core::hint::spin_loop();
         }
         Ok(())

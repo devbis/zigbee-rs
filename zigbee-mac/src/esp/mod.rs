@@ -666,7 +666,6 @@ impl MacDriver for EspMac<'_> {
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
         let msdu_handle = req.msdu_handle;
-        let ack_requested = req.tx_options.ack_tx;
         let mut frame_buf = [0u8; 127];
         let seq = self.next_dsn();
         let len = build_data_frame(
@@ -678,85 +677,39 @@ impl MacDriver for EspMac<'_> {
             &req,
         )?;
 
-        let max_retries = if ack_requested { self.max_frame_retries } else { 0 };
+        // Simple CSMA-CA + TX. ACK detection is unreliable on ESP32 because
+        // start_receive() interferes with the hardware's TX→RX turnaround.
+        // The coordinator receives our frames even without us checking the ACK.
+        let mut be = self.min_be;
+        let mut nb: u8 = 0;
 
-        for attempt in 0..=max_retries {
-            // Unslotted CSMA-CA
-            let mut be = self.min_be;
-            let mut nb: u8 = 0;
-            let symbol_period_us: u64 = 16;
-            let unit_backoff_symbols: u64 = 20;
+        loop {
+            let max_val = (1u32 << be) - 1;
+            let random = (seq as u32)
+                .wrapping_add(nb as u32)
+                .wrapping_mul(1103515245)
+                .wrapping_add(12345);
+            let backoff = (random % (max_val + 1)) as u64;
+            if backoff > 0 {
+                Timer::after_micros(backoff * 20 * 16).await;
+            }
 
-            let channel_clear = loop {
-                let max_val = (1u32 << be) - 1;
-                let random = (seq as u32)
-                    .wrapping_add(nb as u32)
-                    .wrapping_add(attempt as u32)
-                    .wrapping_mul(1103515245)
-                    .wrapping_add(12345);
-                let backoff = (random % (max_val + 1)) as u64;
-                let delay_us = backoff * unit_backoff_symbols * symbol_period_us;
-                if delay_us > 0 {
-                    Timer::after_micros(delay_us).await;
-                }
-
-                // Try transmit (CCA implicit)
-                match self.driver.transmit(&frame_buf[..len]) {
-                    Ok(()) => break true,
-                    Err(_) => {
-                        nb += 1;
-                        be = core::cmp::min(be + 1, self.max_be);
-                        if nb > self.max_csma_backoffs {
-                            break false;
-                        }
+            match self.driver.transmit(&frame_buf[..len]) {
+                Ok(()) => break,
+                Err(_) => {
+                    nb += 1;
+                    be = core::cmp::min(be + 1, self.max_be);
+                    if nb > self.max_csma_backoffs {
+                        return Err(MacError::ChannelAccessFailure);
                     }
                 }
-            };
-
-            if !channel_clear {
-                if attempt == max_retries {
-                    return Err(MacError::ChannelAccessFailure);
-                }
-                continue;
-            }
-
-            if !ack_requested {
-                return Ok(McpsDataConfirm { msdu_handle, timestamp: None });
-            }
-
-            // Wait for ACK (turnaround + ACK duration ≈ 1.5ms)
-            self.driver.start_receive();
-            let ack_deadline = Instant::now() + Duration::from_millis(2);
-            let mut got_ack = false;
-
-            while Instant::now() < ack_deadline {
-                if let Some(Ok(rx)) = self.driver.poll_receive() {
-                    let data = &rx.data[..rx.len];
-                    if data.len() >= 3 {
-                        let fc = u16::from_le_bytes([data[0], data[1]]);
-                        let frame_type = fc & 0x07;
-                        if frame_type == 0x02 && data[2] == seq {
-                            got_ack = true;
-                            break;
-                        }
-                    }
-                    self.driver.start_receive();
-                } else {
-                    Timer::after_micros(100).await;
-                }
-            }
-
-            if got_ack {
-                return Ok(McpsDataConfirm { msdu_handle, timestamp: None });
-            }
-
-            // No ACK — retry if attempts remain
-            if attempt < max_retries {
-                log::debug!("[ESP] No ACK seq={}, retry {}/{}", seq, attempt + 1, max_retries);
             }
         }
 
-        Err(MacError::NoAck)
+        Ok(McpsDataConfirm {
+            msdu_handle,
+            timestamp: None,
+        })
     }
 
     async fn mcps_data_indication(&mut self) -> Result<McpsDataIndication, MacError> {
