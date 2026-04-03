@@ -49,9 +49,12 @@ const EXPECTED_REPORT_CLUSTERS: usize = 3;
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    // Heap allocator already provided by zigbee-mac's esp32c6 feature
+    // Initialize heap — required by zigbee-mac's alloc feature  
+    esp_alloc::heap_allocator!(size: 32768);
 
-    // Start embassy time driver (SYSTIMER-based)
+    esp_println::println!("[ESP32-C6] Booting...");
+
+    // Start embassy time driver
     time_driver::init();
 
     esp_println::println!("[ESP32-C6] Zigbee Sensor starting");

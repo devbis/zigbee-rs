@@ -1,9 +1,0 @@
-/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/deps/embedded_io_async-4ff9d6b9bbc63ecf.d: /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/lib.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/impls/mod.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/impls/slice_mut.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/impls/slice_ref.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/../README.md
-
-/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/deps/libembedded_io_async-4ff9d6b9bbc63ecf.rmeta: /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/lib.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/impls/mod.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/impls/slice_mut.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/impls/slice_ref.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/../README.md
-
-/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/lib.rs:
-/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/impls/mod.rs:
-/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/impls/slice_mut.rs:
-/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/impls/slice_ref.rs:
-/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/embedded-io-async-0.7.0/src/../README.md:

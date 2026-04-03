@@ -1,8 +1,0 @@
-/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/deps/esp_radio_rtos_driver-cb114e368137ef96.d: /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/lib.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/queue.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/semaphore.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/timer.rs
-
-/Users/afaronov/zigbee-rs/examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/debug/deps/libesp_radio_rtos_driver-cb114e368137ef96.rmeta: /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/lib.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/queue.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/semaphore.rs /Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/timer.rs
-
-/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/lib.rs:
-/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/queue.rs:
-/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/semaphore.rs:
-/Users/afaronov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/esp-radio-rtos-driver-0.2.0/src/timer.rs:
