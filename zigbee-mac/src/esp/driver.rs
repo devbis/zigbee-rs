@@ -45,13 +45,15 @@ impl<'a> Ieee802154Driver<'a> {
         let mut padded = [0u8; 129];
         padded[..frame.len()].copy_from_slice(frame);
         self.driver.transmit_raw(&padded[..frame.len() + 2])?;
-        // Wait for TX to complete before returning.
-        // Too short: beacon request gets aborted by subsequent start_receive.
-        // Too long: miss ACK from coordinator (ACK arrives ~192µs after our frame).
-        // 2ms is a good compromise — TX completes, and ACK wait starts promptly.
+        // Wait for TX to complete
         let start = esp_hal::time::Instant::now();
-        while start.elapsed() < esp_hal::time::Duration::from_millis(2) {
+        while start.elapsed() < esp_hal::time::Duration::from_millis(5) {
             core::hint::spin_loop();
+        }
+        // Log TX frame header for debugging
+        if frame.len() >= 5 {
+            let fc = u16::from_le_bytes([frame[0], frame[1]]);
+            log::info!("[MAC TX] {} bytes fc=0x{:04X} seq={}", frame.len(), fc, frame[2]);
         }
         Ok(())
     }

@@ -60,6 +60,7 @@ impl<M: MacDriver> NwkLayer<M> {
         discover_route: bool,
     ) -> Result<NldeDataConfirm, NwkStatus> {
         if !self.joined {
+            log::warn!("[NWK] nlde_data_request called but not joined! dst=0x{:04X}", dst_addr.0);
             return Err(NwkStatus::InvalidRequest);
         }
 
