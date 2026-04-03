@@ -82,37 +82,35 @@ impl<'a> EspMac<'a> {
     /// The 6-byte factory MAC is stored in eFuse and converted to EUI-64
     /// by inserting FF:FE in the middle (standard MAC-48 → EUI-64).
     fn read_efuse_ieee() -> IeeeAddress {
-        // ESP32-C6 eFuse MAC registers
         const EFUSE_RD_MAC_SYS_0: *const u32 = 0x600B_0844 as *const u32;
         const EFUSE_RD_MAC_SYS_1: *const u32 = 0x600B_0848 as *const u32;
 
-        // Read twice and take the consistent result (eFuse reads can be flaky)
         let lo = unsafe { core::ptr::read_volatile(EFUSE_RD_MAC_SYS_0) };
         let hi = unsafe { core::ptr::read_volatile(EFUSE_RD_MAC_SYS_1) };
-        let lo2 = unsafe { core::ptr::read_volatile(EFUSE_RD_MAC_SYS_0) };
-        let hi2 = unsafe { core::ptr::read_volatile(EFUSE_RD_MAC_SYS_1) };
 
-        // Use second read if first disagrees (allow settling)
-        let lo = if lo == lo2 { lo } else { lo2 };
-        let hi = if hi == hi2 { hi } else { hi2 };
+        log::info!("[ESP] eFuse regs: lo=0x{:08X} hi=0x{:08X}", lo, hi);
 
-        // Base MAC is 6 bytes in little-endian:
-        // lo[7:0]=mac[0], lo[15:8]=mac[1], lo[23:16]=mac[2], lo[31:24]=mac[3]
-        // hi[7:0]=mac[4], hi[15:8]=mac[5]
-        let mac0 = (lo & 0xFF) as u8;
-        let mac1 = ((lo >> 8) & 0xFF) as u8;
-        let mac2 = ((lo >> 16) & 0xFF) as u8;
-        let mac3 = ((lo >> 24) & 0xFF) as u8;
-        let mac4 = (hi & 0xFF) as u8;
-        let mac5 = ((hi >> 8) & 0xFF) as u8;
+        // ESP-IDF convention (from esp_efuse_mac_get_default):
+        // MAC bytes: [hi[15:8], hi[7:0], lo[31:24], lo[23:16], lo[15:8], lo[7:0]]
+        // espflash shows: 60:55:F9:F6:96:88
+        // So: hi[15:8]=0x60, hi[7:0]=0x55, lo[31:24]=0xF9, lo[23:16]=0xF6,
+        //     lo[15:8]=0x96, lo[7:0]=0x88
+        let mac = [
+            ((hi >> 8) & 0xFF) as u8,  // mac[0] = 0x60
+            (hi & 0xFF) as u8,         // mac[1] = 0x55
+            ((lo >> 24) & 0xFF) as u8, // mac[2] = 0xF9
+            ((lo >> 16) & 0xFF) as u8, // mac[3] = 0xF6
+            ((lo >> 8) & 0xFF) as u8,  // mac[4] = 0x96
+            (lo & 0xFF) as u8,         // mac[5] = 0x88
+        ];
 
         log::info!(
-            "[ESP] eFuse MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            mac0, mac1, mac2, mac3, mac4, mac5
+            "[ESP] MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
 
         // EUI-48 → EUI-64: insert FF:FE in middle, flip U/L bit
-        [mac0 ^ 0x02, mac1, mac2, 0xFF, 0xFE, mac3, mac4, mac5]
+        [mac[0] ^ 0x02, mac[1], mac[2], 0xFF, 0xFE, mac[3], mac[4], mac[5]]
     }
 
     fn next_dsn(&mut self) -> u8 {
