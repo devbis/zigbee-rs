@@ -61,6 +61,7 @@ const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
 const EXPECTED_REPORT_CLUSTERS: usize = 3;
 
+
 #[esp_hal::main]
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
