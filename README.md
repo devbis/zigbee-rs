@@ -248,6 +248,7 @@ Occupancy, Electrical, Carbon Dioxide, PM2.5, Soil Moisture
 - **`#![no_std]`** everywhere — no heap allocation, `heapless` for bounded collections
 - **`async` MacDriver trait** — 13 methods, no `Send`/`Sync` requirement
 - **Platform-agnostic** — same stack code runs on mock, ESP32, nRF, BL702, CC2340, Telink, PHY6222
+- **Power-aware** — two-phase polling (fast/slow), DC-DC, TX power reduction, system sleep, flash deep power-down, GPIO preparation, reportable change thresholds
 - **Manual frame parsing** — no `serde`, bitfield encode/decode for all frame types
 - **Embassy-compatible** — designed for single-threaded async executors
 - **Layered crates** — each layer wraps the one below: `NwkLayer<M: MacDriver>`
@@ -327,7 +328,7 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
 ## Known Limitations
 
 - **CC2340 / Telink B91 / Telink TLSR8258** backends compile with stub FFI — real RF requires linking vendor SDK libraries (blocked by complex RTOS dependencies or proprietary toolchains)
-- **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real)
+- **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real); comprehensive power management is implemented (two-tier sleep with AON system sleep ~3 µA, radio sleep/wake, flash deep power-down, GPIO leak prevention)
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
 - **OTA** — full upgrade flow implemented (OTA cluster + OtaManager + FirmwareWriter trait) but not yet tested on real hardware

@@ -92,6 +92,31 @@ and yield during transfers, so the Zigbee radio continues processing uninterrupt
 - Battery voltage monitoring via SAADC (VDD internal divider)
 - `log` → `defmt` bridge for stack-internal logging via RTT
 
+## Power Optimizations
+
+The firmware applies several hardware-level power optimizations to minimize
+battery drain:
+
+| Optimization | Setting | Savings |
+|-------------|---------|---------|
+| DC-DC converter | `reg0` + `reg1` enabled | ~40% lower current |
+| TX power | 0 dBm (down from +8 dBm) | ~50% TX current |
+| HFCLK source | Internal RC (radio auto-requests XTAL) | ~250 µA idle |
+| RAM power-down | Unused banks off at boot | ~190 KB unpowered |
+
+**Polling scheme:**
+- Fast poll: 250 ms for 120 seconds after join/activity
+- Slow poll: 30 seconds in steady state
+- Report interval: 60 seconds
+
+**Reportable change thresholds** suppress unnecessary transmissions:
+- Temperature: ±0.5 °C
+- Humidity: ±1%
+- Battery: ±2%
+
+With these optimizations, a CR2032 (230 mAh) can last several years in a
+stable environment.
+
 ## Operation
 
 1. Power on → restores saved network state from flash (if any) and auto-rejoins

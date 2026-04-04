@@ -84,6 +84,50 @@ pyocd flash -t phy6222 target/thumbv6m-none-eabi/release/phy6222-sensor
 - Default reporting — temp/hum every 60–300s, battery every 300–3600s
 - Real battery voltage via ADC
 
+## Power Management — Two-Tier Sleep
+
+The firmware implements a comprehensive two-tier sleep architecture that
+achieves ~3+ years battery life on 2×AAA (~1200 mAh).
+
+### Two-Tier Architecture
+
+| Tier | Phase | Sleep Mode | Current | Duration |
+|------|-------|-----------|---------|----------|
+| 1 | Fast poll (250 ms) | Radio off + WFE | ~1.5 mA | 120 s after join |
+| 2 | Slow poll (30 s) | AON system sleep | ~3 µA | Steady state |
+
+**During fast poll**, the radio is powered down between polls and the CPU
+enters WFE via Embassy's timer. This is responsive but draws ~1.5 mA.
+
+**During slow poll** (steady state), the device enters full AON system sleep:
+1. Radio powered down (`radio_sleep()`)
+2. Zigbee state saved to flash NV
+3. Unused GPIOs set to input + pull-down (leak prevention)
+4. Flash put into deep power-down (JEDEC 0xB9, ~1 µA vs ~15 µA)
+5. SRAM retention configured
+6. RTC wake-up scheduled (32 kHz RC oscillator)
+7. System sleep entered (~3 µA total)
+
+On wake, the firmware detects the sleep reset, restores flash from deep
+power-down, and performs a fast Zigbee state restore from NV.
+
+### Reportable Change Thresholds
+
+Reports are only sent when values change significantly, suppressing noise:
+- Temperature: ±0.5 °C
+- Humidity: ±1%
+- Battery: ±2%
+
+### Battery Life Estimate
+
+| State | Current |
+|-------|---------|
+| AON system sleep (radio/flash off) | ~3 µA |
+| Radio RX (poll every 30 s) | ~8 mA × 10 ms |
+| Radio TX (report every 60 s) | ~10 mA × 3 ms |
+| **Average (steady state)** | **~6–10 µA** |
+| **Battery life (2×AAA, ~1200 mAh)** | **~3+ years** |
+
 ## Project Structure
 
 ```

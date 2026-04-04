@@ -287,6 +287,65 @@ match select3(
 }
 ```
 
+## Power Optimization
+
+The nRF52840 sensor example includes several hardware-level power optimizations
+that bring the average current draw down to ~5 µA. See the
+[Power Management](../advanced/power.md) chapter for full details.
+
+### DC-DC Converter
+
+The nRF52840's internal DC-DC converter replaces the default LDO regulators,
+reducing current draw by ~40%. Both `reg0` (main supply) and `reg1` (radio
+supply) are enabled at startup:
+
+```rust
+config.dcdc = embassy_nrf::config::DcdcConfig {
+    reg0: true,
+    reg0_voltage: None,
+    reg1: true,
+};
+```
+
+### TX Power
+
+TX power is set to 0 dBm (down from the default +8 dBm), which cuts TX
+current roughly in half while maintaining adequate range for home environments:
+
+```rust
+mac.set_tx_power(0); // 0 dBm — saves ~50% TX current vs +8 dBm
+```
+
+### HFCLK Source
+
+The high-frequency clock source is set to the internal RC oscillator. The
+radio peripheral automatically requests the external crystal when it needs
+high accuracy (during TX/RX), saving ~250 µA during idle periods:
+
+```rust
+config.hfclk_source = embassy_nrf::config::HfclkSource::Internal;
+```
+
+### Poll and Report Intervals
+
+The sensor uses a two-phase polling scheme:
+
+| Phase | Poll Interval | Duration | Current |
+|-------|--------------|----------|---------|
+| Fast poll | 250 ms | 120 s after join/activity | Higher (responsive) |
+| Slow poll | 30 s | Steady state | Very low (~5 µA avg) |
+
+Reports are sent every 60 seconds, but only when sensor values change by more
+than the configured thresholds (±0.5 °C temperature, ±1% humidity, ±2%
+battery). This suppresses unnecessary transmissions in stable environments.
+
+### RAM Power-Down
+
+Unused RAM banks are powered down at startup, saving ~190 KB of unpowered SRAM.
+This was already implemented in earlier versions.
+
+---
+
 ## Example Walkthrough
 
 ### nrf52840-sensor
