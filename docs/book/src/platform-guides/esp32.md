@@ -4,6 +4,12 @@ Espressif's ESP32-C6 and ESP32-H2 are RISC-V SoCs with native IEEE 802.15.4
 radio support, making them a great fit for zigbee-rs. Both chips share the
 same MAC driver code — only the HAL feature flag differs.
 
+> **✅ Hardware Verified:** The ESP32-C6 has been tested end-to-end on an
+> **ESP32-C6-DevKitC-1** board with **Home Assistant + ZHA**. It appears as
+> "Zigbee-RS ESP32-C6-Sensor" with Temperature, Humidity, and Battery entities.
+> Network state is persisted to flash — the device survives reboots without
+> re-pairing.
+
 ## Hardware Overview
 
 | | ESP32-C6 | ESP32-H2 |
@@ -206,7 +212,15 @@ The MAC driver code is shared — only the HAL feature gate changes.
 ## Example Walkthrough
 
 The `esp32c6-sensor` example implements a Zigbee 3.0 temperature & humidity
-end device with a join/leave button.
+end device with:
+
+- **On-chip temperature sensor** (via `esp_hal::tsens::TemperatureSensor`)
+- **Flash NV storage** — network state persists across power cycles (no re-pairing)
+- **NWK Leave handler** — auto-erases NV and rejoins when coordinator sends Leave
+- **Default reporting** — configures report intervals at boot so data flows before ZHA interview
+- **Identify cluster** (0x0003) — supports Identify, IdentifyQuery, TriggerEffect
+- **Battery percentage** reporting via Power Configuration cluster
+- Join/leave button (BOOT / GPIO9)
 
 ### Initialization
 
@@ -238,6 +252,8 @@ fn main() -> ! {
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
         .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
             ep.cluster_server(0x0000) // Basic
+                .cluster_server(0x0001) // Power Configuration
+                .cluster_server(0x0003) // Identify
                 .cluster_server(0x0402) // Temperature Measurement
                 .cluster_server(0x0405) // Relative Humidity
         })
@@ -262,6 +278,34 @@ let i2c = I2c::new(peripherals.I2C0, /* config */)
 
 // Use any embedded-hal 1.0 compatible sensor driver
 ```
+
+## Flash NV Storage (ESP32-C6)
+
+The `esp32c6-sensor` example persists Zigbee network state to the last two
+4 KB sectors of the on-chip flash (addresses `0x3FE000`–`0x3FFFFF`, 8 KB total).
+This uses the `esp-storage` crate's low-level SPI flash API directly:
+
+- **Read:** `esp_storage::ll::spiflash_read`
+- **Write:** `esp_storage::ll::spiflash_write`
+- **Erase:** `esp_storage::ll::spiflash_erase_sector`
+
+The storage is wrapped in `LogStructuredNv<EspFlashDriver>` — a log-structured
+format that appends writes and only erases on compaction, minimizing flash wear.
+
+On boot, the device checks for saved network state and automatically rejoins
+the previous network. If the coordinator sends a NWK Leave command, the device
+erases NV storage and starts fresh commissioning.
+
+> **Note:** The ESP32-H2 example does **not** yet have NV flash storage.
+> Network state is lost on reboot and the device must re-pair.
+
+## ESP32-C6-DevKitC-1 LED Note
+
+The ESP32-C6-DevKitC-1 has a **WS2812 addressable RGB LED** (on GPIO8), not
+a simple GPIO LED. The Identify cluster blink feature in the ESP32-C6 example
+does not drive this LED. If you want LED feedback during Identify, you would
+need to add a WS2812 driver (e.g., `smart-leds` + `esp-hal-smartled`). The
+ESP32-H2 example does implement LED blinking during Identify.
 
 ## Troubleshooting
 
@@ -290,9 +334,12 @@ Expected output:
 ```
 [init] ESP32-C6 Zigbee sensor starting
 [init] Radio ready
+[init] NV: restored network state from flash
+[init] Default reporting configured (temp: 60-300s, hum: 60-300s, battery: 300-3600s)
 [init] Device ready — press BOOT button to join/leave
 [btn] Joining network…
 [scan] Found network on channel 15, PAN 0x1AAA
 [join] Association successful, short addr = 0x1234
-[sensor] T=22.50°C  H=50.00%
+[sensor] T=22.50°C  H=50.00%  Battery=100%
+[nv] State saved to flash
 ```

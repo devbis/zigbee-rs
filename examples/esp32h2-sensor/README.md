@@ -1,7 +1,8 @@
 # ESP32-H2 Zigbee Temperature & Humidity Sensor
 
 A `no_std` Zigbee 3.0 end device for the **ESP32-H2** that reports simulated
-temperature and humidity readings every 30 seconds.
+temperature and humidity readings. Uses the **esp-hal 1.0** `#[esp_hal::main]`
+entry point with `block_on()` for the async runtime.
 
 ## Hardware Requirements
 
@@ -40,16 +41,25 @@ cargo +esp run -Z build-std=core,alloc --target riscv32imac-unknown-none-elf --r
 
 - Initialising the ESP32-H2 IEEE 802.15.4 radio with `esp-radio`
 - Building a Zigbee device with the `ZigbeeDevice` builder API
+- **esp-hal 1.0 pattern** — `#[esp_hal::main]` entry point with `block_on()` async runtime
+  (replaces the removed `embassy_executor` / `riscv_rt` approach)
 - Registering ZCL endpoint 1 (Home Automation profile, device type 0x0302)
-  with **Basic**, **Temperature Measurement**, and **Relative Humidity** clusters
+  with **Basic**, **Power Configuration**, **Identify**, **Temperature Measurement**,
+  and **Relative Humidity** clusters
+- **NWK Leave handler** — auto-rejoins when coordinator sends Leave
+- **Default reporting configuration** — temp/humidity: 60–300 s, battery: 300–3600 s
+- **Identify cluster** (0x0003) — LED blinks during Identify
 - Button-driven network join/leave via `UserAction::Toggle`
-- Periodic simulated sensor updates (replace with real I2C sensor reads)
+- Periodic simulated sensor updates
+
+> **Note:** NV flash storage is not yet implemented for ESP32-H2. Network state
+> is lost on reboot and the device must re-pair.
 
 ## Operation
 
 1. Power on → device starts idle
 2. Press BOOT → joins the nearest open Zigbee network
-3. Every 30 s → simulated temperature/humidity values are updated
+3. Once joined → reports simulated sensor values periodically
 4. Press BOOT again → leaves the network
 
 ## Project Structure

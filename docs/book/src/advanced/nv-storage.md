@@ -223,10 +223,43 @@ The source code documents these target backends:
 
 | Platform | Recommended Backend |
 |----------|-------------------|
-| ESP32 | `nvs_flash` partition (key-value store built into ESP-IDF) |
-| nRF52840 | `nrf-softdevice` flash pages or littlefs |
+| nRF52840 | Flash-backed `FlashNvStorage` using NVMC (last 2 pages = 8 KB) — **implemented** in `nrf52840-sensor` |
+| ESP32-C6 | `EspFlashDriver` via `esp-storage` LL API (last 2 sectors at `0x3FE000`) — **implemented** in `esp32c6-sensor` |
+| ESP32-H2 | Not yet implemented — network state is lost on reboot |
 | STM32WB | Internal flash with wear leveling |
 | Generic | Bridge via the `embedded-storage` traits |
+
+Both the nRF52840 and ESP32-C6 implementations use `LogStructuredNv<T>` — a
+log-structured NV format from `zigbee-runtime` that wraps a platform-specific
+flash driver. It appends writes sequentially and only erases sectors during
+compaction, minimizing flash wear.
+
+#### ESP32-C6 NV Details
+
+The ESP32-C6 example (`esp32c6-sensor/src/flash_nv.rs`) stores network state
+in the last two 4 KB sectors of the 4 MB external SPI flash:
+
+| Sector | Address | Purpose |
+|--------|---------|---------|
+| Page A | `0x3FE000` – `0x3FEFFF` | Primary NV page |
+| Page B | `0x3FF000` – `0x3FFFFF` | Secondary NV page (for compaction) |
+
+The implementation uses `esp_storage::ll` functions for raw SPI flash access
+(`spiflash_read`, `spiflash_write`, `spiflash_erase_sector`, `spiflash_unlock`).
+
+```rust
+// From esp32c6-sensor/src/flash_nv.rs
+pub fn create_nv() -> LogStructuredNv<EspFlashDriver> {
+    LogStructuredNv::new(EspFlashDriver::new(), NV_PAGE_A, NV_PAGE_B)
+}
+```
+
+#### nRF52840 NV Details
+
+The nRF52840 example (`nrf52840-sensor/src/flash_nv.rs`) uses the NVMC
+(Non-Volatile Memory Controller) to write to the last 2 pages (8 KB) of the
+1 MB internal flash. The `FlashNvStorage` struct implements `NvStorage` and
+is wrapped in `LogStructuredNv` for the same log-structured format.
 
 ---
 

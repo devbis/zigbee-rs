@@ -12,8 +12,9 @@ on-chip TEMP as the default fallback. Uses `defmt` + RTT for logging.
 | `sensor-bme280` | BME280  | Temp + humidity + pressure   |
 | `sensor-sht31`  | SHT31   | Temp + humidity              |
 
-All variants include: Basic, Power Configuration, Battery voltage (SAADC),
-RAM power-down for unused banks, and auto-recovery on sensor failure.
+All variants include: Basic, Power Configuration, **Identify** (LED blink),
+Battery voltage (SAADC), RAM power-down for unused banks, flash NV storage,
+NWK Leave handling, default reporting, and auto-recovery on sensor failure.
 
 ## Hardware Requirements
 
@@ -77,8 +78,12 @@ and yield during transfers, so the Zigbee radio continues processing uninterrupt
 - On-chip TEMP sensor or async external I2C sensor (BME280 / SHT31)
 - Building a Zigbee device with `ZigbeeDevice` builder API
 - ZCL endpoint 1 (Home Automation, device type 0x0302) with **Basic**,
-  **Power Configuration**, **Temperature Measurement**, **Relative Humidity**,
+  **Power Configuration**, **Identify**, **Temperature Measurement**, **Relative Humidity**,
   and optionally **Pressure Measurement** (BME280 only) server clusters
+- **NWK Leave handler** — auto-erases NV and rejoins when coordinator sends Leave
+- **Default reporting configuration** — temp/humidity: 60–300 s, battery: 300–3600 s
+  (devices report data even before ZHA sends ConfigureReporting during interview)
+- **Identify cluster** (0x0003) — LED blinks during Identify
 - Automatic sensor recovery on read failure (re-init next cycle)
 - Processing incoming MAC frames and generating ZCL attribute reports
 - Button-driven network join/leave via `UserAction::Toggle`

@@ -5,7 +5,7 @@ A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
 Embassy and other embedded async runtimes.
 
 ```text
-51,500+ lines of Rust · 166 source files · 9 crates · 45 ZCL clusters · 10 hardware platforms · 270 tests
+51,500+ lines of Rust · 166 source files · 9 crates · 45 ZCL clusters · 10 hardware platforms · 270 tests · Identify in all examples · NV storage on nRF + ESP32-C6
 ```
 
 ## Architecture
@@ -280,7 +280,7 @@ zigbee-rs/
 │   ├── mock-coordinator/      # Host: coordinator
 │   ├── mock-light/            # Host: dimmable light
 │   ├── mock-sleepy-sensor/    # Host: SED demo
-│   ├── esp32c6-sensor/        # ESP32-C6 firmware
+│   ├── esp32c6-sensor/        # ESP32-C6 firmware (NV flash storage, on-chip temp sensor, Identify)
 │   ├── esp32h2-sensor/        # ESP32-H2 firmware
 │   ├── nrf52840-sensor/       # nRF52840-DK (probe-rs) + BME280/SHT31 + flash NV
 │   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop, simple demo)
@@ -313,9 +313,21 @@ Every push builds **10 firmware targets** plus workspace checks:
 
 Download firmware artifacts from the [Actions tab](https://github.com/faronov/zigbee-rs/actions).
 
+## Verified Hardware
+
+The following hardware has been tested end-to-end with **Home Assistant + ZHA**:
+
+| Board | Coordinator | Status | Notes |
+|-------|-------------|--------|-------|
+| **nRF52840-DK** (PCA10056) | ZHA (via zigpy) | ✅ Fully verified | Flash NV, Identify LED blink, BME280/SHT31 optional |
+| **ESP32-C6-DevKitC-1** | ZHA (via zigpy) | ✅ Fully verified | Shows as "Zigbee-RS ESP32-C6-Sensor" with Temperature, Humidity, Battery entities. Flash NV at 0x3FE000. |
+
+All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling** (auto-erase NV + rejoin), and **default reporting configuration** (so devices report data even before the coordinator sends ConfigureReporting).
+
 ## Known Limitations
 
 - **CC2340 / Telink B91 / Telink TLSR8258** backends compile with stub FFI — real RF requires linking vendor SDK libraries (blocked by complex RTOS dependencies or proprietary toolchains)
+- **ESP32-H2** — builds and runs but NV flash storage is not yet implemented (network state is lost on reboot; device must re-pair after power cycle)
 - **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal

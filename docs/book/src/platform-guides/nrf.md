@@ -4,6 +4,11 @@ Nordic's nRF52840 and nRF52833 are ARM Cortex-M4F SoCs with a built-in
 IEEE 802.15.4 radio. The zigbee-rs nRF backend uses Embassy's radio driver
 for interrupt-driven, DMA-based TX/RX — **no SoftDevice required**.
 
+> **✅ Hardware Verified:** The nRF52840-DK has been tested end-to-end with
+> **Home Assistant + ZHA**. Features include flash NV storage (survives reboots),
+> NWK Leave handling (auto-erase + rejoin), default reporting configuration,
+> Identify cluster with LED blink, and optional BME280/SHT31 I2C sensors.
+
 ## Hardware Overview
 
 | | nRF52840 | nRF52833 |
@@ -287,7 +292,14 @@ match select3(
 ### nrf52840-sensor
 
 The flagship example: an Embassy-based Zigbee 3.0 end device that reads the
-on-chip temperature sensor and reports simulated humidity.
+on-chip temperature sensor and reports simulated humidity. Includes:
+
+- **Flash NV storage** — network state persists across power cycles (last 8 KB of flash)
+- **NWK Leave handler** — auto-erases NV and rejoins when coordinator sends Leave
+- **Default reporting** — configures report intervals at boot (temp/hum: 60–300 s, battery: 300–3600 s)
+- **Identify cluster** (0x0003) — LED blinks during Identify
+- **Battery monitoring** via SAADC (VDD internal divider)
+- **Optional external sensors** — BME280 (temp + humidity + pressure) or SHT31 (temp + humidity)
 
 **Initialization:**
 
@@ -360,10 +372,13 @@ DEFMT_LOG = "debug"
 ```
 INFO  Zigbee-RS nRF52840 sensor starting…
 INFO  Radio ready
+INFO  NV: restored network state from flash
+INFO  Default reporting configured (temp: 60-300s, hum: 60-300s, battery: 300-3600s)
 INFO  Device ready — press Button 1 to join/leave
 INFO  [btn] Joining network…
 INFO  [scan] Scanning channels 11-26…
 INFO  [scan] Found network: ch=15, PAN=0x1AAA
 INFO  [join] Association successful, addr=0x1234
-INFO  [sensor] T=23.75°C  H=52.30%
+INFO  [sensor] T=23.75°C  H=52.30%  Battery=100%
+INFO  [nv] State saved to flash
 ```
