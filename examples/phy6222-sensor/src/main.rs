@@ -98,7 +98,7 @@ async fn main(_spawner: Spawner) {
     log::info!("[PHY6222] Radio ready");
 
     // Flash NV storage (last 2 sectors of 512KB flash)
-    let mut nv = flash_nv::FlashNvStorage::new();
+    let mut nv = flash_nv::create_nv();
     log::info!("[PHY6222] Flash NV storage ready");
 
     // ZCL clusters
@@ -196,6 +196,7 @@ async fn main(_spawner: Spawner) {
     let mut was_fast_polling = device.is_joined();
     let mut interview_done = false;
     let mut button_was_pressed = false;
+    let mut needs_save = false;
 
     loop {
         let now = Instant::now();
@@ -306,6 +307,7 @@ async fn main(_spawner: Spawner) {
                             if log_event(&ev) {
                                 fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                                 log::info!("[PHY6222] Fast poll ON ({}s)", FAST_POLL_DURATION_SECS);
+                                needs_save = true;
                             }
                         }
                         // Check if ZHA completed interview
@@ -390,6 +392,13 @@ async fn main(_spawner: Spawner) {
                 last_annce = now2;
                 log::info!("[PHY6222] Device_annce retry ({} left)", annce_retries_left);
                 let _ = device.send_device_annce().await;
+            }
+
+            // Deferred save after join events from process_incoming
+            if needs_save {
+                needs_save = false;
+                device.save_state(&mut nv);
+                log::info!("[PHY6222] State saved to flash (deferred)");
             }
         } else {
             // ── Not joined — blink and auto-retry ──
