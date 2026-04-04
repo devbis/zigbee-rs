@@ -38,6 +38,7 @@ use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
+use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
@@ -112,6 +113,7 @@ fn main() -> ! {
     power_cluster.set_battery_size(4);
     power_cluster.set_battery_quantity(2);
     power_cluster.set_battery_rated_voltage(15);
+    let mut identify_cluster = IdentifyCluster::new();
 
     let mut hum_tick: u32 = 0;
 
@@ -128,6 +130,7 @@ fn main() -> ! {
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
         .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
             ep.cluster_server(0x0000) // Basic
+                .cluster_server(0x0003) // Identify
                 .cluster_server(0x0001) // Power Configuration
                 .cluster_server(0x0402) // Temperature Measurement
                 .cluster_server(0x0405) // Relative Humidity
@@ -150,6 +153,7 @@ fn main() -> ! {
             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
         ];
         if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
             log_event(e);
@@ -209,6 +213,7 @@ fn main() -> ! {
                         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                     ];
                     if let TickResult::Event(ref e) = device.tick(0, &mut cls).await {
                         if log_event(e) {
@@ -236,6 +241,7 @@ fn main() -> ! {
                                 ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                                 ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                                 ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                             ];
                             if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                                 match &ev {
@@ -263,6 +269,7 @@ fn main() -> ! {
                                 ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                                 ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                                 ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                             ];
                             let _ = device.tick(0, &mut cls2).await;
                         }
@@ -292,8 +299,15 @@ fn main() -> ! {
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                 ];
                 let _ = device.tick(tick_elapsed, &mut clusters).await;
+
+                // Identify LED blink
+                identify_cluster.tick(tick_elapsed);
+                if identify_cluster.is_identifying() {
+                    led.toggle();
+                }
 
                 // Device_annce retry
                 if annce_retries_left > 0 && now2.duration_since(last_annce).as_secs() >= 8 {
@@ -324,6 +338,7 @@ fn main() -> ! {
                         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                     ];
                     let _ = device.tick(0, &mut cls).await;
                     if device.is_joined() {

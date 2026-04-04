@@ -67,6 +67,7 @@ use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
+use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 #[cfg(feature = "sensor-bme280")]
 use zigbee_zcl::clusters::pressure::PressureCluster;
@@ -235,6 +236,7 @@ async fn main(_spawner: Spawner) {
     #[cfg(feature = "sensor-bme280")]
     let mut press_cluster = PressureCluster::new(3000, 11000);
     let mut power_cluster = PowerConfigCluster::new();
+    let mut identify_cluster = IdentifyCluster::new();
     power_cluster.set_battery_size(4);
     power_cluster.set_battery_quantity(2);
     power_cluster.set_battery_rated_voltage(15);
@@ -251,6 +253,7 @@ async fn main(_spawner: Spawner) {
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
         .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
             let ep = ep.cluster_server(0x0000) // Basic
+                .cluster_server(0x0003)        // Identify
                 .cluster_server(0x0001)        // Power Configuration
                 .cluster_server(0x0402)        // Temperature Measurement
                 .cluster_server(0x0405);       // Relative Humidity
@@ -278,6 +281,7 @@ async fn main(_spawner: Spawner) {
         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
         ClusterRef { endpoint: 1, cluster: &mut press_cluster },
         ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
     ];
     #[cfg(not(feature = "sensor-bme280"))]
     let mut clusters = [
@@ -285,6 +289,7 @@ async fn main(_spawner: Spawner) {
         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
         ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
     ];
     if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
         if log_event(e, &mut led) {
@@ -379,6 +384,7 @@ async fn main(_spawner: Spawner) {
                         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut press_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                     ];
                     #[cfg(not(feature = "sensor-bme280"))]
                     let mut clusters = [
@@ -386,6 +392,7 @@ async fn main(_spawner: Spawner) {
                         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                     ];
                     if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
                         match e {
@@ -434,6 +441,7 @@ async fn main(_spawner: Spawner) {
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut press_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                         ];
                         #[cfg(not(feature = "sensor-bme280"))]
                         let mut cls = [
@@ -441,6 +449,7 @@ async fn main(_spawner: Spawner) {
                             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                         ];
                         if let Some(ev) = device.process_incoming(&ind, &mut cls).await {
                             match &ev {
@@ -480,6 +489,7 @@ async fn main(_spawner: Spawner) {
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut press_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                         ];
                         #[cfg(not(feature = "sensor-bme280"))]
                         let mut cls2 = [
@@ -487,6 +497,7 @@ async fn main(_spawner: Spawner) {
                             ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                             ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                         ];
                         let _ = device.tick(0, &mut cls2).await;
                     }
@@ -522,6 +533,7 @@ async fn main(_spawner: Spawner) {
                 ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut press_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
             ];
             #[cfg(not(feature = "sensor-bme280"))]
             let mut clusters = [
@@ -529,11 +541,18 @@ async fn main(_spawner: Spawner) {
                 ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                 ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
             ];
             if let TickResult::Event(ref e) = device.tick(tick_elapsed, &mut clusters).await {
                 if log_event(e, &mut led) {
                     fast_poll_until = Instant::now() + Duration::from_secs(FAST_POLL_DURATION_SECS);
                 }
+            }
+
+            // Identify LED blink
+            identify_cluster.tick(tick_elapsed);
+            if identify_cluster.is_identifying() {
+                led.toggle();
             }
 
             // Device_annce retry
@@ -576,6 +595,7 @@ async fn main(_spawner: Spawner) {
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut press_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                 ];
                 #[cfg(not(feature = "sensor-bme280"))]
                 let mut clusters = [
@@ -583,6 +603,7 @@ async fn main(_spawner: Spawner) {
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                    ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                 ];
                 let _ = device.tick(0, &mut clusters).await;
                 if device.is_joined() {

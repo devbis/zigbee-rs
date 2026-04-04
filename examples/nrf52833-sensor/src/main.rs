@@ -33,6 +33,7 @@ use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::{ClusterRef, UserAction, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::BasicCluster;
 use zigbee_zcl::clusters::humidity::HumidityCluster;
+use zigbee_zcl::clusters::identify::IdentifyCluster;
 use zigbee_zcl::clusters::power_config::PowerConfigCluster;
 use zigbee_zcl::clusters::temperature::TemperatureCluster;
 
@@ -142,6 +143,7 @@ async fn main(_spawner: Spawner) {
     let mut hum_cluster = HumidityCluster::new(0, 10000);
 
     let mut power_cluster = PowerConfigCluster::new();
+    let mut identify_cluster = IdentifyCluster::new();
     power_cluster.set_battery_size(4);     // AAA
     power_cluster.set_battery_quantity(2); // 2× AAA
     power_cluster.set_battery_rated_voltage(15); // 1.5V per cell
@@ -162,6 +164,7 @@ async fn main(_spawner: Spawner) {
         .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
         .endpoint(1, PROFILE_HOME_AUTOMATION, 0x0302, |ep| {
             ep.cluster_server(0x0000) // Basic
+                .cluster_server(0x0003) // Identify
                 .cluster_server(0x0001) // Power Configuration
                 .cluster_server(0x0402) // Temperature Measurement
                 .cluster_server(0x0405) // Relative Humidity
@@ -185,6 +188,7 @@ async fn main(_spawner: Spawner) {
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                 ];
                 if let Some(event) = device.process_incoming(&indication, &mut clusters).await {
                     log_event(&event);
@@ -207,6 +211,7 @@ async fn main(_spawner: Spawner) {
                     ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                     ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                 ];
                 if let TickResult::Event(ref e) = device.tick(0, &mut clusters).await {
                     log_event(e);
@@ -257,6 +262,7 @@ async fn main(_spawner: Spawner) {
                         ClusterRef { endpoint: 1, cluster: &mut temp_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut hum_cluster },
                         ClusterRef { endpoint: 1, cluster: &mut power_cluster },
+                ClusterRef { endpoint: 1, cluster: &mut identify_cluster },
                     ]).await
                 {
                     log_event(e);
