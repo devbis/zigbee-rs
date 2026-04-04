@@ -327,8 +327,7 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
 ## Known Limitations
 
 - **CC2340 / Telink B91 / Telink TLSR8258** backends compile with stub FFI — real RF requires linking vendor SDK libraries (blocked by complex RTOS dependencies or proprietary toolchains)
-- **ESP32-H2** — builds and runs but NV flash storage is not yet implemented (network state is lost on reboot; device must re-pair after power cycle)
-- **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence
+- **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real)
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
 - **OTA** — full upgrade flow implemented (OTA cluster + OtaManager + FirmwareWriter trait) but not yet tested on real hardware

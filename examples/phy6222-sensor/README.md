@@ -77,8 +77,12 @@ pyocd flash -t phy6222 target/thumbv6m-none-eabi/release/phy6222-sensor
 - Proper interrupt vector table (32 entries for all PHY6222 peripherals)
 - No vendor dependencies — fully auditable, reproducible builds
 - Button-driven network join/leave with edge detection
-- RGB LED status indication
-- ZCL Temperature Measurement + Relative Humidity clusters
+- RGB LED status indication + identify blink
+- ZCL Temperature Measurement + Relative Humidity + Identify clusters
+- Flash NV storage — network state persists across reboots (shared `LogStructuredNv`)
+- NWK Leave handler — auto-erase NV + rejoin when coordinator sends Leave
+- Default reporting — temp/hum every 60–300s, battery every 300–3600s
+- Real battery voltage via ADC
 
 ## Project Structure
 
@@ -93,5 +97,6 @@ phy6222-sensor/
     ├── main.rs           # Entry point, device setup, sensor loop
     ├── time_driver.rs    # Embassy time driver (SysTick, 1ms tick, µs resolution)
     ├── vectors.rs        # Interrupt vector table + NVIC Interrupt enum
+    ├── flash_nv.rs       # Flash NV via shared LogStructuredNv<FlashDriver>
     └── stubs.rs          # CI stubs (not needed for real builds)
 ```
