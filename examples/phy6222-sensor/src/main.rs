@@ -77,21 +77,29 @@ async fn main(_spawner: Spawner) {
         cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::LlIrq);
     }
 
-    log::info!("[PHY6222] Zigbee Sensor starting (pure Rust!)");
+    let woke_from_sleep = phy6222_hal::sleep::was_sleep_reset();
+    if woke_from_sleep {
+        phy6222_hal::sleep::clear_sleep_flag();
+        log::info!("[PHY6222] Woke from system sleep — fast restore");
+    } else {
+        log::info!("[PHY6222] Zigbee Sensor starting (pure Rust!)");
+    }
 
     // GPIO init
     phy6222_hal::gpio::set_output(pins::LED_G);
     phy6222_hal::gpio::set_input(pins::BTN);
     led_off();
 
-    // Boot signal: triple blink
-    for _ in 0..3u8 {
-        led_on();
-        Timer::after(Duration::from_millis(100)).await;
-        led_off();
-        Timer::after(Duration::from_millis(100)).await;
+    // Boot signal: triple blink (skip on sleep wake for fast resume)
+    if !woke_from_sleep {
+        for _ in 0..3u8 {
+            led_on();
+            Timer::after(Duration::from_millis(100)).await;
+            led_off();
+            Timer::after(Duration::from_millis(100)).await;
+        }
+        Timer::after(Duration::from_millis(500)).await;
     }
-    Timer::after(Duration::from_millis(500)).await;
 
     // Radio + MAC
     let mac = Phy6222Mac::new();
@@ -274,10 +282,24 @@ async fn main(_spawner: Spawner) {
         }
         button_was_pressed = pressed;
 
-        // ── Sleep until next poll (radio off to save power) ──
-        device.mac_mut().radio_sleep();
-        Timer::after(Duration::from_millis(poll_ms)).await;
-        device.mac_mut().radio_wake();
+        // ── Sleep until next poll ──
+        if !in_fast_poll && device.is_joined() && poll_ms >= 5000 {
+            // Deep sleep: save state, enter AON system sleep (~3 µA)
+            device.mac_mut().radio_sleep();
+            device.save_state(&mut nv);
+            phy6222_hal::sleep::set_ram_retention(phy6222_hal::regs::RET_SRAM0);
+            phy6222_hal::sleep::config_rtc_wakeup(
+                phy6222_hal::sleep::ms_to_rtc_ticks(poll_ms as u32),
+            );
+            log::info!("[PHY6222] Entering system sleep ({}s)", poll_ms / 1000);
+            phy6222_hal::sleep::enter_system_sleep();
+            // never returns — chip reboots on wake
+        } else {
+            // Light sleep: radio off, CPU in WFE via embassy Timer
+            device.mac_mut().radio_sleep();
+            Timer::after(Duration::from_millis(poll_ms)).await;
+            device.mac_mut().radio_wake();
+        }
 
         // ── Poll parent for indirect frames (SED core) ──
         if device.is_joined() {

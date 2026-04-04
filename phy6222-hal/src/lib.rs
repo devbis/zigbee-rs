@@ -21,3 +21,4 @@ pub mod gpio;
 pub mod i2c;
 pub mod adc;
 pub mod flash;
+pub mod sleep;

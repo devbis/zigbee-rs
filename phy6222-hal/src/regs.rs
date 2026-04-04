@@ -81,11 +81,32 @@ pub const PCRM_ADC_CTL4: u32 = AP_PCRM_BASE + 0x40;
 
 // ── AON (always-on domain) ─────────────────────────────────────
 
+pub const AON_PWROFF: u32 = AP_AON_BASE + 0x00;
+pub const AON_PWRSLP: u32 = AP_AON_BASE + 0x04;
 pub const AON_IOCTL0: u32 = AP_AON_BASE + 0x08;
 pub const AON_IOCTL1: u32 = AP_AON_BASE + 0x0C;
 pub const AON_IOCTL2: u32 = AP_AON_BASE + 0x10;
 pub const AON_PMCTL0: u32 = AP_AON_BASE + 0x14;
+pub const AON_PMCTL1: u32 = AP_AON_BASE + 0x18;
+pub const AON_PMCTL2_0: u32 = AP_AON_BASE + 0x1C;
 pub const AON_PMCTL2_1: u32 = AP_AON_BASE + 0x20;
+pub const AON_RTCCTL: u32 = AP_AON_BASE + 0x24;
+pub const AON_RTCCNT: u32 = AP_AON_BASE + 0x28;
+pub const AON_RTCCC0: u32 = AP_AON_BASE + 0x2C;
+pub const AON_RTCFLAG: u32 = AP_AON_BASE + 0x38;
+pub const AON_SLEEP_R0: u32 = AP_AON_BASE + 0xC0;
+pub const AON_SLEEP_R1: u32 = AP_AON_BASE + 0xC4;
+pub const AON_SLEEP_R2: u32 = AP_AON_BASE + 0xC8;
+pub const AON_SLEEP_R3: u32 = AP_AON_BASE + 0xCC;
+
+// Sleep magic values
+pub const SYSTEM_OFF_MAGIC: u32 = 0x5A5A_A5A5;
+pub const SYSTEM_SLEEP_MAGIC: u32 = 0xA5A5_5A5A;
+
+// SRAM retention bank bits (PMCTL2_0[21:17])
+pub const RET_SRAM0: u32 = 1 << 0; // 32K: 0x1FFF0000–0x1FFF7FFF
+pub const RET_SRAM1: u32 = 1 << 1; // 16K: 0x1FFF8000–0x1FFFBFFF
+pub const RET_SRAM2: u32 = 1 << 2; // 16K: 0x1FFFC000–0x1FFFFFFF
 
 // ── Clock gating (AP_PCR->SW_CLK) ─────────────────────────────
 
