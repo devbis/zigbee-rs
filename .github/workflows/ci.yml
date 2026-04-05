@@ -103,6 +103,35 @@ jobs:
             examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor.bin
             examples/nrf52840-sensor/target/thumbv7em-none-eabihf/release/nrf52840-sensor.hex
 
+  build-nrf52840-router:
+    name: Build nRF52840 router
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: thumbv7em-none-eabihf
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/nrf52840-router
+      - name: Build nRF52840 router (release)
+        working-directory: examples/nrf52840-router
+        run: cargo build --release
+      - name: Create firmware artifacts
+        run: |
+          ELF=examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router
+          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          $OBJCOPY -O binary $ELF ${ELF}.bin
+          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+      - name: Upload nRF52840 router firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: nrf52840-router-firmware
+          path: |
+            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.bin
+            examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.hex
+
   build-nrf52833:
     name: Build nRF52833 sensor
     runs-on: ubuntu-latest

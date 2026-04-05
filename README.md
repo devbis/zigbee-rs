@@ -219,7 +219,7 @@ The build script links: `libdrivers_8258.a` from `$TELINK_SDK_DIR/platform/lib/`
 
 > **Legend:** ✅ = fully functional radio driver · ⚡ = compiles with stubs, needs vendor SDK for real RF · 🦀 = pure Rust (no FFI)
 
-All 10 firmware targets build in CI and produce downloadable artifacts.
+All 11 firmware targets build in CI and produce downloadable artifacts.
 
 ## ZCL Clusters (45)
 
@@ -252,7 +252,7 @@ Occupancy, Electrical, Carbon Dioxide, PM2.5, Soil Moisture
 - **Manual frame parsing** — no `serde`, bitfield encode/decode for all frame types
 - **Embassy-compatible** — designed for single-threaded async executors
 - **Layered crates** — each layer wraps the one below: `NwkLayer<M: MacDriver>`
-- **CI-enforced** — every push builds all 10 firmware targets + clippy + fmt + tests
+- **CI-enforced** — every push builds all 11 firmware targets + clippy + fmt + tests
 
 ## Project Structure
 
@@ -286,7 +286,8 @@ zigbee-rs/
 │   ├── nrf52840-sensor/       # nRF52840-DK (probe-rs) + BME280/SHT31 + flash NV
 │   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop, simple demo)
 │   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs)
-│   ├── nrf52840-bridge/       # nRF52840 coordinator bridge
+│   ├── nrf52840-router/       # nRF52840 Zigbee router (relay, permit join)
+│   ├── nrf52840-bridge/       # nRF52840 coordinator bridge (stub)
 │   ├── bl702-sensor/          # BL702 (requires vendor libs from Bouffalo SDK)
 │   ├── cc2340-sensor/         # TI CC2340R5 (stubs)
 │   ├── telink-b91-sensor/     # Telink B91 (stubs)
@@ -300,7 +301,7 @@ zigbee-rs/
 
 ## CI / Firmware Artifacts
 
-Every push builds **10 firmware targets** plus workspace checks:
+Every push builds **11 firmware targets** plus workspace checks:
 
 | Job | What it does |
 |-----|-------------|
@@ -309,7 +310,7 @@ Every push builds **10 firmware targets** plus workspace checks:
 | Clippy | `cargo clippy --workspace` |
 | Format | `cargo fmt --check` |
 | Doc | `cargo doc --workspace --no-deps` |
-| Build × 10 | Each platform produces a downloadable firmware artifact |
+| Build × 11 | Each platform produces a downloadable firmware artifact |
 | Deploy | Book + web flasher published to GitHub Pages |
 
 Download firmware artifacts from the [Actions tab](https://github.com/faronov/zigbee-rs/actions).
