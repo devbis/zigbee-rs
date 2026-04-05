@@ -33,6 +33,7 @@
 #![allow(async_fn_in_trait)]
 
 pub mod frames;
+pub mod indirect;
 pub mod neighbor;
 pub mod nib;
 pub mod nlde;
@@ -105,6 +106,15 @@ pub struct PendingRouteReply {
     pub route_request_id: u8,
 }
 
+/// A deferred RREQ rebroadcast (queued from sync handler, sent async).
+#[derive(Debug, Clone)]
+pub struct PendingRreqRebroadcast {
+    pub command_options: u8,
+    pub route_request_id: u8,
+    pub dst_addr: ShortAddress,
+    pub path_cost: u8,
+}
+
 /// // Discover networks
 /// let networks = nwk.nlme_network_discovery(ChannelMask::ALL_2_4GHZ, 3).await?;
 ///
@@ -116,6 +126,7 @@ pub struct NwkLayer<M: MacDriver> {
     nib: nib::Nib,
     neighbors: neighbor::NeighborTable,
     routing: routing::RoutingTable,
+    btr: routing::BtrTable,
     security: security::NwkSecurity,
     device_type: DeviceType,
     joined: bool,
@@ -125,6 +136,14 @@ pub struct NwkLayer<M: MacDriver> {
     rx_on_when_idle: bool,
     /// Pending route replies to be sent asynchronously.
     pending_route_replies: heapless::Vec<PendingRouteReply, 4>,
+    /// Pending RREQ rebroadcasts (queued from sync handler, sent async).
+    pending_rreq_rebroadcasts: heapless::Vec<PendingRreqRebroadcast, 4>,
+    /// Indirect frame queue for sleeping end device children.
+    indirect: indirect::IndirectQueue,
+    /// Link status periodic timer counter (seconds).
+    link_status_counter: u16,
+    /// Flag: link status should be sent in next async context.
+    link_status_due: bool,
 }
 
 impl<M: MacDriver> NwkLayer<M> {
@@ -137,11 +156,16 @@ impl<M: MacDriver> NwkLayer<M> {
             nib: nib::Nib::new(),
             neighbors: neighbor::NeighborTable::new(),
             routing: routing::RoutingTable::new(),
+            btr: routing::BtrTable::new(),
             security: security::NwkSecurity::new(),
             device_type,
             joined: false,
             rx_on_when_idle,
             pending_route_replies: heapless::Vec::new(),
+            pending_rreq_rebroadcasts: heapless::Vec::new(),
+            indirect: indirect::IndirectQueue::new(),
+            link_status_counter: 0,
+            link_status_due: false,
         }
     }
 
@@ -242,5 +266,44 @@ impl<M: MacDriver> NwkLayer<M> {
         let mut entry = neighbor::NeighborEntry::new_from_annce(nwk_addr, ieee_addr);
         entry.active = true;
         let _ = self.neighbors.add_or_update(entry);
+    }
+
+    /// Periodic router maintenance — call every second from the runtime tick.
+    ///
+    /// Ages BTR and indirect queues, triggers periodic link status broadcasts,
+    /// and expires stale routing entries.
+    pub fn tick_router_maintenance(&mut self, elapsed_secs: u16) {
+        // Age BTR entries
+        for _ in 0..elapsed_secs {
+            self.btr.age();
+            self.indirect.age();
+        }
+
+        // Age routing table entries
+        self.routing.age_tick();
+
+        // Periodic link status for routers/coordinators
+        if self.device_type != DeviceType::EndDevice && self.joined {
+            self.link_status_counter = self.link_status_counter.saturating_add(elapsed_secs);
+            if self.link_status_counter >= 15 {
+                self.link_status_counter = 0;
+                self.link_status_due = true;
+            }
+        }
+    }
+
+    /// Whether a link status broadcast is due (set by tick, cleared after send).
+    pub fn link_status_due(&self) -> bool {
+        self.link_status_due
+    }
+
+    /// Clear the link status due flag after sending.
+    pub fn clear_link_status_due(&mut self) {
+        self.link_status_due = false;
+    }
+
+    /// Read-only access to the indirect frame queue.
+    pub fn indirect_queue(&self) -> &indirect::IndirectQueue {
+        &self.indirect
     }
 }

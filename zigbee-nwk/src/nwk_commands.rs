@@ -212,10 +212,10 @@ impl<M: MacDriver> NwkLayer<M> {
             .await
     }
 
-    /// Drain and send all queued route replies.
+    /// Drain and send all queued route replies and RREQ rebroadcasts.
     ///
     /// Call this after `process_incoming_nwk_frame` returns so that
-    /// deferred RREPs (generated in sync command handlers) get
+    /// deferred RREPs and RREQs (generated in sync command handlers) get
     /// transmitted asynchronously.
     pub async fn process_pending_routing(&mut self) {
         while let Some(pending) = self.pending_route_replies.pop() {
@@ -240,6 +240,42 @@ impl<M: MacDriver> NwkLayer<M> {
                     pending.next_hop.0,
                     e
                 );
+            }
+        }
+
+        // Drain RREQ rebroadcasts
+        while let Some(pending) = self.pending_rreq_rebroadcasts.pop() {
+            let rreq = RouteRequest {
+                command_options: pending.command_options,
+                route_request_id: pending.route_request_id,
+                dst_addr: pending.dst_addr,
+                path_cost: pending.path_cost,
+                dst_ieee: None,
+            };
+            let mut payload = [0u8; 16];
+            let len = rreq.serialize(&mut payload);
+
+            if let Err(e) = self
+                .send_nwk_command(
+                    ShortAddress::BROADCAST,
+                    NwkCommandId::RouteRequest,
+                    &payload[..len],
+                )
+                .await
+            {
+                log::warn!(
+                    "[NWK] Failed to rebroadcast RREQ for 0x{:04X}: {:?}",
+                    pending.dst_addr.0,
+                    e
+                );
+            }
+        }
+
+        // Send link status if due
+        if self.link_status_due {
+            self.link_status_due = false;
+            if let Err(e) = self.send_link_status().await {
+                log::warn!("[NWK] Failed to send periodic link status: {:?}", e);
             }
         }
     }

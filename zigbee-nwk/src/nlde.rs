@@ -214,9 +214,22 @@ impl<M: MacDriver> NwkLayer<M> {
 
         let dst = header.dst_addr;
         let src = header.src_addr;
-        let is_for_us = dst == self.nib.network_address
-            || dst == ShortAddress::BROADCAST
-            || dst == ShortAddress(0xFFFF);
+        let is_broadcast = dst.0 >= 0xFFF8;
+        let is_for_us = dst == self.nib.network_address || is_broadcast;
+
+        // ── Broadcast deduplication (BTR) ──
+        if is_broadcast && self.device_type != DeviceType::EndDevice {
+            if self.btr.is_duplicate(src, header.seq_number) {
+                log::debug!("[NWK] BTR dup: src=0x{:04X} seq={}", src.0, header.seq_number);
+                return None;
+            }
+            self.btr.record(src, header.seq_number);
+        }
+
+        // ── Broadcast relay (routers/coordinators rebroadcast) ──
+        if is_broadcast && self.device_type != DeviceType::EndDevice && header.radius > 1 {
+            let _ = self.relay_broadcast(mac_payload, &header).await;
+        }
 
         if is_for_us {
             if header.frame_control.security {
@@ -311,7 +324,7 @@ impl<M: MacDriver> NwkLayer<M> {
             }));
         }
 
-        // Not for us — relay if router/coordinator
+        // Not for us — relay unicast if router/coordinator
         if self.device_type != DeviceType::EndDevice && header.radius > 1 {
             let _ = self.relay_frame(mac_payload, &header).await;
         }
@@ -329,6 +342,33 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Determine next hop for the final destination
         let next_hop = self.resolve_next_hop(header.dst_addr)?;
+
+        // Check if next hop is a sleepy child — buffer in indirect queue
+        if let Some(neighbor) = self.neighbors.find_by_short(next_hop) {
+            if !neighbor.rx_on_when_idle {
+                // Sleepy child — buffer for indirect delivery
+                let mut relay_buf = [0u8; 128];
+                let mut new_header = header.clone();
+                new_header.radius = new_radius;
+                let hdr_len = new_header.serialize(&mut relay_buf);
+                let (_, orig_hdr_len) = match NwkHeader::parse(original) {
+                    Some(parsed) => parsed,
+                    None => return Err(NwkStatus::InvalidParameter),
+                };
+                let payload = &original[orig_hdr_len..];
+                if hdr_len + payload.len() > relay_buf.len() {
+                    return Err(NwkStatus::FrameTooLong);
+                }
+                relay_buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
+                let total = hdr_len + payload.len();
+                if self.indirect.enqueue(next_hop, &relay_buf[..total]) {
+                    log::debug!("[NWK] Buffered indirect frame for sleepy child 0x{:04X}", next_hop.0);
+                    return Ok(());
+                }
+                log::warn!("[NWK] Indirect queue full for 0x{:04X}", next_hop.0);
+                return Err(NwkStatus::FrameNotBuffered);
+            }
+        }
 
         // Rebuild frame with decremented radius
         let mut relay_buf = [0u8; 128];
@@ -358,8 +398,52 @@ impl<M: MacDriver> NwkLayer<M> {
                 payload: &relay_buf[..total],
                 msdu_handle: self.nib.next_seq(),
                 tx_options: TxOptions {
-                    // Fix 9: No MAC ACK for broadcast
                     ack_tx: next_hop.0 != 0xFFFF,
+                    ..Default::default()
+                },
+            })
+            .await
+            .map_err(|_| NwkStatus::RouteError)?;
+
+        Ok(())
+    }
+
+    /// Relay a broadcast NWK frame via MAC broadcast with decremented radius.
+    async fn relay_broadcast(&mut self, original: &[u8], header: &NwkHeader) -> Result<(), NwkStatus> {
+        let new_radius = header.radius.saturating_sub(1);
+        if new_radius == 0 {
+            return Ok(());
+        }
+
+        let mut relay_buf = [0u8; 128];
+        let mut new_header = header.clone();
+        new_header.radius = new_radius;
+        let hdr_len = new_header.serialize(&mut relay_buf);
+
+        let (_, orig_hdr_len) = match NwkHeader::parse(original) {
+            Some(parsed) => parsed,
+            None => return Err(NwkStatus::InvalidParameter),
+        };
+        let payload = &original[orig_hdr_len..];
+        if hdr_len + payload.len() > relay_buf.len() {
+            return Err(NwkStatus::FrameTooLong);
+        }
+        relay_buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
+        let total = hdr_len + payload.len();
+
+        log::debug!(
+            "[NWK] Relaying broadcast from 0x{:04X} (radius {} → {})",
+            header.src_addr.0, header.radius, new_radius
+        );
+
+        self.mac
+            .mcps_data(McpsDataRequest {
+                src_addr_mode: AddressMode::Short,
+                dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
+                payload: &relay_buf[..total],
+                msdu_handle: self.nib.next_seq(),
+                tx_options: TxOptions {
+                    ack_tx: false, // No ACK for broadcast
                     ..Default::default()
                 },
             })
@@ -565,6 +649,14 @@ impl<M: MacDriver> NwkLayer<M> {
                 rreq.dst_addr.0,
                 new_cost
             );
+
+            // Queue RREQ rebroadcast (async send happens in process_pending_routing)
+            let _ = self.pending_rreq_rebroadcasts.push(crate::PendingRreqRebroadcast {
+                command_options: rreq.command_options,
+                route_request_id: rreq.route_request_id,
+                dst_addr: rreq.dst_addr,
+                path_cost: new_cost,
+            });
         }
     }
 

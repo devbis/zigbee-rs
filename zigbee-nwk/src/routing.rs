@@ -336,3 +336,82 @@ impl Default for RoutingTable {
         Self::new()
     }
 }
+
+// ── Broadcast Transaction Record ──────────────────────────────
+
+/// Maximum BTR entries for broadcast deduplication
+pub const MAX_BTR: usize = 16;
+
+/// Broadcast Transaction Record — tracks seen broadcasts to prevent storms.
+/// Spec: Table 3-68.
+#[derive(Debug, Clone)]
+pub struct BtrEntry {
+    pub src_addr: ShortAddress,
+    pub seq_number: u8,
+    /// Remaining lifetime in seconds (spec default: 9s = nwkNetworkBroadcastDeliveryTime)
+    pub expiry: u8,
+    pub active: bool,
+}
+
+impl BtrEntry {
+    fn empty() -> Self {
+        Self { src_addr: ShortAddress(0xFFFF), seq_number: 0, expiry: 0, active: false }
+    }
+}
+
+/// BTR table for broadcast relay deduplication.
+pub struct BtrTable {
+    entries: [BtrEntry; MAX_BTR],
+}
+
+impl BtrTable {
+    pub fn new() -> Self {
+        Self { entries: core::array::from_fn(|_| BtrEntry::empty()) }
+    }
+
+    /// Check if this broadcast was already seen. Returns true if duplicate.
+    pub fn is_duplicate(&self, src: ShortAddress, seq: u8) -> bool {
+        self.entries.iter().any(|e| e.active && e.src_addr == src && e.seq_number == seq)
+    }
+
+    /// Record a broadcast (must call after is_duplicate check).
+    pub fn record(&mut self, src: ShortAddress, seq: u8) {
+        // Find empty slot first
+        let mut target_idx = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            if !e.active {
+                target_idx = Some(i);
+                break;
+            }
+        }
+        // No empty slot — evict oldest (lowest expiry)
+        if target_idx.is_none() {
+            let mut min_expiry = u8::MAX;
+            for (i, e) in self.entries.iter().enumerate() {
+                if e.expiry < min_expiry {
+                    min_expiry = e.expiry;
+                    target_idx = Some(i);
+                }
+            }
+        }
+        if let Some(idx) = target_idx {
+            self.entries[idx] = BtrEntry { src_addr: src, seq_number: seq, expiry: 9, active: true };
+        }
+    }
+
+    /// Age entries. Call every second.
+    pub fn age(&mut self) {
+        for e in self.entries.iter_mut() {
+            if e.active {
+                e.expiry = e.expiry.saturating_sub(1);
+                if e.expiry == 0 { e.active = false; }
+            }
+        }
+    }
+}
+
+impl Default for BtrTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -202,6 +202,14 @@ impl<M: MacDriver> crate::ZigbeeDevice<M> {
             aps.fragment_rx_mut().age_entries();
         }
 
+        // Phase 4b: NWK router maintenance — BTR aging, link status, routing expiry
+        {
+            let nwk = self.bdb.zdo_mut().aps_mut().nwk_mut();
+            nwk.tick_router_maintenance(elapsed_secs);
+            // Send link status if due (async operation)
+            nwk.process_pending_routing().await;
+        }
+
         // Phase 5: Tick the reporting engine timers
         self.reporting.tick(elapsed_secs);
 
