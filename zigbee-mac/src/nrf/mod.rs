@@ -140,6 +140,47 @@ impl<'a, T: Instance> NrfMac<'a, T> {
         self.radio.set_transmission_power(dbm);
     }
 
+    /// Disable the radio to save power between poll cycles.
+    ///
+    /// Writes TASKS_DISABLE and waits for DISABLED state.
+    /// Saves ~4-8 mA (radio RX/idle current). Call `radio_wake()` before
+    /// the next TX/RX operation.
+    pub fn radio_sleep(&mut self) {
+        const RADIO_BASE: u32 = 0x4000_1000;
+        const TASKS_DISABLE: u32 = RADIO_BASE + 0x010;
+        const EVENTS_DISABLED: u32 = RADIO_BASE + 0x110;
+        const STATE: u32 = RADIO_BASE + 0x550;
+
+        unsafe {
+            // Check if already disabled
+            let state = core::ptr::read_volatile(STATE as *const u32);
+            if state == 0 { return; } // 0 = DISABLED
+
+            // Clear event
+            core::ptr::write_volatile(EVENTS_DISABLED as *mut u32, 0);
+            // Trigger disable
+            core::ptr::write_volatile(TASKS_DISABLE as *mut u32, 1);
+            // Wait for disabled state (should be fast, <10µs)
+            for _ in 0..10_000u32 {
+                if core::ptr::read_volatile(EVENTS_DISABLED as *const u32) != 0 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Re-enable the radio after `radio_sleep()`.
+    ///
+    /// The radio peripheral is already powered — just needs the next TX/RX
+    /// operation to transition from DISABLED → TXRU/RXRU. No explicit
+    /// wake needed; the embassy radio driver handles this automatically.
+    pub fn radio_wake(&mut self) {
+        // Nothing to do — embassy Radio handles DISABLED→RX/TX transitions
+        // in try_send() and receive(). Just re-apply channel in case it was lost.
+        self.radio.set_channel(self.channel);
+    }
+
     /// Configure hardware address filtering on the radio.
     ///
     /// The nRF52840 RADIO peripheral supports automatic MHR (MAC Header) matching

@@ -356,7 +356,8 @@ async fn main(_spawner: Spawner) {
             was_fast_polling = true;
         }
 
-        // ── Sleep with button check ──
+        // ── Sleep with radio off (button or timer wake) ──
+        device.mac_mut().radio_sleep();
         match select(
             button.wait_for_falling_edge(),
             Timer::after(Duration::from_millis(poll_ms)),
@@ -436,6 +437,7 @@ async fn main(_spawner: Spawner) {
             }
             Either::Second(_) => {} // Normal timeout — proceed to poll
         }
+        device.mac_mut().radio_wake();
 
         // ── Poll parent for indirect frames (SED core) ──
         if device.is_joined() {

@@ -340,9 +340,8 @@ async fn main(_spawner: Spawner) {
             was_fast_polling = true;
         }
 
-        // ── Step 1: Sleep until next poll ──
-        // Single Timer per iteration — avoids rapid create/drop that panics embassy.
-        // During sleep, check button via select (only 2 futures, not 3).
+        // ── Step 1: Sleep with radio off until next poll ──
+        device.mac_mut().radio_sleep();
         if let Some(ref mut btn) = button {
             match select(
                 btn.wait_for_falling_edge(),
@@ -389,6 +388,7 @@ async fn main(_spawner: Spawner) {
             // No button — just sleep
             Timer::after(Duration::from_millis(poll_ms)).await;
         }
+        device.mac_mut().radio_wake();
 
         // ── Step 2: Poll parent for indirect frames (SED core) ──
         if device.is_joined() {
