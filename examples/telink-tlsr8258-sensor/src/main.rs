@@ -47,9 +47,9 @@ use zigbee_zcl::clusters::temperature::TemperatureCluster;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
 
-const REPORT_INTERVAL_SECS: u64 = 30;
+const REPORT_INTERVAL_SECS: u64 = 60;
 const FAST_POLL_MS: u64 = 250;
-const SLOW_POLL_SECS: u64 = 10;
+const SLOW_POLL_SECS: u64 = 30;
 const FAST_POLL_DURATION_SECS: u64 = 120;
 const EXPECTED_REPORT_CLUSTERS: usize = 3;
 
@@ -318,7 +318,10 @@ async fn main(_spawner: Spawner) {
         }
         button_was_pressed = pressed;
 
+        // Sleep with radio off to save power
+        device.mac_mut().radio_sleep();
         Timer::after(Duration::from_millis(poll_ms)).await;
+        device.mac_mut().radio_wake();
 
         if device.is_joined() {
             // Poll parent for indirect frames

@@ -620,6 +620,37 @@ impl TelinkDriver {
     pub fn disable_rx(&self) {
         set_trx_state(RF_STATE_OFF);
     }
+
+    /// Power down the radio to save battery between poll cycles.
+    ///
+    /// Disables RF, DMA channels, and RF IRQs. Saves ~5-8 mA.
+    /// Call `radio_wake()` before next TX/RX.
+    pub fn radio_sleep(&self) {
+        // Disable radio
+        set_trx_state(RF_STATE_OFF);
+        // Disable RF DMA channels
+        let dma_en = reg_read_u8(REG_DMA_CHN_EN);
+        reg_write_u8(REG_DMA_CHN_EN, dma_en & !(DMA_CHN_RF_RX | DMA_CHN_RF_TX));
+        // Disable RF IRQs
+        reg_write_u16(REG_RF_IRQ_MASK, 0);
+    }
+
+    /// Re-enable the radio after `radio_sleep()`.
+    ///
+    /// Restores DMA channels, IRQ mask, and re-applies channel.
+    pub fn radio_wake(&mut self) {
+        // Re-enable RF DMA channels
+        let dma_en = reg_read_u8(REG_DMA_CHN_EN);
+        reg_write_u8(REG_DMA_CHN_EN, dma_en | DMA_CHN_RF_RX | DMA_CHN_RF_TX);
+        // Re-enable TX+RX IRQs
+        reg_write_u16(REG_RF_IRQ_MASK, FLD_RF_IRQ_TX | FLD_RF_IRQ_RX);
+        // Re-apply channel
+        set_channel(self.config.channel);
+        // Set RX buffer
+        set_rx_buf(core::ptr::addr_of!(RF_RX_DMA_BUF) as *mut u8);
+        // Back to RX mode
+        set_trx_state(RF_STATE_RX);
+    }
 }
 
 // ── IRQ handler implementations ─────────────────────────────────

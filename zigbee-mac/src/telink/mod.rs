@@ -161,6 +161,17 @@ impl TelinkMac {
         seq
     }
 
+    /// Power down the radio to save battery between poll cycles.
+    /// Saves ~5-8 mA. Call `radio_wake()` before next TX/RX.
+    pub fn radio_sleep(&self) {
+        self.driver.radio_sleep();
+    }
+
+    /// Re-enable the radio after `radio_sleep()`.
+    pub fn radio_wake(&mut self) {
+        self.driver.radio_wake();
+    }
+
     #[allow(dead_code)]
     fn next_bsn(&mut self) -> u8 {
         let seq = self.bsn;
