@@ -85,3 +85,7 @@ efr32 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]
 
+efr32mg21 = [
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+]
+

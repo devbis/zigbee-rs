@@ -436,6 +436,35 @@ jobs:
             examples/efr32mg1-sensor/target/thumbv7em-none-eabihf/release/efr32mg1-sensor.bin
             examples/efr32mg1-sensor/target/thumbv7em-none-eabihf/release/efr32mg1-sensor.hex
 
+  build-efr32mg21:
+    name: Build EFR32MG21 sensor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: thumbv8m.main-none-eabihf
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/efr32mg21-sensor
+      - name: Build EFR32MG21 sensor (release)
+        working-directory: examples/efr32mg21-sensor
+        run: cargo build --release
+      - name: Create firmware artifacts
+        run: |
+          ELF=examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor
+          OBJCOPY=$(find $(rustc --print sysroot) -name llvm-objcopy | head -1)
+          $OBJCOPY -O binary $ELF ${ELF}.bin
+          $OBJCOPY -O ihex   $ELF ${ELF}.hex
+      - name: Upload EFR32MG21 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: efr32mg21-sensor-firmware
+          path: |
+            examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.bin
+            examples/efr32mg21-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg21-sensor.hex
+
   # ── Deploy Book + Web Flasher to GitHub Pages ────────────────
   # Builds the mdBook documentation and bundles it with the
   # ESP web flasher and latest firmware binaries.
