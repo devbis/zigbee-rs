@@ -5,7 +5,7 @@ A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
 Embassy and other embedded async runtimes.
 
 ```text
-58,000+ lines of Rust · 183 source files · 9 crates · 45 ZCL clusters · 10 hardware platforms · 270 tests · 2 pure-Rust radios · NV storage on nRF + ESP32-C6
+58,000+ lines of Rust · 183 source files · 9 crates · 45 ZCL clusters · 11 hardware platforms · 270 tests · 3 pure-Rust radios · NV storage on nRF + ESP32-C6
 ```
 
 ## Architecture
@@ -30,7 +30,7 @@ Embassy and other embedded async runtimes.
 │      frames · routing (AODV+tree) · security · NIB   │
 ├──────────────────────────────────────────────────────┤
 │                    zigbee-mac                          │
-│  MacDriver trait · 10 backends (see table below)     │
+│  MacDriver trait · 11 backends (see table below)     │
 ├──────────────────────────────────────────────────────┤
 │                   zigbee-types                         │
 │     IeeeAddress · ShortAddress · PanId · Channel     │
@@ -235,10 +235,12 @@ The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258
 | **Telink B91** | ⚡ Telink FFI | `riscv32imac-unknown-none-elf` | Telink SDK stubs |
 | **Telink TLSR8258** | 🦀 **Pure Rust** | `tc32-unknown-none-elf` | [modern-tc32](https://github.com/modern-tc32) toolchain for real builds; `thumbv6m` for CI |
 | **PHY6222** | 🦀 **Pure Rust** | `thumbv6m-none-eabi` | Zero vendor blobs — direct register access! |
+| **EFR32MG1** | 🦀 **Pure Rust** | `thumbv7em-none-eabihf` | Series 1, Cortex-M4F — direct register access! |
+| **EFR32MG21** | 🦀 **Pure Rust** | `thumbv8m.main-none-eabihf` | Series 2, Cortex-M33 — independent `efr32s2` module |
 
 > **Legend:** ✅ = fully functional radio driver · ⚡ = compiles with stubs, needs vendor SDK for real RF · 🦀 = pure Rust (no FFI, no vendor blobs)
 
-All 11 firmware targets build in CI and produce downloadable artifacts.
+All 13 firmware targets build in CI and produce downloadable artifacts.
 
 ## ZCL Clusters (45)
 
@@ -266,14 +268,14 @@ Occupancy, Electrical, Carbon Dioxide, PM2.5, Soil Moisture
 
 - **`#![no_std]`** everywhere — no heap allocation, `heapless` for bounded collections
 - **`async` MacDriver trait** — 13 methods, no `Send`/`Sync` requirement
-- **Platform-agnostic** — same stack code runs on mock, ESP32, nRF, BL702, CC2340, Telink, PHY6222
+- **Platform-agnostic** — same stack code runs on mock, ESP32, nRF, BL702, CC2340, Telink, PHY6222, EFR32
 - **Power-aware** — two-phase polling (fast/slow), DC-DC, TX power reduction, radio sleep, CPU suspend, system sleep, flash deep power-down, GPIO preparation, reportable change thresholds
-- **Two pure-Rust radios** — PHY6222 and TLSR8258 need zero vendor blobs
+- **Three pure-Rust radios** — PHY6222, TLSR8258, and EFR32 (MG1 + MG21) need zero vendor blobs
 - **Router support** — full relay, RREQ rebroadcast, Link Status, indirect queue, source routing
 - **Manual frame parsing** — no `serde`, bitfield encode/decode for all frame types
 - **Embassy-compatible** — designed for single-threaded async executors
 - **Layered crates** — each layer wraps the one below: `NwkLayer<M: MacDriver>`
-- **CI-enforced** — every push builds all 11 firmware targets + clippy + fmt + tests
+- **CI-enforced** — every push builds all 13 firmware targets + clippy + fmt + tests
 
 ## Project Structure
 
@@ -288,7 +290,9 @@ zigbee-rs/
 │       ├── bl702/             # BL702 (lmac154 FFI)
 │       ├── cc2340/            # CC2340 (ZBOSS FFI stubs)
 │       ├── telink/            # Telink B91 (FFI stubs) + TLSR8258 (pure Rust!)
-│       └── phy6222/           # PHY6222 (pure Rust radio driver!)
+│       ├── phy6222/           # PHY6222 (pure Rust radio driver!)
+│       ├── efr32/             # EFR32MG1 (pure Rust radio driver!)
+│       └── efr32s2/           # EFR32MG21 Series 2 (pure Rust radio driver!)
 ├── zigbee-nwk/                # Network layer (routing, security, router relay)
 ├── zigbee-aps/                # Application Support (binding, groups)
 ├── zigbee-zdo/                # Device Objects (discovery, mgmt)
@@ -313,7 +317,9 @@ zigbee-rs/
 │   ├── cc2340-sensor/         # TI CC2340R5 (stubs)
 │   ├── telink-b91-sensor/     # Telink B91 (requires vendor libs or stubs)
 │   ├── telink-tlsr8258-sensor/# Telink TLSR8258 — pure Rust, no vendor SDK!
-│   └── phy6222-sensor/        # PHY6222 — pure Rust, no vendor SDK!
+│   ├── phy6222-sensor/        # PHY6222 — pure Rust, no vendor SDK!
+│   ├── efr32mg1-sensor/       # EFR32MG1P — pure Rust, Series 1 Cortex-M4F!
+│   └── efr32mg21-sensor/      # EFR32MG21 — pure Rust, Series 2 Cortex-M33!
 ├── docs/
 │   ├── book/                  # mdBook source → GitHub Pages
 │   └── flasher/               # ESP web flasher (GitHub Pages)
@@ -322,7 +328,7 @@ zigbee-rs/
 
 ## CI / Firmware Artifacts
 
-Every push builds **11 firmware targets** plus workspace checks:
+Every push builds **13 firmware targets** plus workspace checks:
 
 | Job | What it does |
 |-----|-------------|
@@ -331,7 +337,7 @@ Every push builds **11 firmware targets** plus workspace checks:
 | Clippy | `cargo clippy --workspace` |
 | Format | `cargo fmt --check` |
 | Doc | `cargo doc --workspace --no-deps` |
-| Build × 11 | Each platform produces a downloadable firmware artifact |
+| Build × 13 | Each platform produces a downloadable firmware artifact |
 | Deploy | Book + web flasher published to GitHub Pages |
 
 Download firmware artifacts from the [Actions tab](https://github.com/faronov/zigbee-rs/actions).
