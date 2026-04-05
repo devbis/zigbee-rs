@@ -1,0 +1,84 @@
+name: Build TLSR8258 (TC32 real firmware)
+
+# This workflow builds real tc32-unknown-none-elf firmware for the TLSR8258
+# using the modern-tc32 Rust toolchain. It runs separately from the main CI
+# because it requires the custom TC32 toolchain.
+#
+# Triggers:
+# - Manual dispatch (workflow_dispatch)
+# - When the TC32 toolchain is available as a release/artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      tc32_toolchain_run_id:
+        description: 'Run ID from modern-tc32/rust build (default: latest)'
+        required: false
+        default: '24006473891'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-tlsr8258-tc32:
+    name: Build TLSR8258 real firmware (tc32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download TC32 toolchain artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tc32-rust-toolchain-linux-amd64
+          repository: modern-tc32/rust
+          run-id: ${{ inputs.tc32_toolchain_run_id }}
+          github-token: ${{ secrets.TC32_REPO_TOKEN }}
+          path: tc32-artifact
+
+      - name: Unpack TC32 toolchain
+        run: |
+          mkdir -p $HOME/tc32-stage1
+          tar -xzf tc32-artifact/tc32-rust-toolchain-linux-amd64.tar.gz -C $HOME/
+          # The tarball extracts to tc32-stage1-x86_64-unknown-linux-gnu/
+          ln -sf $HOME/tc32-stage1-x86_64-unknown-linux-gnu $HOME/tc32-stage1
+          echo "TC32_TOOLCHAIN=$HOME/tc32-stage1" >> $GITHUB_ENV
+          echo "TC32_LLVM_BIN=$HOME/tc32-stage1/llvm/bin" >> $GITHUB_ENV
+
+      - name: Clone Telink Zigbee SDK
+        run: |
+          git clone --depth 1 https://github.com/telink-semi/tl_zigbee_sdk.git $HOME/tl_zigbee_sdk
+          echo "TC32_SDK_DIR=$HOME/tl_zigbee_sdk" >> $GITHUB_ENV
+
+      - name: Verify TC32 toolchain
+        run: |
+          $TC32_TOOLCHAIN/bin/rustc --version
+          $TC32_TOOLCHAIN/bin/rustc --print target-list | grep tc32
+          $TC32_TOOLCHAIN/llvm/bin/clang --version
+          echo "TC32 toolchain ready"
+
+      - name: Build TLSR8258 sensor (real tc32 firmware)
+        working-directory: examples/telink-tlsr8258-sensor
+        run: |
+          $TC32_TOOLCHAIN/bin/cargo build --release
+          echo "=== Build successful ==="
+          ls -la target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
+
+      - name: Create firmware binary
+        run: |
+          ELF=examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor
+          $TC32_LLVM_BIN/llvm-objcopy -O binary $ELF ${ELF}.bin
+          echo "=== Firmware sizes ==="
+          ls -la ${ELF} ${ELF}.bin
+
+      - name: Upload TLSR8258 real firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlsr8258-tc32-firmware
+          path: |
+            examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin
+
