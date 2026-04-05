@@ -157,7 +157,8 @@ actual sleep/wake is performed by the MAC backend:
 | Platform | Light Sleep | Deep Sleep |
 |----------|-----------|------------|
 | ESP32-C6/H2 | `esp_light_sleep_start()` | `esp_deep_sleep()` — only RTC memory retained |
-| nRF52840 | `__WFE` (System ON, RAM retained) | System OFF (wake via GPIO/RTC) |
+| nRF52840 | `TASKS_DISABLE` + `__WFE` (System ON, RAM retained) | System OFF (wake via GPIO/RTC) |
+| TLSR8258 | `radio_sleep()` + WFI (~1.5 mA) | CPU suspend (~3 µA, timer wake, RAM retained) |
 | PHY6222 | `radio_sleep()` + WFE (~1.5 mA) | AON system sleep (~3 µA, RTC wake) |
 | BL702 | PDS (Power Down Sleep) | HBN (Hibernate) — wake via RTC |
 
@@ -236,6 +237,74 @@ powered off.
 - Fast poll: 250 ms for 120 seconds after joining/activity (responsive)
 - Slow poll: 30 seconds during steady state (low power)
 - Report interval: 60 seconds
+
+**Radio sleep** — Between polls, the radio is disabled via `TASKS_DISABLE`
+register write and the state machine waits for `DISABLED`. This saves ~4-8 mA
+of radio idle current. Before the next TX/RX, `radio_wake()` re-applies the
+channel setting and re-enables the radio:
+
+```rust
+device.mac_mut().radio_sleep();
+Timer::after(Duration::from_millis(poll_ms)).await;
+device.mac_mut().radio_wake();
+```
+
+### TLSR8258
+
+The TLSR8258 sensor implements a **two-tier sleep architecture** similar to
+the PHY6222, using the pure-Rust radio driver's built-in power management.
+
+**Tier 1 — Light sleep (fast poll, ~1.5 mA):**
+During fast polling (first 120 seconds after join/activity), the radio
+transceiver is disabled between polls and the CPU enters WFI. The radio
+driver disables RF, DMA channels, and RF IRQs to minimize current:
+
+```rust
+device.mac_mut().radio_sleep();   // disable RF + DMA + IRQ (~5-8 mA saved)
+Timer::after(Duration::from_millis(poll_ms)).await;
+device.mac_mut().radio_wake();    // re-enable, re-apply channel
+```
+
+**Tier 2 — CPU suspend (slow poll, ~3 µA):**
+During slow polling (30-second intervals), the device enters tc32 CPU suspend
+mode. Unlike PHY6222's system sleep (which reboots), TLSR8258 suspend mode
+retains all RAM and resumes execution in-place when the system timer fires:
+
+```rust
+// Radio is already sleeping from radio_sleep()
+// Enter CPU suspend with timer wake
+driver.cpu_suspend_ms(poll_ms);
+// CPU resumes here — RAM intact, no reboot
+driver.radio_wake();
+```
+
+The suspend mode uses direct register access:
+- System timer wake compare register sets the wake time
+- Wake source enable register selects timer wake
+- Power-down control register enters suspend (`BIT(7)`)
+
+**Power registers used:**
+
+| Register | Address | Purpose |
+|----------|---------|---------|
+| `REG_TMR_WKUP` | `0x740 + 0x08` | Timer compare for wake |
+| `REG_WAKEUP_EN` | `0x6E` | Wake source enable (timer, PAD, etc.) |
+| `REG_PWDN_CTRL` | `0x6F` | Suspend/deep-sleep entry (BIT 7) |
+
+**Battery life estimate (TLSR8258, CR2032, 230 mAh):**
+
+| State | Current | Duty Cycle | Average |
+|-------|---------|------------|---------|
+| CPU suspend (radio off, RAM retained) | ~3 µA | ~99.8% | ~3.0 µA |
+| Radio RX (poll) | ~8 mA | ~0.03% (10 ms / 30 s) | ~2.7 µA |
+| Radio TX (report) | ~10 mA | ~0.005% (3 ms / 60 s) | ~0.5 µA |
+| Fast poll phase (WFI, ~1.5 mA) | ~1.5 mA | ~1.5% (120 s / 2 hr) | ~22 µA |
+| **Total average (steady state)** | | | **~6 µA** |
+| **Estimated battery life (CR2032)** | | | **~4+ years** |
+
+> CPU suspend preserves all RAM, so no NV save/restore is needed between
+> sleep cycles. This is a significant advantage over the PHY6222, which
+> reboots from system sleep and requires full state restoration.
 
 ### PHY6222
 

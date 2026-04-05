@@ -106,6 +106,13 @@ cargo build --release --no-default-features --features board-nrf-dongle  # PCA10
 cargo build --release --no-default-features --features board-nrf-dk      # DK (J-Link)
 ```
 
+### nRF52840 Router
+
+```bash
+cd examples/nrf52840-router
+cargo build --release
+```
+
 ### nRF52840 Bridge (coordinator)
 
 ```bash
@@ -133,6 +140,10 @@ From `.github/workflows/ci.yml`:
 ```bash
 # nRF52840 sensor
 cd examples/nrf52840-sensor
+cargo build --release
+
+# nRF52840 router
+cd examples/nrf52840-router
 cargo build --release
 
 # nRF52833 sensor
@@ -289,6 +300,8 @@ match select3(
 
 ## Power Optimization
 
+### Sensor (End Device)
+
 The nRF52840 sensor example includes several hardware-level power optimizations
 that bring the average current draw down to ~5 µA. See the
 [Power Management](../advanced/power.md) chapter for full details.
@@ -343,6 +356,19 @@ battery). This suppresses unnecessary transmissions in stable environments.
 
 Unused RAM banks are powered down at startup, saving ~190 KB of unpowered SRAM.
 This was already implemented in earlier versions.
+
+### Radio Sleep
+
+Between polls, the radio is disabled via `TASKS_DISABLE` register write,
+saving ~4-8 mA of radio RX/idle current. The `radio_wake()` method re-applies
+the channel setting and re-enables the radio before the next TX/RX operation.
+
+### Router (Always-On)
+
+The nRF52840 router uses `PowerMode::AlwaysOn` — the radio is always on since
+routers must relay frames continuously. DC-DC converters are still enabled for
+lower power, but no sleep logic is applied. Typical current draw with DC-DC
+enabled is ~5-7 mA (radio RX idle).
 
 ---
 
@@ -402,6 +428,19 @@ This variant auto-joins on boot (no button press needed) and includes a
 ### nrf52840-bridge
 
 A coordinator/bridge example that exposes the Zigbee network over USB serial.
+
+### nrf52840-router
+
+A Zigbee 3.0 router that extends network range. Key differences from the
+sensor examples:
+
+- **Device type:** Router (FFD) instead of End Device
+- **Power mode:** `AlwaysOn` — radio is never turned off
+- **Frame relay:** Relays unicast, broadcast, and indirect frames
+- **Child management:** Accepts end device joins, buffers frames for sleepy children
+- **Link Status:** Sends periodic broadcasts (every 15 seconds)
+- **RREQ rebroadcast:** Participates in AODV route discovery
+- **LEDs:** LED1 = joined status, LED2 = blink on frame relay
 
 ## Troubleshooting
 

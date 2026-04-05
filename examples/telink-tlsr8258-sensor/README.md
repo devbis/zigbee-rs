@@ -84,6 +84,10 @@ TelinkBDT --chip 8258 --firmware target/tc32-unknown-none-elf/release/telink-tls
 - Default reporting with change thresholds
 - IEEE 802.15.4 radio via pure-Rust register access (no vendor C library)
 - Button-driven join/leave with factory reset
+- Two-tier power management:
+  - Radio sleep: disable RF+DMA+IRQ between polls (~5-8 mA saved)
+  - CPU suspend: ~3 µA with timer wake during slow poll intervals
+- Auto ED Timeout Request after join (index 14 ≈ 11 days)
 
 ## Project Structure
 

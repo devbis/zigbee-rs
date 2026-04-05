@@ -144,7 +144,7 @@ backend is behind a Cargo feature flag:
 | **nRF** | `nrf52840`, `nrf52833` | nRF52840, nRF52833 | Nordic 802.15.4 radio, `embassy-nrf` peripherals |
 | **BL702** | `bl702` | BL702, BL706 | Bouffalo Lab 802.15.4 radio |
 | **CC2340** | `cc2340` | CC2340R5 | TI SimpleLink, Cortex-M0+ with 802.15.4 |
-| **Telink** | `telink` | B91 (TLSR9518), TLSR8258 | Telink Semiconductor 802.15.4 radios |
+| **Telink** | `telink` | B91 (TLSR9518), TLSR8258 | Telink 802.15.4 radios — TLSR8258 is pure Rust (direct register access), B91 uses FFI |
 | **PHY6222** | `phy6222` | PHY6222 | Phyplus BLE+802.15.4 combo SoC |
 | **Mock** | `mock` | — | In-memory mock for unit tests and CI |
 
@@ -169,8 +169,9 @@ a one-line Cargo feature change plus updating the MAC initialization code.
 - **BL702** — Low cost, good for high-volume products.
 - **CC2340R5** — TI ecosystem, good for industrial applications.
 - **Telink B91 / TLSR8258** — Very low cost, widely used in commercial Zigbee
-  products (IKEA TRÅDFRI, etc.).
-- **PHY6222** — Budget BLE+802.15.4 combo, suitable for simple sensors.
+  products (IKEA TRÅDFRI, etc.). TLSR8258 has a pure-Rust radio driver (no
+  vendor SDK needed); B91 requires Telink SDK.
+- **PHY6222** — Budget BLE+802.15.4 combo, pure-Rust radio driver, suitable for simple sensors.
 - **Mock** — Use for testing your application logic without hardware.
 
 ## The Mock Backend

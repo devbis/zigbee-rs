@@ -5,7 +5,7 @@ A complete Zigbee PRO R22 protocol stack written in Rust, targeting embedded
 Embassy and other embedded async runtimes.
 
 ```text
-51,500+ lines of Rust · 166 source files · 9 crates · 45 ZCL clusters · 10 hardware platforms · 270 tests · Identify in all examples · NV storage on nRF + ESP32-C6
+58,000+ lines of Rust · 183 source files · 9 crates · 45 ZCL clusters · 10 hardware platforms · 270 tests · 2 pure-Rust radios · NV storage on nRF + ESP32-C6
 ```
 
 ## Architecture
@@ -85,6 +85,17 @@ cargo build --release --features sensor-sht31
 probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-sensor
 ```
 
+### nRF52840 router (with debug probe)
+
+```bash
+cd examples/nrf52840-router
+cargo build --release
+probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/nrf52840-router
+```
+
+> **Router mode** — relays frames, accepts child joins, sends periodic Link Status
+> broadcasts. LED2 blinks on frame relay.
+
 > **Flash NV storage** — network state is saved to internal flash (last 8 KB) and automatically
 > restored on power-up. No re-pairing after power cycles!
 
@@ -122,16 +133,25 @@ cargo build --release --features stubs
 CC2340_SDK_DIR=/path/to/simplelink_lowpower_f3_sdk cargo build --release
 ```
 
-### Telink B91 / TLSR8258 firmware
+### Telink B91 firmware
 
 ```bash
 # CI mode (stubs):
 cd examples/telink-b91-sensor && cargo build --release --features stubs
-cd examples/telink-tlsr8258-sensor && cargo build --release --features stubs
 
 # Real radio (requires Telink SDK — see "Vendor Libraries" below):
 TELINK_SDK_DIR=/path/to/tl_zigbee_sdk cargo build --release
 ```
+
+### Telink TLSR8258 firmware (pure Rust — no vendor SDK!)
+
+```bash
+cd examples/telink-tlsr8258-sensor
+cargo build --release   # no stubs, no vendor blobs needed!
+```
+
+> The TLSR8258 radio driver uses pure-Rust register access. For real tc32
+> firmware, use the [modern-tc32](https://github.com/modern-tc32) toolchain.
 
 ### PHY6222 firmware (pure Rust — no vendor SDK!)
 
@@ -142,7 +162,7 @@ cargo build --release   # no stubs, no vendor blobs needed!
 
 ### Vendor Libraries
 
-Four backends require vendor radio libraries for **real RF** operation. Without them, use `--features stubs` for CI/development builds.
+Three backends require vendor radio libraries for **real RF** operation. Without them, use `--features stubs` for CI/development builds.
 
 #### BL702 — Bouffalo `lmac154` + `bl702_rf`
 
@@ -213,10 +233,10 @@ The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258
 | **BL702** | ✅ lmac154 FFI | `riscv32imac-unknown-none-elf` | Requires vendor libs (`liblmac154.a` + `libbl702_rf.a`) from Bouffalo SDK |
 | **CC2340** | ⚡ ZBOSS FFI | `thumbv6m-none-eabi` | TI SimpleLink SDK stubs (50+ RTOS deps) |
 | **Telink B91** | ⚡ Telink FFI | `riscv32imac-unknown-none-elf` | Telink SDK stubs |
-| **Telink TLSR8258** | ⚡ Telink FFI | `tc32-unknown-none-elf` | [modern-tc32](https://github.com/modern-tc32) toolchain for real builds; `thumbv6m` stubs for CI |
+| **Telink TLSR8258** | 🦀 **Pure Rust** | `tc32-unknown-none-elf` | [modern-tc32](https://github.com/modern-tc32) toolchain for real builds; `thumbv6m` for CI |
 | **PHY6222** | 🦀 **Pure Rust** | `thumbv6m-none-eabi` | Zero vendor blobs — direct register access! |
 
-> **Legend:** ✅ = fully functional radio driver · ⚡ = compiles with stubs, needs vendor SDK for real RF · 🦀 = pure Rust (no FFI)
+> **Legend:** ✅ = fully functional radio driver · ⚡ = compiles with stubs, needs vendor SDK for real RF · 🦀 = pure Rust (no FFI, no vendor blobs)
 
 All 11 firmware targets build in CI and produce downloadable artifacts.
 
@@ -247,7 +267,9 @@ Occupancy, Electrical, Carbon Dioxide, PM2.5, Soil Moisture
 - **`#![no_std]`** everywhere — no heap allocation, `heapless` for bounded collections
 - **`async` MacDriver trait** — 13 methods, no `Send`/`Sync` requirement
 - **Platform-agnostic** — same stack code runs on mock, ESP32, nRF, BL702, CC2340, Telink, PHY6222
-- **Power-aware** — two-phase polling (fast/slow), DC-DC, TX power reduction, system sleep, flash deep power-down, GPIO preparation, reportable change thresholds
+- **Power-aware** — two-phase polling (fast/slow), DC-DC, TX power reduction, radio sleep, CPU suspend, system sleep, flash deep power-down, GPIO preparation, reportable change thresholds
+- **Two pure-Rust radios** — PHY6222 and TLSR8258 need zero vendor blobs
+- **Router support** — full relay, RREQ rebroadcast, Link Status, indirect queue, source routing
 - **Manual frame parsing** — no `serde`, bitfield encode/decode for all frame types
 - **Embassy-compatible** — designed for single-threaded async executors
 - **Layered crates** — each layer wraps the one below: `NwkLayer<M: MacDriver>`
@@ -265,9 +287,9 @@ zigbee-rs/
 │       ├── nrf/               # nRF52840/52833 (radio peripheral)
 │       ├── bl702/             # BL702 (lmac154 FFI)
 │       ├── cc2340/            # CC2340 (ZBOSS FFI stubs)
-│       ├── telink/            # Telink B91 + TLSR8258 (SDK stubs)
+│       ├── telink/            # Telink B91 (FFI stubs) + TLSR8258 (pure Rust!)
 │       └── phy6222/           # PHY6222 (pure Rust radio driver!)
-├── zigbee-nwk/                # Network layer (routing, security)
+├── zigbee-nwk/                # Network layer (routing, security, router relay)
 ├── zigbee-aps/                # Application Support (binding, groups)
 ├── zigbee-zdo/                # Device Objects (discovery, mgmt)
 ├── zigbee-bdb/                # Base Device Behavior (commissioning)
@@ -285,12 +307,12 @@ zigbee-rs/
 │   ├── nrf52840-sensor/       # nRF52840-DK (probe-rs) + BME280/SHT31 + flash NV
 │   ├── nrf52840-sensor-uf2/   # nice!nano / ProMicro (UF2 drag-drop, simple demo)
 │   ├── nrf52833-sensor/       # nRF52833-DK (probe-rs)
-│   ├── nrf52840-router/       # nRF52840 Zigbee router (relay, permit join)
+│   ├── nrf52840-router/       # nRF52840 Zigbee router (relay, permit join, Link Status)
 │   ├── nrf52840-bridge/       # nRF52840 coordinator bridge (stub)
 │   ├── bl702-sensor/          # BL702 (requires vendor libs from Bouffalo SDK)
 │   ├── cc2340-sensor/         # TI CC2340R5 (stubs)
-│   ├── telink-b91-sensor/     # Telink B91 (stubs)
-│   ├── telink-tlsr8258-sensor/# Telink TLSR8258 (stubs)
+│   ├── telink-b91-sensor/     # Telink B91 (requires vendor libs or stubs)
+│   ├── telink-tlsr8258-sensor/# Telink TLSR8258 — pure Rust, no vendor SDK!
 │   └── phy6222-sensor/        # PHY6222 — pure Rust, no vendor SDK!
 ├── docs/
 │   ├── book/                  # mdBook source → GitHub Pages
@@ -327,7 +349,8 @@ All sensor examples include **Identify cluster** (0x0003), **NWK Leave handling*
 
 ## Known Limitations
 
-- **CC2340 / Telink B91 / Telink TLSR8258** backends compile with stub FFI — real RF requires linking vendor SDK libraries (blocked by complex RTOS dependencies or proprietary toolchains)
+- **CC2340 / Telink B91** backends compile with stub FFI — real RF requires linking vendor SDK libraries (blocked by complex RTOS dependencies)
+- **Telink TLSR8258** pure-Rust driver is fully functional; real tc32 firmware requires the [modern-tc32](https://github.com/modern-tc32) toolchain
 - **PHY6222** pure-Rust driver uses simplified TP calibration defaults — production firmware would need proper PLL lock sequence; temp/humidity sensors are simulated (battery ADC is real); comprehensive power management is implemented (two-tier sleep with AON system sleep ~3 µA, radio sleep/wake, flash deep power-down, GPIO leak prevention)
 - **Test coverage** is basic — the mock examples exercise more than the test crate
 - **Security** — AES-CCM\* encryption works (RustCrypto `aes` + `ccm`, `no_std`) but key management is minimal
