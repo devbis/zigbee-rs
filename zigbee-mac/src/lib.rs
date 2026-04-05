@@ -47,6 +47,9 @@ pub mod telink;
 #[cfg(feature = "phy6222")]
 pub mod phy6222;
 
+#[cfg(feature = "efr32")]
+pub mod efr32;
+
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 

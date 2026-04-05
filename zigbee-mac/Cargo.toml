@@ -81,3 +81,7 @@ phy6222 = [
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
 ]
 
+efr32 = [
+    "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures",
+]
+

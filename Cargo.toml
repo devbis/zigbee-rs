@@ -29,6 +29,7 @@ exclude = [
     "examples/telink-b91-sensor",
     "examples/telink-tlsr8258-sensor",
     "examples/phy6222-sensor",
+    "examples/efr32mg1-sensor",
     "phy6222-hal",
 ]
 
