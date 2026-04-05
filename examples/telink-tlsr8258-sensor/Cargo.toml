@@ -33,7 +33,6 @@ panic-halt = "1.0"
 
 [features]
 default = []
-stubs = []
 
 [profile.release]
 opt-level = "s"

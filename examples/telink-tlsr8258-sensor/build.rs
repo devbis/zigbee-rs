@@ -2,12 +2,13 @@
 //!
 //! Supports two build modes:
 //!
-//! 1. **CI/stub mode** (`--features stubs` with `thumbv6m-none-eabi`):
-//!    Links memory.x and emits linker script args. Stubs provide FFI symbols.
+//! 1. **CI mode** (`thumbv6m-none-eabi`):
+//!    Links memory.x and emits linker script args. No FFI stubs needed —
+//!    the radio driver uses pure-Rust register access.
 //!
 //! 2. **Real TC32 mode** (`tc32-unknown-none-elf` with modern-tc32 toolchain):
-//!    Compiles Telink SDK startup/drivers with `clang --target=tc32` and links
-//!    `libdrivers_8258.a`. Requires:
+//!    Compiles Telink SDK startup/drivers with `clang --target=tc32`.
+//!    Requires:
 //!    - TC32 Rust toolchain: <https://github.com/modern-tc32/examples_rust>
 //!    - Telink SDK: `TC32_SDK_DIR=/path/to/tl_zigbee_sdk`
 //!    - TC32 LLVM: `TC32_TOOLCHAIN=/path/to/tc32-stage1`
@@ -26,18 +27,11 @@ fn main() {
     if target == "tc32-unknown-none-elf" {
         build_tc32_sdk();
     } else {
-        // CI stub mode — just emit linker args for thumbv6m stand-in
+        // CI mode — just emit linker args for thumbv6m stand-in
         println!("cargo:rustc-link-arg=-Tlink.x");
         println!("cargo:rustc-link-arg=--noinhibit-exec");
     }
 
-    // Link Telink driver library when SDK path is provided (either mode)
-    if let Ok(sdk_dir) = std::env::var("TELINK_SDK_DIR") {
-        let lib_path = format!("{}/platform/lib", sdk_dir);
-        println!("cargo:rustc-link-search=native={}", lib_path);
-        println!("cargo:rustc-link-lib=static=drivers_8258");
-    }
-    println!("cargo:rerun-if-env-changed=TELINK_SDK_DIR");
     println!("cargo:rerun-if-env-changed=TC32_SDK_DIR");
     println!("cargo:rerun-if-env-changed=TC32_TOOLCHAIN");
     println!("cargo:rerun-if-env-changed=TC32_LLVM_BIN");
@@ -108,16 +102,10 @@ fn build_tc32_sdk() {
         }
     }
 
-    // Link vendor libs
-    let drivers = format!("{}/platform/lib/libdrivers_8258.a", sdk_dir);
+    // Link vendor soft-float library (still needed for FP math on tc32)
     let soft_fp = format!("{}/platform/tc32/libsoft-fp.a", sdk_dir);
     println!("cargo:rustc-link-arg=--gc-sections");
-    if std::path::Path::new(&drivers).exists() {
-        println!("cargo:rustc-link-arg=--start-group");
-        println!("cargo:rustc-link-arg={}", drivers);
-        if std::path::Path::new(&soft_fp).exists() {
-            println!("cargo:rustc-link-arg={}", soft_fp);
-        }
-        println!("cargo:rustc-link-arg=--end-group");
+    if std::path::Path::new(&soft_fp).exists() {
+        println!("cargo:rustc-link-arg={}", soft_fp);
     }
 }

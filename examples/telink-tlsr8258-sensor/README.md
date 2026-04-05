@@ -13,16 +13,16 @@ reporting temperature and humidity via ZCL clusters 0x0402 and 0x0405.
 
 ## Build Modes
 
-### 1. CI/stub mode (no TC32 toolchain needed)
+### 1. CI mode (no TC32 toolchain needed)
 
 ```bash
 cd examples/telink-tlsr8258-sensor
-cargo build --release --features stubs
+cargo build --release
 ```
 
-Uses `thumbv6m-none-eabi` as a stand-in target. The `stubs` feature provides
-no-op FFI symbols. This verifies the Rust code compiles but does NOT produce
-flashable firmware.
+Uses `thumbv6m-none-eabi` as a stand-in target. The radio driver uses pure-Rust
+register access, so no FFI stubs or vendor libraries are needed. This verifies
+the Rust code compiles but does NOT produce flashable firmware.
 
 ### 2. Real TC32 firmware (with modern-tc32 toolchain)
 
@@ -44,7 +44,7 @@ This produces a real `tc32-unknown-none-elf` binary flashable to TLSR8258 hardwa
 
 The `build.rs` automatically:
 - Compiles Telink SDK C sources with `clang --target=tc32`
-- Links `libdrivers_8258.a` and `libsoft-fp.a` from the SDK
+- Links `libsoft-fp.a` from the SDK
 - Handles startup code and linker script
 
 ## TC32 Toolchain
@@ -62,7 +62,6 @@ Setup: see [modern-tc32/examples_rust](https://github.com/modern-tc32/examples_r
 
 | Library | SDK Path | Purpose |
 |---------|----------|---------|
-| `libdrivers_8258.a` | `platform/lib/` | Hardware drivers (RF, GPIO, timer) |
 | `libsoft-fp.a` | `platform/tc32/` | Soft-float math |
 
 ```bash
@@ -83,19 +82,18 @@ TelinkBDT --chip 8258 --firmware target/tc32-unknown-none-elf/release/telink-tls
 - Zigbee 3.0 SED with Identify, Temperature, Humidity, Battery clusters
 - NWK Leave handler with auto-rejoin
 - Default reporting with change thresholds
-- IEEE 802.15.4 radio via Telink SDK FFI
+- IEEE 802.15.4 radio via pure-Rust register access (no vendor C library)
 - Button-driven join/leave with factory reset
-- Two build paths: CI stubs + real TC32 firmware
 
 ## Project Structure
 
 ```
 telink-tlsr8258-sensor/
 ├── .cargo/config.toml   # Target config (thumbv6m for CI, tc32 for real)
-├── Cargo.toml            # Dependencies, stubs feature flag
-├── build.rs              # Dual-mode: stub linking OR TC32 SDK compilation
+├── Cargo.toml            # Dependencies
+├── build.rs              # Dual-mode: CI linking OR TC32 SDK compilation
 ├── memory.x              # Flash @ 0x00000000, RAM @ 0x00840000
 └── src/
     ├── main.rs           # Entry point, SED loop, sensor clusters
-    └── stubs.rs          # No-op FFI stubs for CI builds
+    └── stubs.rs          # Critical-section stubs for CI builds
 ```

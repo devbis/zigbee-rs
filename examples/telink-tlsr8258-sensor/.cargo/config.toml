@@ -1,6 +1,6 @@
 [build]
 # With the TC32 toolchain installed: target = "tc32-unknown-none-elf"
-# For CI/development without TC32 toolchain (uses stubs):
+# For CI/development without TC32 toolchain:
 target = "thumbv6m-none-eabi"
 
 # To build real firmware, use:

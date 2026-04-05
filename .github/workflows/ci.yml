@@ -362,7 +362,7 @@ jobs:
           workspaces: examples/telink-tlsr8258-sensor
       - name: Build Telink TLSR8258 sensor (release)
         working-directory: examples/telink-tlsr8258-sensor
-        run: cargo build --release --features stubs
+        run: cargo build --release
       - name: Create firmware artifacts
         run: |
           ELF=examples/telink-tlsr8258-sensor/target/thumbv6m-none-eabi/release/telink-tlsr8258-sensor

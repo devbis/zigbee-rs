@@ -26,7 +26,8 @@
 #![no_std]
 #![no_main]
 
-#[cfg(feature = "stubs")]
+// Critical-section stubs for CI builds (thumbv6m stand-in target)
+#[cfg(target_arch = "arm")]
 mod stubs;
 
 use panic_halt as _;

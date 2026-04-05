@@ -191,14 +191,13 @@ cd examples/telink-b91-sensor && cargo build --release
 
 The build script links: `libdrivers_b91.a` from `$TELINK_SDK_DIR/platform/lib/`.
 
-#### Telink TLSR8258 — Telink Zigbee SDK
+#### Telink TLSR8258 — Pure Rust (no vendor library needed)
 
 ```bash
-export TELINK_SDK_DIR=/path/to/tl_zigbee_sdk
 cd examples/telink-tlsr8258-sensor && cargo build --release
 ```
 
-The build script links: `libdrivers_8258.a` from `$TELINK_SDK_DIR/platform/lib/`.
+The TLSR8258 radio driver uses pure-Rust register access — no `libdrivers_8258.a` required.
 
 > **PHY6222** and **nRF52840/52833** and **ESP32-C6/H2** do **not** need any vendor libraries.
 

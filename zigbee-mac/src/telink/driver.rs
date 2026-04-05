@@ -1,14 +1,11 @@
-//! Low-level Telink 802.15.4 radio driver via FFI to the tl_zigbee_sdk PHY layer.
+//! Low-level Telink TLSR8258 802.15.4 radio driver using direct register access.
 //!
-//! Provides async TX/RX on top of Telink's IEEE 802.15.4 radio peripheral
-//! (TLSR825x and B91 families) using Embassy signals for interrupt-driven
-//! completion notification.
+//! Provides async TX/RX on top of the TLSR8258 IEEE 802.15.4 radio peripheral
+//! using Embassy signals for interrupt-driven completion notification.
 //!
-//! Telink chips (TLSR8258, TLSR8278, B91/TLSR9518) have a built-in 2.4 GHz
-//! multi-protocol radio supporting BLE 5.x and IEEE 802.15.4. Radio access is
-//! provided through the `tl_zigbee_sdk` C library. This driver creates Rust FFI
-//! bindings to that library's MAC PHY layer and implements the IRQ handler
-//! callbacks to bridge into Embassy async signals.
+//! All radio control is done via volatile memory-mapped register access,
+//! eliminating the need for the Telink `tl_zigbee_sdk` C library
+//! (`libdrivers_8258.a`).
 //!
 //! # Radio peripheral overview
 //! - 2.4 GHz IEEE 802.15.4 compliant
@@ -22,10 +19,10 @@
 //! # Architecture
 //! ```text
 //! TelinkDriver (Rust, async)
-//!   ├── FFI calls → tl_zigbee_sdk MAC PHY (Telink C library)
-//!   │     ├── rf_setChannel / rf_setTxPower / rf_setTrxState / ...
-//!   │     ├── rf802154_tx_ready + rf802154_tx / rf_setRxBuf
-//!   │     └── rf_performCCA / rf_startEDScan / rf_stopEDScan / rf_getLqi
+//!   ├── Direct register access (volatile MMIO at 0x800000+)
+//!   │     ├── set_channel / set_tx_power / set_trx_state / ...
+//!   │     ├── tx_ready + tx_trigger / set_rx_buf
+//!   │     └── perform_cca / start_ed_scan / stop_ed_scan / get_lqi
 //!   ├── TX completion: rf_tx_irq_handler() → TX_SIGNAL
 //!   └── RX completion: rf_rx_irq_handler() → RX_SIGNAL
 //! ```
@@ -48,9 +45,9 @@
 //! ```
 //!
 //! # Build requirements
-//! The downstream firmware crate must link the Telink Zigbee SDK libraries.
-//! The RF interrupt must be registered in platform startup code so that
-//! `rf_rx_irq_handler` and `rf_tx_irq_handler` are called from the ISR.
+//! No external C libraries are required. The RF interrupt must be registered
+//! in platform startup code so that `rf_rx_irq_handler` and
+//! `rf_tx_irq_handler` are called from the ISR.
 
 use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, AtomicU32, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -68,43 +65,273 @@ const ZB_RADIO_RX_HDR_LEN: usize = 13;
 /// Maximum 802.15.4 PHY frame size (PSDU including FCS).
 const MAX_FRAME_LEN: usize = 127;
 
-// ── Radio states (from mac_phy.h) ──────────────────────────────
+// ── Radio states ───────────────────────────────────────────────
 
 const RF_STATE_RX: u8 = 1;
 const RF_STATE_OFF: u8 = 3;
 
-// ── CCA result codes (from mac_phy.h) ──────────────────────────
+// ── CCA result codes ───────────────────────────────────────────
 
 const PHY_CCA_IDLE: u8 = 0x04;
 #[allow(dead_code)]
 const PHY_CCA_BUSY: u8 = 0x00;
 
-// ── FFI bindings to Telink tl_zigbee_sdk MAC PHY layer ─────────
-// These map to functions in the Telink Zigbee SDK. The SDK is compiled
-// and linked by the downstream firmware crate.
+/// CCA RSSI threshold in raw register units.
+/// -70 dBm + 110 offset = 40.
+const CCA_RSSI_THRESHOLD: u8 = 40;
 
-unsafe extern "C" {
-    // ── Initialization ──
-    fn rf_init();
-    fn mac_trxInit();
+// ── TLSR8258 Register Map ──────────────────────────────────────
+// All registers are memory-mapped at 0x800000 + offset.
+// Offsets from Telink SDK register_8258.h.
 
-    // ── Configuration ──
-    fn rf_setChannel(chn: u8);
-    fn rf_setTxPower(power: u8);
-    fn rf_setRxBuf(buf: *mut u8);
-    fn rf_setTrxState(state: u8);
+const REG_BASE: u32 = 0x800000;
 
-    // ── TX ──
-    fn rf802154_tx_ready(buf: *mut u8, len: u8);
-    fn rf802154_tx();
+// RF core registers
+const REG_RF_MODE_CFG: u32 = REG_BASE + 0x400; // RF mode configuration
+const REG_RF_PA_POWER: u32 = REG_BASE + 0x404; // PA power setting
+const REG_RF_ACC_LEN: u32 = REG_BASE + 0x405; // Access code length
+const REG_RF_CHN: u32 = REG_BASE + 0x408; // Channel frequency
+const REG_RF_RSSI: u32 = REG_BASE + 0x441; // Instantaneous RSSI
 
-    // ── CCA / Energy Detection ──
-    fn rf_performCCA() -> u8;
-    fn rf_startEDScan();
-    fn rf_stopEDScan() -> u8;
+// DMA registers
+const REG_DMA2_ADDR: u32 = REG_BASE + 0xC08; // RF RX DMA buffer (low 16 bits)
+const REG_DMA3_ADDR: u32 = REG_BASE + 0xC0C; // RF TX DMA buffer (low 16 bits)
+const REG_DMA_CHN_EN: u32 = REG_BASE + 0xC20; // DMA channel enable
+const REG_DMA_CHN_IRQ_MSK: u32 = REG_BASE + 0xC21; // DMA IRQ mask
 
-    // ── LQI ──
-    fn rf_getLqi(rssi: i8) -> u8;
+// RF link-layer control
+const REG_RF_LL_CTRL_0: u32 = REG_BASE + 0xF02; // LL control 0
+const REG_RF_LL_CTRL_1: u32 = REG_BASE + 0xF03; // LL control 1
+#[allow(dead_code)]
+const REG_RF_RX_TIMEOUT: u32 = REG_BASE + 0xF0A; // RX timeout
+#[allow(dead_code)]
+const REG_RF_LL_CTRL_2: u32 = REG_BASE + 0xF15; // LL control 2
+const REG_RF_LL_CTRL_3: u32 = REG_BASE + 0xF16; // LL control 3
+const REG_RF_IRQ_MASK: u32 = REG_BASE + 0xF1C; // RF IRQ mask (u16)
+const REG_RF_IRQ_STATUS: u32 = REG_BASE + 0xF20; // RF IRQ status (u16)
+
+// System timer (32-bit, 16 MHz)
+#[allow(dead_code)]
+const REG_SYSTEM_TIMER: u32 = REG_BASE + 0x740;
+
+// RF IRQ bit masks (for REG_RF_IRQ_MASK / REG_RF_IRQ_STATUS)
+const FLD_RF_IRQ_TX: u16 = 1 << 1; // TX done
+const FLD_RF_IRQ_RX: u16 = 1 << 0; // RX done
+#[allow(dead_code)]
+const FLD_RF_IRQ_RX_TO: u16 = 1 << 2; // RX timeout
+#[allow(dead_code)]
+const FLD_RF_IRQ_TX_DS: u16 = 1 << 8; // TX DMA done
+#[allow(dead_code)]
+const FLD_RF_IRQ_RX_DR: u16 = 1 << 9; // RX DMA ready
+
+// RF mode values (low 2 bits of REG_RF_LL_CTRL_3)
+#[allow(dead_code)]
+const RF_MODE_TX: u8 = 0;
+const RF_MODE_RX: u8 = 1;
+#[allow(dead_code)]
+const RF_MODE_AUTO: u8 = 2;
+const RF_MODE_OFF: u8 = 3;
+
+// DMA channel bits (for REG_DMA_CHN_EN / REG_DMA_CHN_IRQ_MSK)
+const DMA_CHN_RF_RX: u8 = 1 << 2; // Channel 2 — RF RX
+const DMA_CHN_RF_TX: u8 = 1 << 3; // Channel 3 — RF TX
+
+// LL ctrl_1 bit for timestamp capture
+const FLD_LL_CTRL1_TIMESTAMP_EN: u8 = 1 << 5;
+
+/// TX power lookup table: index → PA register value.
+/// Entries map power levels 0–10 to TLSR8258 PA register values
+/// (from Telink SDK rf_power_level_e).
+const TX_POWER_TABLE: [u8; 11] = [
+    0x06, // 0: -20 dBm
+    0x06, // 1: -15 dBm (same PA setting, attenuator varies)
+    0x06, // 2: -10 dBm
+    0x25, // 3:  -5 dBm
+    0x2C, // 4:  -2 dBm
+    0x30, // 5:   0 dBm
+    0x36, // 6:  +1 dBm
+    0x41, // 7:  +3 dBm
+    0x52, // 8:  +5 dBm
+    0x61, // 9:  +7 dBm
+    0xBF, // 10: +10 dBm
+];
+
+// ── Register access helpers ────────────────────────────────────
+
+#[inline(always)]
+fn reg_write_u8(addr: u32, val: u8) {
+    unsafe { core::ptr::write_volatile(addr as *mut u8, val) }
+}
+
+#[inline(always)]
+fn reg_read_u8(addr: u32) -> u8 {
+    unsafe { core::ptr::read_volatile(addr as *const u8) }
+}
+
+#[inline(always)]
+fn reg_write_u16(addr: u32, val: u16) {
+    unsafe { core::ptr::write_volatile(addr as *mut u16, val) }
+}
+
+#[allow(dead_code)]
+#[inline(always)]
+fn reg_read_u16(addr: u32) -> u16 {
+    unsafe { core::ptr::read_volatile(addr as *const u16) }
+}
+
+#[allow(dead_code)]
+#[inline(always)]
+fn reg_write_u32(addr: u32, val: u32) {
+    unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
+}
+
+#[allow(dead_code)]
+#[inline(always)]
+fn reg_read_u32(addr: u32) -> u32 {
+    unsafe { core::ptr::read_volatile(addr as *const u32) }
+}
+
+// ── Pure-Rust radio functions (replace tl_zigbee_sdk FFI) ──────
+
+/// Initialize the radio hardware for IEEE 802.15.4 operation.
+/// Replaces `rf_init()` + `mac_trxInit()`.
+fn radio_init() {
+    // Enable DMA channels 2 (RF RX) and 3 (RF TX)
+    let dma_en = reg_read_u8(REG_DMA_CHN_EN);
+    reg_write_u8(REG_DMA_CHN_EN, dma_en | DMA_CHN_RF_RX | DMA_CHN_RF_TX);
+
+    // Enable DMA IRQs for RF RX/TX channels
+    let dma_irq = reg_read_u8(REG_DMA_CHN_IRQ_MSK);
+    reg_write_u8(REG_DMA_CHN_IRQ_MSK, dma_irq | DMA_CHN_RF_RX | DMA_CHN_RF_TX);
+
+    // Set access code length to 4 bytes (802.15.4 preamble + SFD)
+    reg_write_u8(REG_RF_ACC_LEN, 4);
+
+    // Set 802.15.4 mode in RF mode configuration register
+    // Bit pattern: 802.15.4 packet format, CRC-16 enabled
+    reg_write_u8(REG_RF_MODE_CFG, 0x20);
+
+    // Configure LL control 0 for 802.15.4 mode
+    reg_write_u8(REG_RF_LL_CTRL_0, 0x45);
+
+    // Enable timestamp capture in LL control 1
+    let ctrl1 = reg_read_u8(REG_RF_LL_CTRL_1);
+    reg_write_u8(REG_RF_LL_CTRL_1, ctrl1 | FLD_LL_CTRL1_TIMESTAMP_EN);
+
+    // Enable RF IRQs for TX and RX completion
+    reg_write_u16(REG_RF_IRQ_MASK, FLD_RF_IRQ_TX | FLD_RF_IRQ_RX);
+
+    // Clear any pending IRQ status
+    reg_write_u16(REG_RF_IRQ_STATUS, 0xFFFF);
+
+    // Start in OFF state
+    set_trx_state(RF_STATE_OFF);
+}
+
+/// Set the IEEE 802.15.4 channel (11–26).
+/// Replaces `rf_setChannel()`.
+fn set_channel(channel: u8) {
+    // 802.15.4 channel frequency: 2405 + 5*(channel-11) MHz
+    // Physical frequency offset from 2400 MHz: (channel - 10) * 5
+    let freq = ((channel as u16).wrapping_sub(10)) * 5;
+    reg_write_u16(REG_RF_CHN, freq);
+}
+
+/// Set the TX power level.
+/// Replaces `rf_setTxPower()`.
+fn set_tx_power(power: u8) {
+    let idx = (power as usize).min(TX_POWER_TABLE.len() - 1);
+    reg_write_u8(REG_RF_PA_POWER, TX_POWER_TABLE[idx]);
+}
+
+/// Set the RX DMA buffer address.
+/// Replaces `rf_setRxBuf()`.
+fn set_rx_buf(buf: *mut u8) {
+    // TLSR8258 DMA address registers hold the low 16 bits of the pointer.
+    // RAM is at 0x840000+, so the low 16 bits uniquely identify the buffer.
+    let addr_lo = buf as u32 as u16;
+    reg_write_u16(REG_DMA2_ADDR, addr_lo);
+}
+
+/// Set the radio transceiver state (RX / OFF).
+/// Replaces `rf_setTrxState()`.
+fn set_trx_state(state: u8) {
+    let mode = match state {
+        RF_STATE_RX => RF_MODE_RX,
+        RF_STATE_OFF => RF_MODE_OFF,
+        _ => RF_MODE_OFF,
+    };
+    // Write mode to low 2 bits of LL ctrl_3, preserving other bits
+    let ctrl = reg_read_u8(REG_RF_LL_CTRL_3);
+    reg_write_u8(REG_RF_LL_CTRL_3, (ctrl & 0xFC) | mode);
+}
+
+/// Prepare the TX DMA buffer with the 802.15.4 frame.
+/// Replaces `rf802154_tx_ready()`.
+///
+/// Builds the DMA header in `RF_TX_DMA_BUF` and copies the payload.
+fn tx_ready(payload: *const u8, len: u8) {
+    unsafe {
+        let buf = core::ptr::addr_of_mut!(RF_TX_DMA_BUF) as *mut u8;
+        // DMA length = rfLen field (1 byte) + payload (len) + CRC (2 bytes)
+        let dma_len = (len as u32) + 3;
+        core::ptr::write_volatile(buf as *mut u32, dma_len);
+        // rfLen = payload length + 2 (hardware appends 2-byte CRC)
+        core::ptr::write_volatile(buf.add(4), len + 2);
+        // Copy payload after the header
+        core::ptr::copy_nonoverlapping(payload, buf.add(5), len as usize);
+    }
+}
+
+/// Trigger transmission of the prepared TX buffer.
+/// Replaces `rf802154_tx()`.
+fn tx_trigger() {
+    // Set TX DMA buffer address (low 16 bits)
+    let buf_addr = core::ptr::addr_of!(RF_TX_DMA_BUF) as u32 as u16;
+    reg_write_u16(REG_DMA3_ADDR, buf_addr);
+
+    // Trigger TX: set mode to TX in LL ctrl_3
+    let ctrl = reg_read_u8(REG_RF_LL_CTRL_3);
+    reg_write_u8(REG_RF_LL_CTRL_3, (ctrl & 0xFC) | RF_MODE_TX);
+}
+
+/// Perform Clear Channel Assessment.
+/// Replaces `rf_performCCA()`.
+///
+/// Returns `PHY_CCA_IDLE` (0x04) if channel is idle, `PHY_CCA_BUSY` (0x00) if busy.
+fn perform_cca() -> u8 {
+    let rssi_raw = reg_read_u8(REG_RF_RSSI);
+    if rssi_raw < CCA_RSSI_THRESHOLD {
+        PHY_CCA_IDLE
+    } else {
+        PHY_CCA_BUSY
+    }
+}
+
+/// Start an Energy Detection scan (switch to RX mode to sample RSSI).
+/// Replaces `rf_startEDScan()`.
+fn start_ed_scan() {
+    set_trx_state(RF_STATE_RX);
+}
+
+/// Stop ED scan and return the energy level (0–255).
+/// Replaces `rf_stopEDScan()`.
+///
+/// Reads the current RSSI and converts to an LQI-scaled ED value.
+fn stop_ed_scan() -> u8 {
+    let rssi_raw = reg_read_u8(REG_RF_RSSI);
+    let rssi_dbm = (rssi_raw as i16) - 110;
+    get_lqi(rssi_dbm as i8)
+}
+
+/// Convert RSSI (dBm) to Link Quality Indicator (0–255).
+/// Replaces `rf_getLqi()`.
+///
+/// Linear mapping: 0 at ≤ -106 dBm, 255 at ≥ -6 dBm.
+fn get_lqi(rssi: i8) -> u8 {
+    let rssi_i16 = rssi as i16;
+    let lqi = (255 * (rssi_i16 + 106)) / 100;
+    lqi.clamp(0, 255) as u8
 }
 
 // ── Async completion signals ────────────────────────────────────
@@ -145,10 +372,8 @@ static RX_COUNTER: AtomicU8 = AtomicU8::new(0);
 // DMA RX buffer given to the radio hardware (must be aligned and static).
 static mut RF_RX_DMA_BUF: [u8; RF_PKT_BUFF_LEN] = [0u8; RF_PKT_BUFF_LEN];
 
-// DMA TX buffer used by rf802154_tx_ready (must be static for DMA access).
-// The SDK's rf802154_tx_ready writes into its own static `rf_tx_buf`, so we
-// only need a staging buffer to pass payload data to it.
-static mut TX_PAYLOAD_BUF: [u8; MAX_FRAME_LEN] = [0u8; MAX_FRAME_LEN];
+// DMA TX buffer with room for header (5 bytes) + payload + CRC.
+static mut RF_TX_DMA_BUF: [u8; RF_PKT_BUFF_LEN] = [0u8; RF_PKT_BUFF_LEN];
 
 /// Received 802.15.4 frame with metadata.
 pub struct ReceivedFrame {
@@ -205,10 +430,10 @@ impl Default for RadioConfig {
     }
 }
 
-/// Async driver for the Telink TLSR825x / B91 IEEE 802.15.4 radio.
+/// Async driver for the Telink TLSR8258 IEEE 802.15.4 radio.
 ///
-/// Uses FFI calls to Telink's `tl_zigbee_sdk` MAC PHY layer for hardware
-/// access, with Embassy signals for interrupt-driven async TX/RX.
+/// Uses direct memory-mapped register access for hardware control, with
+/// Embassy signals for interrupt-driven async TX/RX.
 pub struct TelinkDriver {
     config: RadioConfig,
     initialized: bool,
@@ -235,24 +460,21 @@ impl TelinkDriver {
 
     /// Initialize the radio hardware.
     fn init_hardware(&mut self) {
-        unsafe {
-            rf_init();
-            mac_trxInit();
+        radio_init();
 
-            // Point the radio DMA engine at our static RX buffer
-            let rx_buf_ptr = core::ptr::addr_of_mut!(RF_RX_DMA_BUF) as *mut u8;
-            rf_setRxBuf(rx_buf_ptr);
+        // Point the radio DMA engine at our static RX buffer
+        let rx_buf_ptr = core::ptr::addr_of_mut!(RF_RX_DMA_BUF) as *mut u8;
+        set_rx_buf(rx_buf_ptr);
 
-            // Apply initial config
-            rf_setChannel(self.config.channel);
-            rf_setTxPower(self.config.tx_power as u8);
+        // Apply initial config
+        set_channel(self.config.channel);
+        set_tx_power(self.config.tx_power as u8);
 
-            // Start in RX state
-            rf_setTrxState(RF_STATE_RX);
-        }
+        // Start in RX state
+        set_trx_state(RF_STATE_RX);
 
         self.initialized = true;
-        log::info!("telink: radio initialized (rf_init + mac_trxInit)");
+        log::info!("telink: radio initialized (pure-Rust register access)");
     }
 
     /// Apply the current configuration to the radio hardware.
@@ -260,10 +482,8 @@ impl TelinkDriver {
         if !self.initialized {
             return;
         }
-        unsafe {
-            rf_setChannel(self.config.channel);
-            rf_setTxPower(self.config.tx_power as u8);
-        }
+        set_channel(self.config.channel);
+        set_tx_power(self.config.tx_power as u8);
     }
 
     /// Update radio configuration and re-apply to hardware.
@@ -286,18 +506,11 @@ impl TelinkDriver {
 
         TX_SIGNAL.reset();
 
-        unsafe {
-            // Copy payload into our static staging buffer for the C SDK to read
-            let tx_buf_ptr = core::ptr::addr_of_mut!(TX_PAYLOAD_BUF) as *mut u8;
-            core::ptr::copy_nonoverlapping(data.as_ptr(), tx_buf_ptr, data.len());
+        // Build the DMA TX packet directly from the payload
+        tx_ready(data.as_ptr(), data.len() as u8);
 
-            // rf802154_tx_ready builds the DMA header in the SDK's internal
-            // rf_tx_buf and copies the payload after it.
-            rf802154_tx_ready(tx_buf_ptr, data.len() as u8);
-
-            // Switch to TX state and start transmission
-            rf802154_tx();
-        }
+        // Switch to TX state and start transmission
+        tx_trigger();
 
         log::trace!("telink: tx {} bytes", data.len());
 
@@ -324,7 +537,7 @@ impl TelinkDriver {
         RX_SIGNAL.reset();
 
         // Ensure radio is in RX state
-        unsafe { rf_setTrxState(RF_STATE_RX) };
+        set_trx_state(RF_STATE_RX);
 
         // Wait for frame reception from rf_rx_irq_handler
         RX_SIGNAL.wait().await;
@@ -338,7 +551,7 @@ impl TelinkDriver {
         let len = RX_FRAME_LEN.load(Ordering::Acquire) as usize;
         let rssi = RX_FRAME_RSSI.load(Ordering::Acquire);
         let timestamp = RX_FRAME_TIMESTAMP.load(Ordering::Acquire);
-        let lqi = unsafe { rf_getLqi(rssi) };
+        let lqi = get_lqi(rssi);
 
         let mut frame = ReceivedFrame {
             data: [0u8; 128],
@@ -372,7 +585,7 @@ impl TelinkDriver {
             return Err(RadioError::NotInitialized);
         }
 
-        let result = unsafe { rf_performCCA() };
+        let result = perform_cca();
         Ok(result == PHY_CCA_IDLE)
     }
 
@@ -386,28 +599,26 @@ impl TelinkDriver {
             return Err(RadioError::NotInitialized);
         }
 
-        unsafe {
-            rf_startEDScan();
-            // IEEE 802.15.4 ED measurement duration = 8 symbol periods = 128µs.
-            // Use a calibrated busy-wait (~128µs at typical Telink clock rates).
-            // Each iteration takes ~4 cycles; at 32 MHz → ~4000 iterations ≈ 500µs
-            // (overshoot is fine — gives better RSSI averaging).
-            for _ in 0..4000 {
-                core::hint::spin_loop();
-            }
-            let ed = rf_stopEDScan();
-            Ok(ed)
+        start_ed_scan();
+        // IEEE 802.15.4 ED measurement duration = 8 symbol periods = 128µs.
+        // Use a calibrated busy-wait (~128µs at typical Telink clock rates).
+        // Each iteration takes ~4 cycles; at 32 MHz → ~4000 iterations ≈ 500µs
+        // (overshoot is fine — gives better RSSI averaging).
+        for _ in 0..4000 {
+            core::hint::spin_loop();
         }
+        let ed = stop_ed_scan();
+        Ok(ed)
     }
 
     /// Switch radio to RX state.
     pub fn enable_rx(&self) {
-        unsafe { rf_setTrxState(RF_STATE_RX) };
+        set_trx_state(RF_STATE_RX);
     }
 
     /// Switch radio off.
     pub fn disable_rx(&self) {
-        unsafe { rf_setTrxState(RF_STATE_OFF) };
+        set_trx_state(RF_STATE_OFF);
     }
 }
 
@@ -434,7 +645,7 @@ pub extern "C" fn rf_rx_irq_handler() {
     let payload_len = unsafe { *p.add(12) } as usize;
 
     // Sanity check — reject obviously invalid lengths
-    if payload_len < 3 || payload_len > MAX_FRAME_LEN {
+    if !(3..=MAX_FRAME_LEN).contains(&payload_len) {
         RX_CRC_FAIL.store(true, Ordering::Release);
         RX_FRAME_LEN.store(0, Ordering::Release);
         RX_SIGNAL.signal(true);
@@ -475,10 +686,8 @@ pub extern "C" fn rf_rx_irq_handler() {
     }
 
     // Re-arm the RX buffer for the next packet
-    unsafe {
-        let rx_buf_ptr = core::ptr::addr_of_mut!(RF_RX_DMA_BUF) as *mut u8;
-        rf_setRxBuf(rx_buf_ptr);
-    }
+    let rx_buf_ptr = core::ptr::addr_of_mut!(RF_RX_DMA_BUF) as *mut u8;
+    set_rx_buf(rx_buf_ptr);
 
     RX_SIGNAL.signal(true);
 }
@@ -491,7 +700,7 @@ pub extern "C" fn rf_rx_irq_handler() {
 #[unsafe(no_mangle)]
 pub extern "C" fn rf_tx_irq_handler() {
     // Switch back to RX mode after transmission
-    unsafe { rf_setTrxState(RF_STATE_RX) };
+    set_trx_state(RF_STATE_RX);
 
     TX_SIGNAL.signal(true);
 }
