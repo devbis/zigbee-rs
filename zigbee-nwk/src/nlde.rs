@@ -60,7 +60,10 @@ impl<M: MacDriver> NwkLayer<M> {
         discover_route: bool,
     ) -> Result<NldeDataConfirm, NwkStatus> {
         if !self.joined {
-            log::warn!("[NWK] nlde_data_request called but not joined! dst=0x{:04X}", dst_addr.0);
+            log::warn!(
+                "[NWK] nlde_data_request called but not joined! dst=0x{:04X}",
+                dst_addr.0
+            );
             return Err(NwkStatus::InvalidRequest);
         }
 
@@ -220,7 +223,11 @@ impl<M: MacDriver> NwkLayer<M> {
         // ── Broadcast deduplication (BTR) ──
         if is_broadcast && self.device_type != DeviceType::EndDevice {
             if self.btr.is_duplicate(src, header.seq_number) {
-                log::debug!("[NWK] BTR dup: src=0x{:04X} seq={}", src.0, header.seq_number);
+                log::debug!(
+                    "[NWK] BTR dup: src=0x{:04X} seq={}",
+                    src.0,
+                    header.seq_number
+                );
                 return None;
             }
             self.btr.record(src, header.seq_number);
@@ -359,33 +366,36 @@ impl<M: MacDriver> NwkLayer<M> {
             .unwrap_or(false);
 
         // Check if next hop is a sleepy child — buffer in indirect queue
-        if let Some(neighbor) = self.neighbors.find_by_short(next_hop) {
-            if !neighbor.rx_on_when_idle {
-                // Sleepy child — buffer for indirect delivery
-                let mut relay_buf = [0u8; 128];
-                let mut new_header = header.clone();
-                new_header.radius = new_radius;
-                if needs_route_record {
-                    self.insert_route_record(&mut new_header);
-                }
-                let hdr_len = new_header.serialize(&mut relay_buf);
-                let (_, orig_hdr_len) = match NwkHeader::parse(original) {
-                    Some(parsed) => parsed,
-                    None => return Err(NwkStatus::InvalidParameter),
-                };
-                let payload = &original[orig_hdr_len..];
-                if hdr_len + payload.len() > relay_buf.len() {
-                    return Err(NwkStatus::FrameTooLong);
-                }
-                relay_buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
-                let total = hdr_len + payload.len();
-                if self.indirect.enqueue(next_hop, &relay_buf[..total]) {
-                    log::debug!("[NWK] Buffered indirect frame for sleepy child 0x{:04X}", next_hop.0);
-                    return Ok(());
-                }
-                log::warn!("[NWK] Indirect queue full for 0x{:04X}", next_hop.0);
-                return Err(NwkStatus::FrameNotBuffered);
+        if let Some(neighbor) = self.neighbors.find_by_short(next_hop)
+            && !neighbor.rx_on_when_idle
+        {
+            // Sleepy child — buffer for indirect delivery
+            let mut relay_buf = [0u8; 128];
+            let mut new_header = header.clone();
+            new_header.radius = new_radius;
+            if needs_route_record {
+                self.insert_route_record(&mut new_header);
             }
+            let hdr_len = new_header.serialize(&mut relay_buf);
+            let (_, orig_hdr_len) = match NwkHeader::parse(original) {
+                Some(parsed) => parsed,
+                None => return Err(NwkStatus::InvalidParameter),
+            };
+            let payload = &original[orig_hdr_len..];
+            if hdr_len + payload.len() > relay_buf.len() {
+                return Err(NwkStatus::FrameTooLong);
+            }
+            relay_buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
+            let total = hdr_len + payload.len();
+            if self.indirect.enqueue(next_hop, &relay_buf[..total]) {
+                log::debug!(
+                    "[NWK] Buffered indirect frame for sleepy child 0x{:04X}",
+                    next_hop.0
+                );
+                return Ok(());
+            }
+            log::warn!("[NWK] Indirect queue full for 0x{:04X}", next_hop.0);
+            return Err(NwkStatus::FrameNotBuffered);
         }
 
         // Rebuild frame with decremented radius (and optional route record)
@@ -542,18 +552,20 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Queue a Network Status (route error) to send toward the frame source
         if frame_source != self.nib.network_address {
-            let _ = self
-                .pending_route_errors
-                .push(crate::PendingNetworkStatus {
-                    destination: frame_source,
-                    status_code: crate::frames::NetworkStatusCommand::NO_ROUTE_AVAILABLE,
-                    failed_destination: failed_dest,
-                });
+            let _ = self.pending_route_errors.push(crate::PendingNetworkStatus {
+                destination: frame_source,
+                status_code: crate::frames::NetworkStatusCommand::NO_ROUTE_AVAILABLE,
+                failed_destination: failed_dest,
+            });
         }
     }
 
     /// Relay a broadcast NWK frame via MAC broadcast with decremented radius.
-    async fn relay_broadcast(&mut self, original: &[u8], header: &NwkHeader) -> Result<(), NwkStatus> {
+    async fn relay_broadcast(
+        &mut self,
+        original: &[u8],
+        header: &NwkHeader,
+    ) -> Result<(), NwkStatus> {
         let new_radius = header.radius.saturating_sub(1);
         if new_radius == 0 {
             return Ok(());
@@ -577,7 +589,9 @@ impl<M: MacDriver> NwkLayer<M> {
 
         log::debug!(
             "[NWK] Relaying broadcast from 0x{:04X} (radius {} → {})",
-            header.src_addr.0, header.radius, new_radius
+            header.src_addr.0,
+            header.radius,
+            new_radius
         );
 
         self.mac
@@ -835,12 +849,14 @@ impl<M: MacDriver> NwkLayer<M> {
             );
 
             // Queue RREQ rebroadcast (async send happens in process_pending_routing)
-            let _ = self.pending_rreq_rebroadcasts.push(crate::PendingRreqRebroadcast {
-                command_options: rreq.command_options,
-                route_request_id: rreq.route_request_id,
-                dst_addr: rreq.dst_addr,
-                path_cost: new_cost,
-            });
+            let _ = self
+                .pending_rreq_rebroadcasts
+                .push(crate::PendingRreqRebroadcast {
+                    command_options: rreq.command_options,
+                    route_request_id: rreq.route_request_id,
+                    dst_addr: rreq.dst_addr,
+                    path_cost: new_cost,
+                });
         }
     }
 

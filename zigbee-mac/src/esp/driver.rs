@@ -81,8 +81,7 @@ impl<'a> Ieee802154Driver<'a> {
         self.driver.start_receive();
 
         // ACK window: aTurnaroundTime (192µs) + ACK duration (~352µs) + margin
-        let deadline = esp_hal::time::Instant::now()
-            + esp_hal::time::Duration::from_millis(2);
+        let deadline = esp_hal::time::Instant::now() + esp_hal::time::Duration::from_millis(2);
 
         while esp_hal::time::Instant::now() < deadline {
             if let Some(raw) = self.driver.raw_received() {

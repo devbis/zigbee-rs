@@ -106,11 +106,25 @@ impl<'a> EspMac<'a> {
 
         log::info!(
             "[ESP] MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         );
 
         // EUI-48 → EUI-64: insert FF:FE in middle, flip U/L bit
-        [mac[0] ^ 0x02, mac[1], mac[2], 0xFF, 0xFE, mac[3], mac[4], mac[5]]
+        [
+            mac[0] ^ 0x02,
+            mac[1],
+            mac[2],
+            0xFF,
+            0xFE,
+            mac[3],
+            mac[4],
+            mac[5],
+        ]
     }
 
     fn next_dsn(&mut self) -> u8 {
@@ -148,16 +162,29 @@ impl<'a> EspMac<'a> {
             if let Some(Ok(rx)) = self.driver.poll_receive() {
                 rx_count += 1;
                 let data = &rx.data[..rx.len];
-                let fc = if data.len() >= 2 { u16::from_le_bytes([data[0], data[1]]) } else { 0 };
+                let fc = if data.len() >= 2 {
+                    u16::from_le_bytes([data[0], data[1]])
+                } else {
+                    0
+                };
                 let ftype = fc & 0x07;
                 // Log first few frames on each channel for debugging
                 if rx_count <= 3 {
-                    log::info!("[SCAN] ch{}: #{} fc=0x{:04X} type={} len={}",
-                        channel, rx_count, fc, ftype, rx.len);
+                    log::info!(
+                        "[SCAN] ch{}: #{} fc=0x{:04X} type={} len={}",
+                        channel,
+                        rx_count,
+                        fc,
+                        ftype,
+                        rx.len
+                    );
                 }
                 if let Some(pd) = parse_beacon(channel, data, rx.lqi) {
-                    log::info!("[SCAN] ch{}: BEACON PAN=0x{:04X}",
-                        channel, pd.coord_address.pan_id().0);
+                    log::info!(
+                        "[SCAN] ch{}: BEACON PAN=0x{:04X}",
+                        channel,
+                        pd.coord_address.pan_id().0
+                    );
                     if descriptors.push(pd).is_err() {
                         break;
                     }
@@ -181,8 +208,13 @@ impl<'a> EspMac<'a> {
         // PanDescriptor. EZSP coordinators may not send standard beacons but
         // the presence of data traffic proves the network exists.
         if descriptors.is_empty() && saw_data_on_channel {
-            log::info!("[SCAN] ch{}: no beacons but {} data frames, synth PAN=0x{:04X} src=0x{:04X}",
-                channel, rx_count, data_pan, data_src);
+            log::info!(
+                "[SCAN] ch{}: no beacons but {} data frames, synth PAN=0x{:04X} src=0x{:04X}",
+                channel,
+                rx_count,
+                data_pan,
+                data_src
+            );
             let _ = descriptors.push(PanDescriptor {
                 coord_address: MacAddress::Short(PanId(data_pan), ShortAddress(data_src)),
                 channel,
@@ -229,7 +261,13 @@ impl<'a> EspMac<'a> {
                 }
                 let fc = u16::from_le_bytes([data[0], data[1]]);
                 let ftype = fc & 0x07;
-                log::info!("[ESP ASSOC-WAIT] #{} fc=0x{:04X} type={} len={}", rx_count, fc, ftype, rx.len);
+                log::info!(
+                    "[ESP ASSOC-WAIT] #{} fc=0x{:04X} type={} len={}",
+                    rx_count,
+                    fc,
+                    ftype,
+                    rx.len
+                );
                 // Must be a MAC command frame (type 3)
                 if fc & 0x07 != 3 {
                     self.driver.start_receive();
@@ -391,11 +429,8 @@ impl MacDriver for EspMac<'_> {
             }
 
             // Send Data Request to poll for indirect response
-            let data_req = build_data_request(
-                self.next_dsn(),
-                &req.coord_address,
-                &self.extended_address,
-            );
+            let data_req =
+                build_data_request(self.next_dsn(), &req.coord_address, &self.extended_address);
             let _ = self.transmit_frame(&data_req).await;
 
             // Wait for response
@@ -449,7 +484,7 @@ impl MacDriver for EspMac<'_> {
 
         // Restore normal mode
         self.driver.update_config(|cfg| cfg.promiscuous = false);
-        
+
         confirm.ok_or(MacError::NoBeacon)
     }
 
@@ -610,7 +645,10 @@ impl MacDriver for EspMac<'_> {
                 if let Some(result) = self.driver.poll_receive() {
                     let received = match result {
                         Ok(r) => r,
-                        Err(_) => { self.driver.start_receive(); continue; }
+                        Err(_) => {
+                            self.driver.start_receive();
+                            continue;
+                        }
                     };
                     if received.len < 3 {
                         self.driver.start_receive();
@@ -688,7 +726,11 @@ impl MacDriver for EspMac<'_> {
             &req,
         )?;
 
-        let max_retries = if ack_requested { self.max_frame_retries } else { 0 };
+        let max_retries = if ack_requested {
+            self.max_frame_retries
+        } else {
+            0
+        };
 
         for attempt in 0..=max_retries {
             // CSMA-CA backoff
@@ -710,12 +752,20 @@ impl MacDriver for EspMac<'_> {
                 if ack_requested {
                     // TX + ACK wait using driver's precise timing
                     if self.driver.transmit_with_ack(&frame_buf[..len], seq) {
-                        return Ok(McpsDataConfirm { msdu_handle, timestamp: None });
+                        return Ok(McpsDataConfirm {
+                            msdu_handle,
+                            timestamp: None,
+                        });
                     }
                     break true; // TX sent but no ACK — will retry
                 } else {
                     match self.driver.transmit(&frame_buf[..len]) {
-                        Ok(()) => return Ok(McpsDataConfirm { msdu_handle, timestamp: None }),
+                        Ok(()) => {
+                            return Ok(McpsDataConfirm {
+                                msdu_handle,
+                                timestamp: None,
+                            });
+                        }
                         Err(_) => {
                             nb += 1;
                             be = core::cmp::min(be + 1, self.max_be);

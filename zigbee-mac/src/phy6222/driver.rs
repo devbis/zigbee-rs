@@ -631,7 +631,9 @@ impl Phy6222Driver {
         sub_write_reg(CLK_CFG_REG, 19, 18, 0x03);
 
         // Small settling delay for PLL
-        for _ in 0..1000u32 { core::hint::spin_loop(); }
+        for _ in 0..1000u32 {
+            core::hint::spin_loop();
+        }
 
         // Re-apply channel (re-locks PLL)
         self.set_channel(self.config.channel);

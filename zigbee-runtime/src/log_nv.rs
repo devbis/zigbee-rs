@@ -140,8 +140,10 @@ impl<F: FlashDriver> LogStructuredNv<F> {
                 if len == 0 {
                     found_len = None; // deletion marker
                 } else if len <= buf.len() {
-                    self.flash
-                        .read(self.active_page + (offset + HEADER_SIZE) as u32, &mut buf[..len]);
+                    self.flash.read(
+                        self.active_page + (offset + HEADER_SIZE) as u32,
+                        &mut buf[..len],
+                    );
                     found_len = Some(len);
                 }
             }
@@ -176,8 +178,10 @@ impl<F: FlashDriver> LogStructuredNv<F> {
             write_buf[HEADER_SIZE..HEADER_SIZE + data.len()].copy_from_slice(data);
         }
 
-        self.flash
-            .write(self.active_page + self.write_offset as u32, &write_buf[..total]);
+        self.flash.write(
+            self.active_page + self.write_offset as u32,
+            &write_buf[..total],
+        );
         self.write_offset += total;
         Ok(())
     }
@@ -245,12 +249,12 @@ impl<F: FlashDriver> NvStorage for LogStructuredNv<F> {
         let mut data_buf = [0u8; 128];
         for &item_id in seen_ids.iter() {
             self.active_page = old_active;
-            if let Some(nv_id) = raw_to_nv_item_id(item_id) {
-                if let Some(len) = self.find_latest(nv_id, &mut data_buf) {
-                    self.active_page = scratch;
-                    let _ = self.append_item(nv_id, &data_buf[..len]);
-                    continue;
-                }
+            if let Some(nv_id) = raw_to_nv_item_id(item_id)
+                && let Some(len) = self.find_latest(nv_id, &mut data_buf)
+            {
+                self.active_page = scratch;
+                let _ = self.append_item(nv_id, &data_buf[..len]);
+                continue;
             }
             self.active_page = scratch;
         }

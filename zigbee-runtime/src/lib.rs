@@ -30,8 +30,8 @@
 pub mod builder;
 pub mod event_loop;
 pub mod firmware_writer;
-pub mod nv_storage;
 pub mod log_nv;
+pub mod nv_storage;
 #[cfg(feature = "ota")]
 pub mod ota;
 pub mod power;
@@ -203,17 +203,26 @@ impl<M: MacDriver> ZigbeeDevice<M> {
 
         log::info!(
             "[Runtime] Resume: addr=0x{:04X} PAN=0x{:04X} ch={} parent=0x{:04X}",
-            addr, pan_id.0, channel, parent.0
+            addr,
+            pan_id.0,
+            channel,
+            parent.0
         );
 
         // Configure MAC layer with restored addresses so it accepts
         // unicast frames and can transmit with the correct source address.
         let mac = self.bdb.zdo_mut().nwk_mut().mac_mut();
         let _ = mac
-            .mlme_set(zigbee_mac::PibAttribute::PhyCurrentChannel, zigbee_mac::PibValue::U8(channel))
+            .mlme_set(
+                zigbee_mac::PibAttribute::PhyCurrentChannel,
+                zigbee_mac::PibValue::U8(channel),
+            )
             .await;
         let _ = mac
-            .mlme_set(zigbee_mac::PibAttribute::MacPanId, zigbee_mac::PibValue::PanId(PanId(pan_id.0)))
+            .mlme_set(
+                zigbee_mac::PibAttribute::MacPanId,
+                zigbee_mac::PibValue::PanId(PanId(pan_id.0)),
+            )
             .await;
         let _ = mac
             .mlme_set(
@@ -564,7 +573,13 @@ impl<M: MacDriver> ZigbeeDevice<M> {
             // is higher than what we saved. Add 1000 to avoid replay rejection.
             const FC_SAFETY_MARGIN: u32 = 1000;
             let fc_safe = fc.saturating_add(FC_SAFETY_MARGIN);
-            log::info!("[NV] Restored NWK key seq={}, fc={} (saved={} +{})", seq, fc_safe, fc, FC_SAFETY_MARGIN);
+            log::info!(
+                "[NV] Restored NWK key seq={}, fc={} (saved={} +{})",
+                seq,
+                fc_safe,
+                fc,
+                FC_SAFETY_MARGIN
+            );
             self.bdb
                 .zdo_mut()
                 .nwk_mut()
@@ -784,7 +799,14 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                 buf[..len].copy_from_slice(&after_header[..len]);
             }
 
-            (dst, src, header.frame_control.security, nwk_fc.frame_type, buf, len)
+            (
+                dst,
+                src,
+                header.frame_control.security,
+                nwk_fc.frame_type,
+                buf,
+                len,
+            )
         };
 
         let (dst, src, nwk_security, frame_type, buf, len) = nwk_indication;
@@ -793,7 +815,12 @@ impl<M: MacDriver> ZigbeeDevice<M> {
         if frame_type == 1 {
             if len > 0 {
                 let cmd_id = buf[0];
-                log::info!("[RX] NWK Command id=0x{:02X} from 0x{:04X} ({} bytes)", cmd_id, src.0, len);
+                log::info!(
+                    "[RX] NWK Command id=0x{:02X} from 0x{:04X} ({} bytes)",
+                    cmd_id,
+                    src.0,
+                    len
+                );
                 // NWK Leave command (0x04) — signal application to rejoin
                 if cmd_id == 0x04 && len >= 2 {
                     let options = buf[1];
@@ -801,7 +828,9 @@ impl<M: MacDriver> ZigbeeDevice<M> {
                     let rejoin = (options & 0x20) != 0;
                     log::warn!(
                         "[RX] NWK Leave from 0x{:04X} (remove_children={}, rejoin={})",
-                        src.0, remove_children, rejoin
+                        src.0,
+                        remove_children,
+                        rejoin
                     );
                     // Mark as not joined so the stack stops sending
                     self.bdb.zdo_mut().nwk_mut().set_joined(false);

@@ -17,9 +17,11 @@ pub fn build_beacon_request(seq: u8) -> [u8; 8] {
         fc as u8,
         (fc >> 8) as u8,
         seq,
-        0xFF, 0xFF, // dst PAN = broadcast
-        0xFF, 0xFF, // dst addr = broadcast
-        0x07,       // Beacon Request command ID
+        0xFF,
+        0xFF, // dst PAN = broadcast
+        0xFF,
+        0xFF, // dst addr = broadcast
+        0x07, // Beacon Request command ID
     ]
 }
 
@@ -343,13 +345,17 @@ pub fn parse_association_response(data: &[u8]) -> Option<(ShortAddress, u8)> {
     let pan_compress = (fc >> 6) & 0x01;
 
     let mut offset = 3;
-    if dst_mode > 0 { offset += 2; } // PAN
+    if dst_mode > 0 {
+        offset += 2;
+    } // PAN
     match dst_mode {
         2 => offset += 2,
         3 => offset += 8,
         _ => {}
     }
-    if src_mode > 0 && pan_compress == 0 { offset += 2; } // Src PAN
+    if src_mode > 0 && pan_compress == 0 {
+        offset += 2;
+    } // Src PAN
     match src_mode {
         2 => offset += 2,
         3 => offset += 8,

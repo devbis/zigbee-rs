@@ -51,7 +51,14 @@ impl Phy6222Mac {
         let ieee = Self::read_factory_ieee();
         log::info!(
             "[MAC] IEEE: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            ieee[0], ieee[1], ieee[2], ieee[3], ieee[4], ieee[5], ieee[6], ieee[7]
+            ieee[0],
+            ieee[1],
+            ieee[2],
+            ieee[3],
+            ieee[4],
+            ieee[5],
+            ieee[6],
+            ieee[7]
         );
         Self {
             driver: Phy6222Driver::new(config),
@@ -309,11 +316,8 @@ impl MacDriver for Phy6222Mac {
                             break;
                         }
                         let remaining = deadline - now;
-                        let result = select::select(
-                            self.driver.receive(),
-                            Timer::after(remaining),
-                        )
-                        .await;
+                        let result =
+                            select::select(self.driver.receive(), Timer::after(remaining)).await;
 
                         if let select::Either::First(Ok(frame)) = result {
                             if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
@@ -333,11 +337,8 @@ impl MacDriver for Phy6222Mac {
                             break;
                         }
                         let remaining = deadline - now;
-                        let result = select::select(
-                            self.driver.receive(),
-                            Timer::after(remaining),
-                        )
-                        .await;
+                        let result =
+                            select::select(self.driver.receive(), Timer::after(remaining)).await;
 
                         if let select::Either::First(Ok(frame)) = result {
                             if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
@@ -401,8 +402,7 @@ impl MacDriver for Phy6222Mac {
             );
             let _ = self.csma_ca_transmit(&data_req, true).await;
 
-            let deadline =
-                embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
+            let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
 
             for _ in 0..20u8 {
                 let now = embassy_time::Instant::now();
@@ -411,8 +411,7 @@ impl MacDriver for Phy6222Mac {
                 }
                 let remaining = deadline - now;
 
-                let result =
-                    select::select(self.driver.receive(), Timer::after(remaining)).await;
+                let result = select::select(self.driver.receive(), Timer::after(remaining)).await;
 
                 match result {
                     select::Either::Second(_) => break,
@@ -437,9 +436,7 @@ impl MacDriver for Phy6222Mac {
 
                         // Check for Association Response (MAC command, type 3)
                         if frame_type == 0x03 {
-                            if let Some((addr, status_byte)) =
-                                parse_association_response(data)
-                            {
+                            if let Some((addr, status_byte)) = parse_association_response(data) {
                                 let status = match status_byte {
                                     0x00 => AssociationStatus::Success,
                                     0x01 => AssociationStatus::PanAtCapacity,
@@ -467,10 +464,7 @@ impl MacDriver for Phy6222Mac {
                                 let copy_len = payload.len().min(128);
                                 buf[..copy_len].copy_from_slice(&payload[..copy_len]);
                                 self.pending_assoc_frame = Some((buf, copy_len));
-                                log::info!(
-                                    "phy6222: saved post-assoc frame ({} bytes)",
-                                    copy_len
-                                );
+                                log::info!("phy6222: saved post-assoc frame ({} bytes)", copy_len);
                             }
                         }
                     }
@@ -484,16 +478,14 @@ impl MacDriver for Phy6222Mac {
 
         // After getting assoc response, listen briefly for more frames (Transport-Key)
         if confirm.is_some() && self.pending_assoc_frame.is_none() {
-            let deadline =
-                embassy_time::Instant::now() + embassy_time::Duration::from_millis(2000);
+            let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(2000);
             for _ in 0..20u8 {
                 let now = embassy_time::Instant::now();
                 if now >= deadline {
                     break;
                 }
                 let remaining = deadline - now;
-                let result =
-                    select::select(self.driver.receive(), Timer::after(remaining)).await;
+                let result = select::select(self.driver.receive(), Timer::after(remaining)).await;
                 if let select::Either::First(Ok(rx)) = result {
                     let data = &rx.data[..rx.len];
                     if data.len() >= 3 {
@@ -510,10 +502,7 @@ impl MacDriver for Phy6222Mac {
                                 let copy_len = payload.len().min(128);
                                 buf[..copy_len].copy_from_slice(&payload[..copy_len]);
                                 self.pending_assoc_frame = Some((buf, copy_len));
-                                log::info!(
-                                    "phy6222: saved post-assoc frame ({} bytes)",
-                                    copy_len
-                                );
+                                log::info!("phy6222: saved post-assoc frame ({} bytes)", copy_len);
                                 break;
                             }
                         }
@@ -685,11 +674,7 @@ impl MacDriver for Phy6222Mac {
                     .copied()
                     .collect::<heapless::Vec<u8, 24>>()
             } else {
-                build_data_request_ieee(
-                    self.next_dsn(),
-                    &parent,
-                    &self.extended_address,
-                )
+                build_data_request_ieee(self.next_dsn(), &parent, &self.extended_address)
             };
 
             if self.csma_ca_transmit(&data_req, true).await.is_err() {
@@ -697,8 +682,7 @@ impl MacDriver for Phy6222Mac {
             }
 
             // Wait up to 1500ms with up to 40 RX attempts per pass
-            let deadline =
-                embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
+            let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
 
             let mut got_none = false;
             for _rx_attempt in 0..40u8 {
@@ -738,8 +722,7 @@ impl MacDriver for Phy6222Mac {
                         }
 
                         // Verify MAC destination matches us or broadcast
-                        let (_src, dst, payload_offset, _security_use) =
-                            parse_mac_addresses(data);
+                        let (_src, dst, payload_offset, _security_use) = parse_mac_addresses(data);
                         match &dst {
                             MacAddress::Short(_, d) => {
                                 let for_us = d.0 == self.short_address.0

@@ -154,7 +154,9 @@ impl<'a, T: Instance> NrfMac<'a, T> {
         unsafe {
             // Check if already disabled
             let state = core::ptr::read_volatile(STATE as *const u32);
-            if state == 0 { return; } // 0 = DISABLED
+            if state == 0 {
+                return;
+            } // 0 = DISABLED
 
             // Clear event
             core::ptr::write_volatile(EVENTS_DISABLED as *mut u32, 0);
