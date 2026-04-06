@@ -307,7 +307,10 @@ impl Efr32Driver {
             config,
             initialized: false,
         };
-        drv.init_hardware();
+        // TODO: init_hardware() is disabled until register values are verified
+        // against the EFR32xG1 reference manual. The placeholder values cause
+        // crashes on real hardware.
+        // drv.init_hardware();
         drv
     }
 
