@@ -207,8 +207,8 @@ async fn main(_spawner: Spawner) {
     // Radio + MAC
     let radio = radio::ieee802154::Radio::new(p.RADIO, Irqs);
     let mut mac = zigbee_mac::nrf::NrfMac::new(radio);
-    mac.set_tx_power(8);
-    info!("Radio ready (TX +8 dBm)");
+    mac.set_tx_power(0);
+    info!("Radio ready (TX 0 dBm)");
 
     // ── Flash NV storage (last 2 pages of 1 MB flash) ──
     let nvmc = embassy_nrf::nvmc::Nvmc::new(p.NVMC);
