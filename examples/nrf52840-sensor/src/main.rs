@@ -127,42 +127,21 @@ core::arch::global_asm!(
     "bx lr",
 );
 
-/// Power down unused RAM banks to reduce sleep current.
-/// nRF52840 has 256 KB RAM in 9 banks; we keep only what's needed.
+/// Power down unused high RAM banks to reduce sleep current.
+/// 
+/// nRF52840 RAM layout: Banks 0-7 (8KB each, 64KB total) + Bank 8 (6×32KB, 192KB).
+/// Embassy allocates task stacks from the top of RAM downward, so we can only
+/// safely power down Bank 8 sections that are clearly above any possible stack use.
+/// For a SED sensor (~37KB BSS + 8KB stack), banks 0-7 (64KB) are sufficient.
+/// Bank 8 (0x20010000-0x20040000, 192KB) can be fully powered down.
 fn power_down_unused_ram() {
-    extern "C" { static __sheap: u8; }
-    let heap_start = unsafe { core::ptr::addr_of!(__sheap) as usize };
-    let ram_start: usize = 0x2000_0000;
-    let ram_end: usize = 0x2004_0000; // 256 KB
-    let stack_reserve: usize = 8 * 1024;
-    let used_end = heap_start;
-    let keep_end = ram_end - stack_reserve;
+    // Power down entire Bank 8 (192KB in 6 sections of 32KB)
+    // Bank 8 starts at 0x20010000 — well above our ~37KB BSS + stack
     const POWER_BASE: usize = 0x4000_0900;
-
-    // Banks 0-7: 8 KB each (2 sections of 4 KB)
-    for bank in 0u32..8 {
-        let bank_start = ram_start + (bank as usize) * 8192;
-        let bank_end = bank_start + 8192;
-        if bank_start >= used_end && bank_end <= keep_end {
-            let powerclr = (POWER_BASE + (bank as usize) * 0x10 + 0x08) as *mut u32;
-            unsafe { core::ptr::write_volatile(powerclr, 0x0003_0003); }
-        }
-    }
-    // Bank 8: 192 KB (6 sections of 32 KB)
     let powerclr8 = (POWER_BASE + 8 * 0x10 + 0x08) as *mut u32;
-    let mut mask8 = 0u32;
-    for section in 0u32..6 {
-        let section_start = ram_start + 64 * 1024 + (section as usize) * 32768;
-        let section_end = section_start + 32768;
-        if section_start >= used_end && section_end <= keep_end {
-            mask8 |= (1u32 << section) | (1u32 << (section + 16));
-        }
-    }
-    if mask8 != 0 {
-        unsafe { core::ptr::write_volatile(powerclr8, mask8); }
-    }
-    let saved_kb = (keep_end.saturating_sub(used_end)) / 1024;
-    info!("RAM: used ~{}KB, powered down ~{}KB", (used_end - ram_start) / 1024, saved_kb);
+    // All 6 sections off (bits 0-5 for power, bits 16-21 for retention)
+    unsafe { core::ptr::write_volatile(powerclr8, 0x003F_003F); }
+    info!("RAM: powered down 192KB (bank 8)");
 }
 
 #[embassy_executor::main]
@@ -182,9 +161,8 @@ async fn main(_spawner: Spawner) {
     };
     let p = embassy_nrf::init(config);
 
-    // RAM power-down disabled temporarily for debugging
-    // power_down_unused_ram();
-    info!("RAM power-down skipped (debugging)");
+
+    info!("Zigbee-RS nRF52840 sensor starting…");
 
     // LED1 on nRF52840-DK (P0.13, active LOW)
     let mut led = gpio::Output::new(p.P0_13, gpio::Level::High, gpio::OutputDrive::Standard);
