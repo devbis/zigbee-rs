@@ -73,32 +73,30 @@ const BUFC_BASE: u32 = 0x4008_2000;
 /// GPIO controller base.
 const _GPIO_BASE: u32 = 0x4000_A000;
 
-// ── CMU Register Offsets ────────────────────────────────────────
+// ── CMU Register Offsets (EFR32xG1 Series 1) ──────────────────
 
-/// High-frequency peripheral clock enable register 0.
-const CMU_HFPERCLKEN0: u32 = CMU_BASE + 0x044;
-/// High-frequency radio clock enable register.
-const CMU_HFRADIOCLKEN0: u32 = CMU_BASE + 0x0C8;
-/// CMU oscillator enable register.
-const CMU_OSCENCMD: u32 = CMU_BASE + 0x020;
-/// CMU clock select command register.
-const CMU_HFCLKSEL: u32 = CMU_BASE + 0x024;
 /// CMU status register.
 const CMU_STATUS: u32 = CMU_BASE + 0x01C;
-
-// ── CMU Clock Enable Bits ───────────────────────────────────────
-
-/// Bit 0 = RAC, bit 1 = FRC, bit 2 = MODEM — combined = 0x07 enables all radio.
-const CMU_HFRADIOCLKEN0_ALL: u32 = 0x07;
+/// CMU oscillator enable command register.
+const CMU_OSCENCMD: u32 = CMU_BASE + 0x020;
+/// CMU HFCLK select command register.
+const CMU_HFCLKSEL: u32 = CMU_BASE + 0x068;
+/// High-frequency core clock enable register 0.
+/// Bit 16 = RADIO (enables RAC/FRC/MODEM clocking).
+const CMU_HFCORECLKEN0: u32 = CMU_BASE + 0x090;
+/// High-frequency bus clock enable register 0.
+const CMU_HFBUSCLKEN0: u32 = CMU_BASE + 0x094;
+/// High-frequency peripheral clock enable register 0.
+const CMU_HFPERCLKEN0: u32 = CMU_BASE + 0x098;
 
 // ── RAC Register Offsets ────────────────────────────────────────
 
 /// RAC command register — triggers state transitions.
-const RAC_CMD: u32 = RAC_BASE + 0x004;
+const RAC_STATUS: u32 = RAC_BASE + 0x004;
+const RAC_CMD: u32 = RAC_BASE + 0x008;
 /// RAC status register — current radio state.
-const RAC_STATUS: u32 = RAC_BASE + 0x008;
 /// RAC interrupt flag register.
-const RAC_IF: u32 = RAC_BASE + 0x010;
+const RAC_IF: u32 = RAC_BASE + 0x014;
 /// RAC interrupt flag clear register.
 const RAC_IFC: u32 = RAC_BASE + 0x018;
 /// RAC interrupt enable register.
@@ -378,12 +376,18 @@ impl Efr32Driver {
         // Switch HFCLK source to HFXO (write 2 to HFCLKSEL)
         reg_write(CMU_HFCLKSEL, 2);
 
-        // Enable high-frequency peripheral clock
-        // On Series 1, radio peripherals (RAC/FRC/MODEM) are on HFPERCLK bus
-        // and don't have a separate HFRADIOCLKEN0 register.
-        // RAC manages its own clock gating internally.
+        // Enable RADIO clock (bit 16 of HFCORECLKEN0)
+        // This enables RAC, FRC, MODEM peripheral clocking on Series 1.
+        let val = reg_read(CMU_HFCORECLKEN0);
+        reg_write(CMU_HFCORECLKEN0, val | (1 << 16));
+
+        // Enable HFPERCLK for GPIO/Timer
         let val = reg_read(CMU_HFPERCLKEN0);
-        reg_write(CMU_HFPERCLKEN0, val | (1 << 0)); // Timer0 for timing
+        reg_write(CMU_HFPERCLKEN0, val | 1);
+
+        // Enable HFBUSCLK for GPIO
+        let val = reg_read(CMU_HFBUSCLKEN0);
+        reg_write(CMU_HFBUSCLKEN0, val | (1 << 1)); // GPIO
     }
 
     /// Configure RAC (Radio Controller) for 802.15.4 operation.
@@ -424,6 +428,10 @@ impl Efr32Driver {
         reg_write(RAC_BASE + 0x74, 0x0000_0010); // misc
         reg_write(RAC_BASE + 0x78, 0x0000_01C3); // misc
         // 0x7C = RAIL RAM pointer (skip)
+
+        // Enable RAC sequencer (bit 0 of CTRL at 0x0C)
+        let ctrl = reg_read(RAC_BASE + 0x0C);
+        reg_write(RAC_BASE + 0x0C, ctrl | 1);
 
         // Clear and enable relevant IRQs
         reg_write(RAC_IFC, RAC_IF_TXDONE | RAC_IF_RXDONE | RAC_IF_RXOF);
@@ -767,31 +775,19 @@ impl Efr32Driver {
     /// Disables radio peripheral clocks via CMU. Saves ~5–10 mA on EFR32MG1P.
     /// Call `radio_wake()` before the next TX or RX operation.
     pub fn radio_sleep(&self) {
-        // Disable RX/TX
         reg_write(RAC_CMD, RAC_CMD_TXDIS | RAC_CMD_RXDIS);
-
-        // Clear pending IRQs
         reg_write(RAC_IFC, RAC_IF_TXDONE | RAC_IF_RXDONE | RAC_IF_RXOF);
-
-        // Disable radio block clocks to save power
-        // Series 1: use RAC CMD to disable (no HFRADIOCLKEN0)
-        reg_write(RAC_CMD, RAC_CMD_TXDIS | RAC_CMD_RXDIS);
+        // Disable RADIO clock (bit 16 of HFCORECLKEN0)
+        let val = reg_read(CMU_HFCORECLKEN0);
+        reg_write(CMU_HFCORECLKEN0, val & !(1 << 16));
     }
 
     /// Re-enable radio after `radio_sleep()`.
-    ///
-    /// Re-enables clocks and re-applies channel configuration.
-    /// Must be called before any TX/RX operation after sleep.
     pub fn radio_wake(&mut self) {
-        // Re-enable radio block clocks
-        // Series 1: radio clocks managed by RAC internally
-
-        // Small settling delay for clocks
-        for _ in 0..1_000u32 {
-            core::hint::spin_loop();
-        }
-
-        // Re-apply channel (re-locks PLL)
+        // Re-enable RADIO clock
+        let val = reg_read(CMU_HFCORECLKEN0);
+        reg_write(CMU_HFCORECLKEN0, val | (1 << 16));
+        for _ in 0..1_000u32 { core::hint::spin_loop(); }
         self.set_channel(self.config.channel);
     }
 }
