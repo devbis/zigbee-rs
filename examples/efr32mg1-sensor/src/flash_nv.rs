@@ -121,6 +121,8 @@ impl FlashDriver for Efr32FlashDriver {
     }
 }
 
-pub fn create_nv() -> LogStructuredNv<Efr32FlashDriver> {
+pub type Nv = LogStructuredNv<Efr32FlashDriver>;
+
+pub fn create_nv() -> Nv {
     LogStructuredNv::new(Efr32FlashDriver::new(), NV_PAGE_A, NV_PAGE_B)
 }

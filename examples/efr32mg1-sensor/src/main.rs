@@ -68,6 +68,7 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
+use static_cell::StaticCell;
 
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::efr32::Efr32Mac;
@@ -195,8 +196,12 @@ async fn main(_spawner: Spawner) {
     // Simulated sensor state
     let mut hum_tick: u32 = 0;
 
-    // Build device (SED)
-    let mut device = ZigbeeDevice::builder(mac)
+    // Build device (SED) — place in static to reduce async future size.
+    // Without this, the entire ZigbeeDevice (~10KB+) gets inlined into
+    // the main async future, requiring a 20KB+ arena on a 32KB SRAM chip.
+    // With StaticCell, only a &mut reference (4 bytes) is in the future.
+    static DEVICE: StaticCell<ZigbeeDevice<Efr32Mac>> = StaticCell::new();
+    let device = DEVICE.init(ZigbeeDevice::builder(mac)
         .device_type(DeviceType::EndDevice)
         .power_mode(PowerMode::Sleepy {
             poll_interval_ms: 10_000,
@@ -213,7 +218,7 @@ async fn main(_spawner: Spawner) {
                 .cluster_server(0x0402) // Temperature Measurement
                 .cluster_server(0x0405) // Relative Humidity
         })
-        .build();
+        .build());
 
     // Restore previous network state from flash
     let restored = device.restore_state(&nv);
@@ -239,7 +244,7 @@ async fn main(_spawner: Spawner) {
     }
 
     // Default reporting so device reports even before ZHA interview
-    setup_default_reporting(&mut device);
+    setup_default_reporting(device);
 
     // Set initial sensor values
     {
