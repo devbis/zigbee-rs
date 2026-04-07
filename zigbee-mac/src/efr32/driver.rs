@@ -273,28 +273,44 @@ const FRC_IF_FRAMEERROR: u32 = 1 << 6;
 const _FRC_IF_BLOCKERROR: u32 = 1 << 7;
 const FRC_IF_RXOF: u32 = 1 << 8;
 
-// ── MODEM Register Offsets ──────────────────────────────────────
+// ── MODEM Register Offsets (CMSIS: efr32fg1v_modem.h) ──────────
+// 0x000–0x010 are read-only status registers; first writable is MIXCTRL at 0x014.
 
-/// MODEM control register 0 — modulation format.
-const _MODEM_CTRL0: u32 = MODEM_BASE + 0x000;
+/// MODEM status register (RO).
+const _MODEM_STATUS: u32 = MODEM_BASE + 0x000;
 
-// ── SYNTH Register Offsets ──────────────────────────────────────
+// ── SYNTH Register Offsets (CMSIS: efr32fg1v_synth.h) ──────────
 
-/// SYNTH channel frequency control register.
-const SYNTH_FREQ: u32 = SYNTH_BASE + 0x004;
+/// SYNTH status register (RO).
+const _SYNTH_STATUS: u32 = SYNTH_BASE + 0x000;
+/// SYNTH command register (WO).
+const _SYNTH_CMD: u32 = SYNTH_BASE + 0x004;
+/// SYNTH control register.
+const SYNTH_CTRL: u32 = SYNTH_BASE + 0x008;
+/// SYNTH calibration control register.
+const _SYNTH_CALCTRL: u32 = SYNTH_BASE + 0x00C;
+/// SYNTH frequency register (base frequency).
+const SYNTH_FREQ: u32 = SYNTH_BASE + 0x02C;
+/// SYNTH IF frequency register.
+const SYNTH_IFFREQ: u32 = SYNTH_BASE + 0x030;
+/// SYNTH divider control (LO divider).
+const SYNTH_DIVCTRL: u32 = SYNTH_BASE + 0x034;
+/// SYNTH channel control register (channel number).
+const SYNTH_CHCTRL: u32 = SYNTH_BASE + 0x038;
 /// SYNTH channel spacing register.
-const SYNTH_CHSP: u32 = SYNTH_BASE + 0x008;
-/// SYNTH channel number register.
-const SYNTH_CHNO: u32 = SYNTH_BASE + 0x00C;
-/// SYNTH command register.
-const SYNTH_CMD: u32 = SYNTH_BASE + 0x010;
+const SYNTH_CHSP: u32 = SYNTH_BASE + 0x03C;
+/// SYNTH calibration offset register.
+const _SYNTH_CALOFFSET: u32 = SYNTH_BASE + 0x040;
+/// SYNTH VCO tuning register.
+const _SYNTH_VCOTUNING: u32 = SYNTH_BASE + 0x044;
 
-// ── AGC Register Offsets ────────────────────────────────────────
+// ── AGC Register Offsets (CMSIS: efr32fg1v_agc.h) ──────────────
+// 0x000–0x00C are read-only status registers; first writable is CTRL0 at 0x014.
 
 /// AGC control register 0.
-const _AGC_CTRL0: u32 = AGC_BASE + 0x000;
-/// AGC RSSI register — current received signal strength.
-const AGC_RSSI: u32 = AGC_BASE + 0x020;
+const _AGC_CTRL0: u32 = AGC_BASE + 0x014;
+/// AGC RSSI register — current received signal strength (RO, 0x008).
+const AGC_RSSI: u32 = AGC_BASE + 0x008;
 
 // ── BUFC Register Offsets (from CMSIS TypeDef at 0x40081000) ────
 
@@ -633,28 +649,53 @@ impl Efr32Driver {
         }
 
         // CTRL (0x00C): Enable active/PA/LNA polarities
-        // From baremetal: ACTIVEPOL | PAENPOL | LNAENPOL = 0x381
         reg_write(RAC_CTRL, 0x0000_0381);
 
-        // SYNTHREGCTRL (0x09C): voltage regulator trims for synth
-        // From baremetal: CHPLDOVREFTRIM=3, CHPLDOAMPCURR=3, etc.
-        reg_write(RAC_SYNTHREGCTRL, 0x0000_0FFF);
+        // SYNTHREGCTRL (0x09C): from reference dump = 0x0363_6D80
+        reg_write(RAC_SYNTHREGCTRL, 0x0363_6D80);
 
-        // VCOCTRL (0x0A0): VCO control
+        // VCOCTRL (0x0A0): from reference dump = 0x0F00_277A
         reg_write(RAC_VCOCTRL, 0x0F00_277A);
 
-        // IFPGACTRL (0x138): IF PGA control — band select + gain
-        reg_write(RAC_IFPGACTRL, 0x0000_87F6);
+        // LNAMIXCTRL (0x0FC): from reference dump = 0x00000000
+        reg_write(RAC_BASE + 0x0FC, 0x0000_0000);
 
-        // IFFILTCTRL (0x140): IF filter control
-        reg_write(RAC_IFFILTCTRL, 0x0088_00E0);
+        // LNAMIXCTRL1 (0x134): from reference dump = 0x00301F19
+        reg_write(RAC_BASE + 0x134, 0x0030_1F19);
 
-        // IFADCCTRL (0x144): IF ADC control
+        // IFPGACTRL (0x138): from reference dump = 0x000087E6
+        reg_write(RAC_IFPGACTRL, 0x0000_87E6);
+
+        // IFPGACAL (0x13C): from reference dump = 0x000008E0
+        reg_write(RAC_BASE + 0x13C, 0x0000_08E0);
+
+        // IFFILTCTRL (0x140): from reference dump = 0x0088006D
+        reg_write(RAC_IFFILTCTRL, 0x0088_006D);
+
+        // IFADCCTRL (0x144): from reference dump = 0x115E6C0
         reg_write(RAC_IFADCCTRL, 0x1153_E6C0);
+
+        // PA registers (0x100-0x150) — power amplifier configuration
+        reg_write(RAC_BASE + 0x100, 0x0000_0004); // PACTRL0
+        reg_write(RAC_BASE + 0x104, 0x0104_D700); // PAPKDCTRL
+        reg_write(RAC_BASE + 0x108, 0x0040_0484); // PABIASCTRL0
+        reg_write(RAC_BASE + 0x10C, 0x0002_4525); // PABIASCTRL1
+        reg_write(RAC_BASE + 0x150, 0x001E_0044); // PACTUNECTRL
+
+        // Sub-GHz PA registers (set to reference values)
+        reg_write(RAC_BASE + 0x110, 0x0000_0000); // SGRFENCTRL0
+        reg_write(RAC_BASE + 0x114, 0x0186_DB00); // SGLNAMIXCTRL
+        reg_write(RAC_BASE + 0x118, 0x4000_0008); // SGPACTRL0
+        reg_write(RAC_BASE + 0x11C, 0x0108_D700); // SGPAPKDCTRL
+        reg_write(RAC_BASE + 0x120, 0x0700_0444); // SGPABIASCTRL0
+        reg_write(RAC_BASE + 0x124, 0x0008_4523); // SGPABIASCTRL1
+
+        // RFBIASCAL (0x130): from reference dump
+        reg_write(RAC_BASE + 0x130, 0x0025_1504); // RFBIASCAL
 
         // Clear force-disable if set
         let ctrl = reg_read(RAC_CTRL);
-        if ctrl & (1 << 14) != 0 { // FORCEDISABLE bit
+        if ctrl & (1 << 14) != 0 {
             reg_write(RAC_CTRL, ctrl & !(1 << 14));
         }
 
@@ -724,121 +765,157 @@ impl Efr32Driver {
 
     /// Configure MODEM for IEEE 802.15.4 O-QPSK modulation at 250 kbps.
     ///
-    /// All 32 register words from a working RAIL-based firmware on EFR32MG1P.
+    /// Register values from a working RAIL-based firmware on EFR32MG1P.
     /// Configures O-QPSK with half-sine pulse shaping, 2 Mchip/s chip rate,
     /// 62.5 ksym/s symbol rate, DSSS spreading (32 chips/symbol).
+    ///
+    /// CMSIS: offsets 0x000–0x010 are read-only status registers (STATUS,
+    /// TIMDETSTATUS, FREQOFFSET, AFCADJRX, AFCADJTX). We start writing
+    /// at MIXCTRL (0x014) — the first read-write register.
     fn configure_modem(&self) {
-        // MODEM registers at 0x40086000, 32 words (0x00..0x7C)
-        static MODEM_REGS: [u32; 32] = [
-            0x0000_0000, // [0x00] CTRL0
-            0x0000_0000, // [0x04] CTRL1
-            0xFFFF_0000, // [0x08] CTRL2
-            0x0000_0000, // [0x0C] CTRL3
-            0x0000_0000, // [0x10] CTRL4
-            0x0000_0010, // [0x14] CTRL5
-            0x0413_F920, // [0x18] TXBR (TX baud rate)
-            0x0052_C007, // [0x1C] RXBR (RX baud rate)
-            0x0000_0000, // [0x20] CF (carrier frequency)
-            0x0000_0000, // [0x24]
-            0x0300_0000, // [0x28] timing
-            0x0000_0000, // [0x2C]
-            0x00FF_0264, // [0x30] pre/sync config
-            0x0000_08A2, // [0x34] sync word
-            0x0000_0001, // [0x38] sync config
-            0x0008_07B0, // [0x3C] DSSS config
-            0x0000_00A7, // [0x40] SFD (0xA7 = 802.15.4 SFD)
-            0x0000_0000, // [0x44]
-            0x0AC0_0141, // [0x48] demod config
-            0x744A_C39B, // [0x4C] spreading/chip config
-            0x0000_03F0, // [0x50]
-            0x0000_0000, // [0x54]
-            0x0000_0000, // [0x58]
-            0x3010_0101, // [0x5C] demod timing
-            0x7F7F_7050, // [0x60] AGC integration
-            0x0000_0000, // [0x64]
-            0x0000_0500, // [0x68]
-            0x00F0_0000, // [0x6C]
-            0x0000_0000, // [0x70]
-            0x0000_0000, // [0x74]
-            0x0000_0000, // [0x78]
-            0x0000_0000, // [0x7C]
+        // MODEM writable registers from MIXCTRL (0x14) through ROUTELOC1 (0x78)
+        // = 26 words. Values from RAIL reference firmware dump at 0x40086014.
+        static MODEM_REGS: [u32; 26] = [
+            0x0000_0010, // [0x14] MIXCTRL
+            0x0413_F920, // [0x18] CTRL0
+            0x0052_C007, // [0x1C] CTRL1
+            0x0000_0000, // [0x20] CTRL2
+            0x0000_0000, // [0x24] CTRL3
+            0x0300_0000, // [0x28] CTRL4
+            0x0000_0000, // [0x2C] CTRL5
+            0x00FF_0264, // [0x30] TXBR
+            0x0000_08A2, // [0x34] RXBR
+            0x0000_0001, // [0x38] CF
+            0x0008_07B0, // [0x3C] PRE
+            0x0000_00A7, // [0x40] SYNC0 (802.15.4 SFD = 0xA7)
+            0x0000_0000, // [0x44] SYNC1
+            0x0AC0_0141, // [0x48] TIMING
+            0x744A_C39B, // [0x4C] DSSS0
+            0x0000_03F0, // [0x50] MODINDEX
+            0x0000_0000, // [0x54] AFC
+            0x0101_1030, // [0x58] AFCADJLIM (from ref dump, was 0)
+            0x5070_7F7F, // [0x5C] SHAPING0 (from ref dump)
+            0x0000_0000, // [0x60] SHAPING1 (from ref dump)
+            0x0000_0500, // [0x64] SHAPING2 (from ref dump)
+            0x0000_0000, // [0x68] RAMPCTRL (from ref dump)
+            0x00F0_0000, // [0x6C] RAMPLEV
+            0x0000_0000, // [0x70] ROUTEPEN
+            0x0000_0000, // [0x74] ROUTELOC0
+            0x0000_0000, // [0x78] ROUTELOC1
         ];
 
         for (i, &val) in MODEM_REGS.iter().enumerate() {
-            reg_write(MODEM_BASE + (i as u32) * 4, val);
+            reg_write(MODEM_BASE + 0x14 + (i as u32) * 4, val);
         }
     }
 
     /// Configure SYNTH (Frequency Synthesizer) for 2.4 GHz 802.15.4 channels.
+    ///
+    /// CMSIS layout: STATUS(0x00), CMD(0x04), CTRL(0x08), CALCTRL(0x0C),
+    /// reserved(0x10-0x020), VCDACCTRL(0x24), reserved(0x28),
+    /// FREQ(0x2C), IFFREQ(0x30), DIVCTRL(0x34), CHCTRL(0x38), CHSP(0x3C).
+    ///
+    /// Base frequency: 2405 MHz (channel 11), channel spacing: 5 MHz.
+    /// Channels 11–26 → 2405–2480 MHz.
     fn configure_synth(&self) {
-        // Base frequency: 2405 MHz (channel 11)
-        // Channel spacing: 5 MHz
-        // Channels 11-26 → 2405-2480 MHz
+        // All values from a working RAIL-based 802.15.4 firmware dump.
+        //
+        // CRITICAL: RAIL programs SYNTH_FREQ directly for each channel,
+        // NOT using CHCTRL/CHSP. FREQ encodes the full VCO frequency.
+        // Formula: FREQ = freq_hz * lodiv * 524288 / HFXO_hz
 
-        // Base frequency and channel spacing — these are programmed
-        // dynamically by the PLL configuration. The exact encoding depends
-        // on the SYNTH divider setup. Leave at reset defaults; channel
-        // selection uses SYNTH_CHNO + SYNTH_CMD.
-        reg_write(SYNTH_FREQ, 0x0000_0000);
-        reg_write(SYNTH_CHSP, 0x0000_0000);
+        // SYNTH_CTRL: dithering and lock threshold (from reference)
+        reg_write(SYNTH_CTRL, 0x0000_AC3F);
+
+        // SYNTH_CALCTRL (0x00C): calibration control
+        reg_write(SYNTH_BASE + 0x00C, 0x0004_2801);
+
+        // SYNTH_VCDACCTRL (0x024)
+        reg_write(SYNTH_BASE + 0x024, 0x0000_0023);
+
+        // SYNTH_FREQ: initial = channel 11 = 2405 MHz
+        // 2405e6 * 1 * 524288 / 38400000 = 32836267 = 0x01F50AAB
+        reg_write(SYNTH_FREQ, 0x01F5_0AAB);
+
+        // SYNTH_IFFREQ: IF frequency + LOSIDE bit (from reference dump)
+        // Ref value: 0x00104924 (LOSIDE=1, IFFREQ=0x4924)
+        reg_write(SYNTH_IFFREQ, 0x0010_4924);
+
+        // SYNTH_DIVCTRL: lodiv=1 for 2.4 GHz
+        // Ref value: 0x01 (divC=1, divA=divB=0 → lodiv=1)
+        reg_write(SYNTH_DIVCTRL, 0x0000_0001);
+
+        // SYNTH_CHCTRL: channel 0 (will be set by set_channel)
+        reg_write(SYNTH_CHCTRL, 0);
+
+        // SYNTH_CHSP: channel spacing (15 from reference — RAIL uses direct FREQ)
+        reg_write(SYNTH_CHSP, 0x0000_000F);
+
+        // SYNTH_VCOGAIN (0x050)
+        reg_write(SYNTH_BASE + 0x050, 0x0000_0029);
     }
 
     /// Configure AGC (Automatic Gain Control) for 802.15.4 reception.
     ///
-    /// Register values from a working RAIL-based firmware on EFR32MG1P.
+    /// All values from the working RAIL firmware dump.
+    /// CMSIS: STATUS0-FRAMERSSI (0x00-0x0C) are RO, CTRL0 starts at 0x14.
     fn configure_agc(&self) {
-        reg_write(AGC_BASE + 0x00, 0x18C9_8021); // CTRL0 — AGC mode/target
-        reg_write(AGC_BASE + 0x04, 0x0000_0080); // CTRL1
-        reg_write(AGC_BASE + 0x08, 0x0000_8000); // CTRL2
-        reg_write(AGC_BASE + 0x0C, 0x0000_8000); // CTRL3
-        reg_write(AGC_BASE + 0x14, 0x0000_E0FA); // MININDEX
-        reg_write(AGC_BASE + 0x18, 0x0000_18E7); // MANGAIN
-        reg_write(AGC_BASE + 0x1C, 0x8284_0000); // timing/hold
-        reg_write(AGC_BASE + 0x24, 0x0000_0082); // misc
-        reg_write(AGC_BASE + 0x28, 0x0180_0000); // misc
+        // Values directly from reference firmware register dump
+        reg_write(AGC_BASE + 0x14, 0x0000_E0FA); // CTRL0
+        reg_write(AGC_BASE + 0x18, 0x0000_18E7); // CTRL1
+        reg_write(AGC_BASE + 0x1C, 0x8284_0000); // CTRL2
+        reg_write(AGC_BASE + 0x20, 0x0000_0000); // RSSISTEPTHR (ref=0)
+        reg_write(AGC_BASE + 0x24, 0x0000_0082); // IFPEAKDET
+        reg_write(AGC_BASE + 0x28, 0x0180_0000); // MANGAIN
 
-        // Gain table entries
-        reg_write(AGC_BASE + 0x48, 0x0000_3D3C);
-        reg_write(AGC_BASE + 0x4C, 0x0000_19BC);
-        reg_write(AGC_BASE + 0x50, 0x0CA8_6543); // gain steps
-        reg_write(AGC_BASE + 0x54, 0x0654_3210); // gain steps
-        reg_write(AGC_BASE + 0x58, 0x18B5_2507); // PNRF gain
-        reg_write(AGC_BASE + 0x5C, 0x2518_3DCD); // PNRF gain
-
-        // LNA/mixer control
-        reg_write(AGC_BASE + 0x70, 0x0001_0103);
-        reg_write(AGC_BASE + 0x74, 0x0000_0442);
-        reg_write(AGC_BASE + 0x78, 0x0055_2300);
+        // Gain table entries (from reference dump at 0x48-0x78)
+        reg_write(AGC_BASE + 0x48, 0x0000_3D3C); // GAINRANGE
+        reg_write(AGC_BASE + 0x4C, 0x0000_19BC); // GAININDEX
+        reg_write(AGC_BASE + 0x50, 0x0CA8_6543); // SLICECODE
+        reg_write(AGC_BASE + 0x54, 0x0654_3210); // ATTENCODE1
+        reg_write(AGC_BASE + 0x58, 0x18B5_2507); // ATTENCODE2
+        reg_write(AGC_BASE + 0x5C, 0x2518_3DCD); // ATTENCODE3
+        reg_write(AGC_BASE + 0x60, 0x0000_0000); // GAINERROR1
+        reg_write(AGC_BASE + 0x64, 0x0000_0000); // GAINERROR2
+        reg_write(AGC_BASE + 0x68, 0x0000_0000); // GAINERROR3
+        reg_write(AGC_BASE + 0x70, 0x0001_0103); // GAINSTEPLIM
+        reg_write(AGC_BASE + 0x74, 0x0000_0442); // LOOPDEL
+        reg_write(AGC_BASE + 0x78, 0x0055_2300); // MININDEX
     }
 
-    /// Set TX power via RAC PA config register.
+    /// Set TX power via RAC PA registers.
     ///
-    /// EFR32MG1P supports -20 dBm to +19 dBm output power.
-    fn set_tx_power(&self, dbm: i8) {
-        let power = dbm.clamp(-20, 19);
-        // Map dBm to PA power register value.
-        // The exact mapping is non-linear; linear approximation:
-        //   -20 dBm → ~0, 0 dBm → ~64, +19 dBm → ~252
-        let pa_val = ((power as i16 + 20) * 252 / 39).clamp(0, 252) as u32;
-        // PA config is at RAC_BASE + 0x48 (confirmed from register dump value 0x8C)
-        let old = reg_read(RAC_BASE + 0x48);
-        reg_write(RAC_BASE + 0x48, (old & 0xFFFF_FF00) | pa_val);
+    /// Reference firmware values at RAC 0x100-0x15C for PA configuration.
+    fn set_tx_power(&self, _dbm: i8) {
+        // PA registers from reference dump (RAC_BASE + 0x100+)
+        // PACTRL0: configures PA slices and power level
+        reg_write(RAC_BASE + 0x100, 0x0000_0004); // PACTRL0
+        reg_write(RAC_BASE + 0x104, 0x0104_D700); // PAPKDCTRL
+        reg_write(RAC_BASE + 0x108, 0x0040_0484); // PABIASCTRL0
+        reg_write(RAC_BASE + 0x10C, 0x0002_4525); // PABIASCTRL1
+        // PACTUNECTRL (0x150): PA tuning
+        reg_write(RAC_BASE + 0x150, 0x001E_0044); // CTune TX/RX
     }
 
     /// Set RF channel for IEEE 802.15.4.
     ///
     /// Channels 11–26 map to center frequencies 2405–2480 MHz (5 MHz spacing).
+    /// Programs SYNTH_FREQ directly (same approach as RAIL library).
     fn set_channel(&self, channel: u8) {
         let ch = channel.clamp(11, 26);
-        let ch_offset = (ch - 11) as u32;
+        let freq_mhz = 2405u32 + (ch as u32 - 11) * 5;
 
-        // Write channel number to SYNTH — the PLL locks to the new frequency.
-        reg_write(SYNTH_CHNO, ch_offset);
+        // FREQ = freq_hz * lodiv * 524288 / HFXO_hz
+        // lodiv=1, HFXO=38400000
+        // FREQ = freq_mhz * 1000000 * 524288 / 38400000
+        //      = freq_mhz * 524288000 / 38400
+        //      = freq_mhz * 13652 + freq_mhz * 8 / 38400 * 1000000
+        // Simplified: FREQ = freq_mhz * 13653 + (freq_mhz * 2048 / 75)
+        // Actually just use 64-bit math:
+        let freq_reg = (freq_mhz as u64 * 1_000_000 * 524_288 / 38_400_000) as u32;
+        reg_write(SYNTH_FREQ, freq_reg);
 
-        // Trigger synthesizer calibration for new channel
-        reg_write(SYNTH_CMD, 0x0000_0001);
-
-        // Wait for PLL lock (~50µs typical)
+        // Short delay for PLL lock (~50µs)
         for _ in 0..5_000u32 {
             core::hint::spin_loop();
         }
@@ -945,21 +1022,20 @@ impl Efr32Driver {
             self.config.channel
         );
 
-        // Wait for TX completion with timeout (poll-based, ~100ms max)
-        let mut timeout_loops = 0u32;
-        loop {
-            // Check if TX_DONE was signaled
-            if let Some(ok) = TX_DONE.try_take() {
-                return if ok { Ok(()) } else { Err(RadioError::HardwareError) };
+        // Wait for TX completion with async timeout (10ms should be plenty)
+        let result = embassy_futures::select::select(
+            TX_DONE.wait(),
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(10)),
+        ).await;
+
+        match result {
+            embassy_futures::select::Either::First(ok) => {
+                if ok { Ok(()) } else { Err(RadioError::HardwareError) }
             }
-            timeout_loops += 1;
-            if timeout_loops > 1_000_000 {
-                // TX timed out — abort and return error
+            embassy_futures::select::Either::Second(_) => {
                 reg_write(RAC_CMD, RAC_CMD_TXDIS);
-                log::warn!("efr32: TX timeout, RAC={:#X}", reg_read(RAC_STATUS));
-                return Err(RadioError::HardwareError);
+                Err(RadioError::HardwareError)
             }
-            core::hint::spin_loop();
         }
     }
 
