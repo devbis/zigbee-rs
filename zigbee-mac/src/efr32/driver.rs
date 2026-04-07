@@ -558,6 +558,14 @@ impl Efr32Driver {
         reg_write(SEQ_RX_SEARCHTIME, 0);
         reg_write(SEQ_TX_RX_SEARCHTIME, 0);
 
+        // CRITICAL: Configure state transitions (RADIO_TRANSITIONS at SEQ->REG000)
+        // Without this, the sequencer ignores TXEN/RXEN commands!
+        // From baremetal radio_phy.c:
+        //   TX success → RX (bit 18), TX error → RX (bit 26)
+        //   RX success → RX (bit 2), RX error → RX (bit 10)
+        // RAIL_RF_STATE_IDLE=1, RAIL_RF_STATE_RX=2, RAIL_RF_STATE_TX=3
+        reg_write(_SEQ_TRANSITIONS, 0x0404_0404); // all transitions → RX
+
         // SYNTH LPF control for RX and TX
         reg_write(SEQ_SYNTHLPFCTRLRX, 0x0003_C002);
         reg_write(SEQ_SYNTHLPFCTRLTX, 0x0003_C002);
