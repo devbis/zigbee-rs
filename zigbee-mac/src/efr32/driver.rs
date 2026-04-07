@@ -488,9 +488,10 @@ impl Efr32Driver {
 
     // ── Hardware initialization ─────────────────────────────────
 
-    /// Full radio initialization: clocks → RAC → BUFC → FRC → MODEM → SYNTH → AGC.
+    /// Full radio initialization: clocks → PROTIMER → RAC → BUFC → FRC → MODEM → SYNTH → AGC.
     fn init_hardware(&mut self) {
         self.enable_clocks();
+        self.configure_protimer();
         self.load_rac_sequences();
         self.configure_rac();
         self.configure_bufc();
@@ -501,7 +502,47 @@ impl Efr32Driver {
         self.apply_config();
 
         self.initialized = true;
-        log::info!("efr32: radio initialized in IEEE 802.15.4 mode");
+    }
+
+    /// Initialize PROTIMER (Protocol Timer) — required by RAC sequencer.
+    ///
+    /// The PROTIMER provides timing for the radio state machine.
+    /// Without it, the sequencer cannot schedule TX/RX warm-up
+    /// and transitions, causing SEQSTATUS to go to DONE immediately.
+    ///
+    /// PROTIMER base = 0x40085000, clock from RADIOCLKEN0 bit 0.
+    fn configure_protimer(&self) {
+        const PROTIMER_BASE: u32 = 0x4008_5000;
+        const PROTIMER_CTRL: u32 = PROTIMER_BASE + 0x000;
+        const PROTIMER_CMD: u32 = PROTIMER_BASE + 0x004;
+        const PROTIMER_PRECNTTOP: u32 = PROTIMER_BASE + 0x028;
+        const PROTIMER_WRAPCNTTOP: u32 = PROTIMER_BASE + 0x030;
+        const PROTIMER_IFC: u32 = PROTIMER_BASE + 0x064;
+        const PROTIMER_IEN: u32 = PROTIMER_BASE + 0x068;
+
+        // CTRL = 0x11100 (from baremetal)
+        reg_write(PROTIMER_CTRL, 0x0001_1100);
+
+        // PRECNTTOP: derived from system clock
+        // precnttop = (HFCLK_Hz / 1000) * 0x200 + 500) / 1000
+        // For 38.4 MHz: (38400000/1000) * 512 + 500) / 1000 = (38400*512+500)/1000 = 19661
+        // = 0x4CBD → encoded as (0x4CBD & 0xFF) | ((0x4CBD & 0xFFFFFF00) - 0x100)
+        let hfclk = 38_400_000u32;
+        let precnttop_raw = (hfclk / 1000 * 0x200 + 500) / 1000;
+        let precnttop = (precnttop_raw & 0xFF) | (precnttop_raw & 0xFFFFFF00).wrapping_sub(0x100);
+        reg_write(PROTIMER_PRECNTTOP, precnttop);
+
+        // WRAPCNTTOP = 0 (from baremetal)
+        reg_write(PROTIMER_WRAPCNTTOP, 0);
+
+        // Enable WRAPCNTOF interrupt
+        reg_write(PROTIMER_IEN, 1 << 2); // WRAPCNTOF = bit 2
+
+        // Clear pending interrupts
+        reg_write(PROTIMER_IFC, 0xFFFF_FFFF);
+
+        // Start the timer (CMD bit 0 = START)
+        reg_write(PROTIMER_CMD, 1);
     }
 
     /// Load RAC sequencer microcode into RAM.
@@ -573,7 +614,14 @@ impl Efr32Driver {
         reg_write(SEQ_SYNTHLPFCTRLRX, 0x0003_C002);
         reg_write(SEQ_SYNTHLPFCTRLTX, 0x0003_C002);
 
-        // 9. Start RX
+        // 9. Resume sequencer again (it may have finished init and stopped)
+        reg_write(RAC_SEQCMD, RAC_SEQCMD_RESUME);
+        for _ in 0..10_000u32 { core::hint::spin_loop(); }
+
+        // 10. Start RX (clear disable flag, set IFPGA, enable RXENSRCEN)
+        let seq_ctrl = reg_read(SEQ_CONTROL_REG);
+        reg_write(SEQ_CONTROL_REG, seq_ctrl & !0x20);
+        reg_write(RAC_IFPGACTRL, 0x0000_87F6);
         reg_write(_RAC_RXENSRCEN, 0x02);
         for _ in 0..50_000u32 { core::hint::spin_loop(); }
 
