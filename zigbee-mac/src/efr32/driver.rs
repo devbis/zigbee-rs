@@ -575,58 +575,92 @@ impl Efr32Driver {
     /// RAC_CMD_TXEN/RXEN trigger the sequencer to coordinate SYNTH
     /// calibration, PA enable, FRC TX/RX, and return to idle.
     fn load_rac_sequences(&self) {
+        // Matches VDowbensky/efr32_baremetal RADIO_SeqInit() EXACTLY.
+        //
+        // VDowbensky genericSeqProg = 3820 bytes (955 words).
+        // Code: 0x21000000-0x21000EEB
+        // Variables: 0x21000EFC-0x21000FFF (cleared before resume)
+        //
+        // CRITICAL: Do NOT write variables before RESUME!
+        // The sequencer starts with all vars=0 and enters WAITING state.
+        // Variables are set AFTER resume by RADIO_Config().
+
         // 1. Halt sequencer
         reg_write(RAC_SEQCMD, RAC_SEQCMD_HALT);
 
-        // 2. Clear sequencer RAM (4KB)
-        let dst_base = 0x2100_0000u32;
+        // 2. Clear ALL 4KB of sequencer RAM
         for i in 0..1024u32 {
-            reg_write(dst_base + i * 4, 0);
+            reg_write(0x2100_0000 + i * 4, 0);
         }
 
-        // 3. Set vector address and compact mode
-        reg_write(RAC_VECTADDR, dst_base);
-        reg_write(RAC_SEQCTRL, 1);
+        // Dummy read (baremetal does this)
+        let _ = reg_read(RAC_STATUS);
 
-        // 4. Load the FULL blob — includes code + state data
-        //    The blob occupies 0x21000000-0x21000FFF (4KB).
-        //    Code is at 0x000-0xEEB, state at 0xEEC-0xFFF.
-        //    DO NOT clear any of it after loading!
+        // 3. Set vector address + compact mode
+        reg_write(RAC_VECTADDR, 0x2100_0000);
+        reg_write(RAC_SEQCTRL, 1); // COMPACT
+
+        // 4. Load microcode (955 words = 3820 bytes)
         let seq_data = &super::rac_seq::RAC_SEQ_DATA;
         for (i, &word) in seq_data.iter().enumerate() {
-            reg_write(dst_base + (i as u32) * 4, word);
+            reg_write(0x2100_0000 + (i as u32) * 4, word);
         }
 
-        // 5. Set R6 pointer (sequencer uses this for state management)
+        // 5. Set R6 pointer (baremetal does this BEFORE clearing vars)
         reg_write(_RAC_R6, 0x2100_0FCC);
 
-        // 6. Resume sequencer — it runs init using the state data
-        //    from the blob (0xEFC-0xFFF region is NOT cleared)
+        // 6. Clear variable areas (baremetal does TWO clears AFTER code load):
+        //    a) 0x21000F6C-0x21000FFF (SEQ config area — 148 bytes)
+        for addr in (0x2100_0F6Cu32..=0x2100_0FFCu32).step_by(4) {
+            reg_write(addr, 0);
+        }
+        //    b) 0x21000EFC-0x21000F6B (SEQ variables — 112 bytes)
+        for addr in (0x2100_0EFCu32..0x2100_0F6Cu32).step_by(4) {
+            reg_write(addr, 0);
+        }
+
+        // 7. RESUME — sequencer runs init with all vars = 0
+        //    It should enter WAITING state if everything is correct.
         reg_write(RAC_SEQCMD, RAC_SEQCMD_RESUME);
         reg_write(_RAC_SR0, 0);
         reg_write(_RAC_SR1, 0);
         reg_write(_RAC_SR2, 0);
 
-        // 7. Set ONLY the variables we need to override
-        //    (warm-up times are at 0xF9C+, which IS in the blob)
-        //    Just set SEQ_CONTROL_REG bit 3 (enable)
-        let ctrl = reg_read(SEQ_CONTROL_REG);
-        reg_write(SEQ_CONTROL_REG, ctrl | 0x08);
+        // Short delay for sequencer init
+        for _ in 0..50_000u32 { core::hint::spin_loop(); }
 
-        // 8. Start RX
-        let seq_ctrl2 = reg_read(SEQ_CONTROL_REG);
-        reg_write(SEQ_CONTROL_REG, seq_ctrl2 & !0x20);
+        let seqst = reg_read(RAC_SEQSTATUS);
+        rtt_target::rprintln!("efr32: SEQ {} words, SEQST={:#X}", seq_data.len(), seqst);
+
+        // 8. NOW set variables (AFTER sequencer is running, same as RADIO_Config)
+        reg_write(SEQ_CONTROL_REG, reg_read(SEQ_CONTROL_REG) | 0x08);
+
+        // Warm-up times (µs)
+        reg_write(SEQ_RX_WARMTIME, 100);
+        reg_write(SEQ_TX_WARMTIME, 100);
+        reg_write(SEQ_RX_TX_TIME, 100);
+        reg_write(SEQ_TX_RX_TIME, 100);
+        reg_write(SEQ_TX_TX_TIME, 100);
+        reg_write(SEQ_RXFRAME_TX_TIME, 100);
+        reg_write(SEQ_RX_SEARCHTIME, 0);
+        reg_write(SEQ_TX_RX_SEARCHTIME, 0);
+
+        // State transitions: all → RX
+        reg_write(_SEQ_TRANSITIONS, 0x0404_0404);
+
+        // SYNTH LPF
+        reg_write(SEQ_SYNTHLPFCTRLRX, 0x0003_C002);
+        reg_write(SEQ_SYNTHLPFCTRLTX, 0x0003_C002);
+
+        // 9. Start RX (baremetal calls radio_startrx after all config)
+        let ctrl = reg_read(SEQ_CONTROL_REG);
+        reg_write(SEQ_CONTROL_REG, ctrl & !0x20);
         reg_write(RAC_IFPGACTRL, 0x0000_87F6);
         reg_write(_RAC_RXENSRCEN, 0x02);
 
-        for _ in 0..100_000u32 { core::hint::spin_loop(); }
-
-        rtt_target::rprintln!(
-            "efr32: SEQ {} words, SEQST={:#X} RAC={:#X}",
-            seq_data.len(),
-            reg_read(RAC_SEQSTATUS),
-            reg_read(RAC_STATUS)
-        );
+        for _ in 0..50_000u32 { core::hint::spin_loop(); }
+        rtt_target::rprintln!("efr32: after RX start: SEQST={:#X} RAC={:#X}",
+            reg_read(RAC_SEQSTATUS), reg_read(RAC_STATUS));
     }
 
 
@@ -701,7 +735,9 @@ impl Efr32Driver {
         }
 
         // CTRL (0x00C): Enable active/PA/LNA polarities
-        reg_write(RAC_CTRL, 0x0000_0381);
+        // CTRL (0x00C): ACTIVEPOL | PAENPOL | LNAENPOL
+        // Bit 0 = FORCEDISABLE — must be 0! (was 1 = radio force-disabled!)
+        reg_write(RAC_CTRL, 0x0000_0380);
 
         // SYNTHREGCTRL (0x09C): from reference dump = 0x0363_6D80
         reg_write(RAC_SYNTHREGCTRL, 0x0363_6D80);
