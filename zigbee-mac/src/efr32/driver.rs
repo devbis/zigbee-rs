@@ -31,7 +31,7 @@
 //!   │     └── set_channel()      → program PLL for channel frequency
 //!   ├── AGC registers (0x40087000)
 //!   │     └── energy_detect()    → RSSI measurement
-//!   ├── BUFC registers (0x40082000)
+//!   ├── BUFC registers (0x40081000)
 //!   │     ├── transmit()         → load TX buffer, trigger TX
 //!   │     └── receive()          → configure RX buffer
 //!   └── IRQ → Embassy Signal for async TX/RX completion
@@ -68,26 +68,36 @@ const SYNTH_BASE: u32 = 0x4008_3000;
 const AGC_BASE: u32 = 0x4008_7000;
 
 /// Buffer Controller — TX/RX DMA-like FIFO management.
-const BUFC_BASE: u32 = 0x4008_2000;
+/// CMSIS TypeDef struct at 0x40081000 (NOT 0x40082000).
+const BUFC_BASE: u32 = 0x4008_1000;
 
 /// GPIO controller base.
 const _GPIO_BASE: u32 = 0x4000_A000;
 
-// ── CMU Register Offsets (EFR32xG1 Series 1) ──────────────────
+// ── CMU Register Offsets (from CMSIS efr32fg1v_cmu.h TypeDef) ──
+//
+// CRITICAL: these offsets differ significantly from other ARM chips.
+// The EFR32 Series 1 CMU layout has many reserved gaps.
 
-/// CMU status register.
-const CMU_STATUS: u32 = CMU_BASE + 0x01C;
-/// CMU oscillator enable command register.
-const CMU_OSCENCMD: u32 = CMU_BASE + 0x020;
-/// CMU HFCLK select command register.
-const CMU_HFCLKSEL: u32 = CMU_BASE + 0x068;
-/// High-frequency core clock enable register 0.
-/// Bit 16 = RADIO (enables RAC/FRC/MODEM clocking).
-const CMU_HFCORECLKEN0: u32 = CMU_BASE + 0x090;
-/// High-frequency bus clock enable register 0.
-const CMU_HFBUSCLKEN0: u32 = CMU_BASE + 0x094;
-/// High-frequency peripheral clock enable register 0.
-const CMU_HFPERCLKEN0: u32 = CMU_BASE + 0x098;
+/// CMU control register (0x000).
+const _CMU_CTRL: u32 = CMU_BASE + 0x000;
+/// CMU oscillator enable command register (0x060, NOT 0x020).
+const CMU_OSCENCMD: u32 = CMU_BASE + 0x060;
+/// CMU HFCLK select command register (0x074, NOT 0x068).
+const CMU_HFCLKSEL: u32 = CMU_BASE + 0x074;
+/// CMU status register (0x090, NOT 0x01C).
+/// Bit 0 = HFRCOENS, Bit 2 = HFXOENS, Bit 3 = HFXORDY.
+const CMU_STATUS: u32 = CMU_BASE + 0x090;
+/// HFCLK status register (0x094). Bits[2:0] = selected source.
+const _CMU_HFCLKSTATUS: u32 = CMU_BASE + 0x094;
+/// High-frequency bus clock enable register 0 (0x0B0).
+/// Bit 1 = GPIO.
+const CMU_HFBUSCLKEN0: u32 = CMU_BASE + 0x0B0;
+/// High-frequency peripheral clock enable register 0 (0x0C0).
+const CMU_HFPERCLKEN0: u32 = CMU_BASE + 0x0C0;
+/// Radio clock enable register 0 (0x0C8).
+/// Individual radio peripheral enables: FRC, AGC, MODEM, etc.
+const CMU_RADIOCLKEN0: u32 = CMU_BASE + 0x0C8;
 
 // ── RAC Register Offsets ────────────────────────────────────────
 
@@ -123,34 +133,87 @@ const RAC_IF_TXDONE: u32 = 1 << 0;
 const RAC_IF_RXDONE: u32 = 1 << 1;
 const RAC_IF_RXOF: u32 = 1 << 2;
 
-// ── FRC Register Offsets ────────────────────────────────────────
+// ── FRC Register Offsets (from CMSIS TypeDef at 0x40080000) ─────
 
-/// FRC control register — frame format configuration.
-const FRC_CTRL: u32 = FRC_BASE + 0x000;
-/// FRC RX control register.
-const FRC_RXCTRL: u32 = FRC_BASE + 0x004;
-/// FRC trailing RX data register.
-const FRC_TRAILRXDATA: u32 = FRC_BASE + 0x008;
+/// FRC status register (read-only).
+const _FRC_STATUS: u32 = FRC_BASE + 0x000;
+/// FRC data filter control.
+const _FRC_DFLCTRL: u32 = FRC_BASE + 0x004;
+/// FRC max frame length.
+const _FRC_MAXLENGTH: u32 = FRC_BASE + 0x008;
+/// FRC address filter control.
+const _FRC_ADDRFILTCTRL: u32 = FRC_BASE + 0x00C;
+/// FRC data buffer register.
+const _FRC_DATABUFFER: u32 = FRC_BASE + 0x010;
+/// FRC word counter.
+const _FRC_WCNT: u32 = FRC_BASE + 0x014;
+/// FRC word count compare 0 — set to (payload_bytes - 1) before TX.
+const FRC_WCNTCMP0: u32 = FRC_BASE + 0x018;
+/// FRC word count compare 1.
+const _FRC_WCNTCMP1: u32 = FRC_BASE + 0x01C;
+/// FRC word count compare 2.
+const _FRC_WCNTCMP2: u32 = FRC_BASE + 0x020;
+/// FRC command register — BIT(0)=RXABORT, BIT(1)=FRAMEDETRESUME.
+const _FRC_CMD: u32 = FRC_BASE + 0x024;
+/// FRC whitening control.
+const _FRC_WHITECTRL: u32 = FRC_BASE + 0x028;
+/// FRC whitening polynomial.
+const _FRC_WHITEPOLY: u32 = FRC_BASE + 0x02C;
+/// FRC whitening init value.
+const _FRC_WHITEINIT: u32 = FRC_BASE + 0x030;
 /// FRC FEC control register.
-const FRC_FECCTRL: u32 = FRC_BASE + 0x040;
-/// FRC sniff control register.
-const FRC_SNIFFCTRL: u32 = FRC_BASE + 0x044;
-/// FRC block RAM address register.
-const FRC_BLOCKRAMADDR: u32 = FRC_BASE + 0x04C;
-/// FRC convolutional RAM address register.
-const FRC_CONVRAMADDR: u32 = FRC_BASE + 0x06C;
-/// FRC max length register.
-const FRC_MAXLENGTH: u32 = FRC_BASE + 0x07C;
-/// FRC address filter control registers (0xA0..0xAC).
-const FRC_ADDRFILTCTRL: u32 = FRC_BASE + 0x0A0;
-/// FRC CRC initialization value.
-const _FRC_CRCINIT: u32 = FRC_BASE + 0x020;
-/// FRC CRC polynomial.
-const _FRC_CRCPOLY: u32 = FRC_BASE + 0x024;
+const FRC_FECCTRL: u32 = FRC_BASE + 0x034;
+/// FRC block RAM address.
+const FRC_BLOCKRAMADDR: u32 = FRC_BASE + 0x038;
+/// FRC convolutional RAM address.
+const FRC_CONVRAMADDR: u32 = FRC_BASE + 0x03C;
+/// FRC control register — bits[10:8]=BITSPERWORD, bit[5]=BITORDER.
+const FRC_CTRL: u32 = FRC_BASE + 0x040;
+/// FRC RX control register.
+const FRC_RXCTRL: u32 = FRC_BASE + 0x044;
+/// FRC trail TX data control.
+const _FRC_TRAILTXDATACTRL: u32 = FRC_BASE + 0x048;
+/// FRC trailing RX data register.
+const FRC_TRAILRXDATA: u32 = FRC_BASE + 0x04C;
+/// FRC sequence counter.
+const _FRC_SCNT: u32 = FRC_BASE + 0x050;
 /// FRC interrupt flag register.
-const FRC_IF: u32 = FRC_BASE + 0x030;
+const FRC_IF: u32 = FRC_BASE + 0x060;
+/// FRC interrupt flag set register.
+const _FRC_IFS: u32 = FRC_BASE + 0x064;
 /// FRC interrupt flag clear register.
-const FRC_IFC: u32 = FRC_BASE + 0x038;
+const FRC_IFC: u32 = FRC_BASE + 0x068;
+/// FRC interrupt enable register.
+const FRC_IEN: u32 = FRC_BASE + 0x06C;
+/// FRC buffer mode register.
+const _FRC_BUFFERMODE: u32 = FRC_BASE + 0x070;
+/// Frame Control Descriptor 0 (TX descriptor).
+const FRC_FCD0: u32 = FRC_BASE + 0x0A0;
+/// Frame Control Descriptor 1.
+const _FRC_FCD1: u32 = FRC_BASE + 0x0A4;
+/// Frame Control Descriptor 2 (RX descriptor).
+const FRC_FCD2: u32 = FRC_BASE + 0x0A8;
+/// Frame Control Descriptor 3.
+const _FRC_FCD3: u32 = FRC_BASE + 0x0AC;
+
+// ── FRC Command Bits (FRC_CMD at 0x024) ─────────────────────────
+
+/// Abort current RX operation.
+const _FRC_CMD_RXABORT: u32 = 1 << 0;
+/// Resume frame detection after abort.
+const _FRC_CMD_FRAMEDETRESUME: u32 = 1 << 1;
+
+// ── FRC Interrupt Flag Bits (FRC_IF at 0x060) ───────────────────
+
+const FRC_IF_TXDONE: u32 = 1 << 0;
+const _FRC_IF_TXAFTERFRAMEDONE: u32 = 1 << 1;
+const _FRC_IF_TXABORTED: u32 = 1 << 2;
+const _FRC_IF_TXUF: u32 = 1 << 3;
+const FRC_IF_RXDONE: u32 = 1 << 4;
+const _FRC_IF_RXABORTED: u32 = 1 << 5;
+const FRC_IF_FRAMEERROR: u32 = 1 << 6;
+const _FRC_IF_BLOCKERROR: u32 = 1 << 7;
+const FRC_IF_RXOF: u32 = 1 << 8;
 
 // ── MODEM Register Offsets ──────────────────────────────────────
 
@@ -175,18 +238,41 @@ const _AGC_CTRL0: u32 = AGC_BASE + 0x000;
 /// AGC RSSI register — current received signal strength.
 const AGC_RSSI: u32 = AGC_BASE + 0x020;
 
-// ── BUFC Register Offsets ───────────────────────────────────────
+// ── BUFC Register Offsets (from CMSIS TypeDef at 0x40081000) ────
 
-/// BUFC TX buffer 0 data register.
-const BUFC_BUF0_DATA: u32 = BUFC_BASE + 0x040;
-/// BUFC TX buffer 0 write count.
-const _BUFC_BUF0_WCNT: u32 = BUFC_BASE + 0x044;
-/// BUFC RX buffer 1 data register.
-const BUFC_BUF1_DATA: u32 = BUFC_BASE + 0x080;
-/// BUFC RX buffer 1 read count.
-const BUFC_BUF1_RCNT: u32 = BUFC_BASE + 0x084;
-/// BUFC command register.
-const BUFC_CMD: u32 = BUFC_BASE + 0x004;
+// Buffer 0 — used for TX
+const BUFC_BUF0_CTRL: u32 = BUFC_BASE + 0x000;
+const BUFC_BUF0_ADDR: u32 = BUFC_BASE + 0x004;
+const _BUFC_BUF0_WRITEOFFSET: u32 = BUFC_BASE + 0x008;
+const _BUFC_BUF0_READOFFSET: u32 = BUFC_BASE + 0x00C;
+const _BUFC_BUF0_READDATA: u32 = BUFC_BASE + 0x014;
+const BUFC_BUF0_WRITEDATA: u32 = BUFC_BASE + 0x018;
+const _BUFC_BUF0_STATUS: u32 = BUFC_BASE + 0x020;
+const BUFC_BUF0_CMD: u32 = BUFC_BASE + 0x028;
+
+// Buffer 1 — used for RX
+const BUFC_BUF1_CTRL: u32 = BUFC_BASE + 0x030;
+const BUFC_BUF1_ADDR: u32 = BUFC_BASE + 0x034;
+const BUFC_BUF1_READDATA: u32 = BUFC_BASE + 0x044;
+const BUFC_BUF1_STATUS: u32 = BUFC_BASE + 0x050;
+const BUFC_BUF1_CMD: u32 = BUFC_BASE + 0x058;
+
+// Buffer 2 — used for RX length
+const _BUFC_BUF2_CMD: u32 = BUFC_BASE + 0x088;
+
+// BUFC interrupt registers
+const _BUFC_IF: u32 = BUFC_BASE + 0x0E0;
+const _BUFC_IFC: u32 = BUFC_BASE + 0x0E8;
+
+/// BUFC buffer size code: 2 = 256 bytes.
+const BUFC_BUFSIZE_256: u32 = 2;
+
+// ── Static RAM buffers for BUFC DMA ─────────────────────────────
+
+/// TX RAM buffer pointed to by BUFC BUF0_ADDR.
+static BUFC_TX_RAM: SyncUnsafeCell<[u8; 256]> = SyncUnsafeCell::new([0u8; 256]);
+/// RX RAM buffer pointed to by BUFC BUF1_ADDR.
+static BUFC_RX_RAM: SyncUnsafeCell<[u8; 256]> = SyncUnsafeCell::new([0u8; 256]);
 
 // ── Register access helpers ─────────────────────────────────────
 
@@ -322,11 +408,12 @@ impl Efr32Driver {
 
     // ── Hardware initialization ─────────────────────────────────
 
-    /// Full radio initialization: clocks → RAC → FRC → MODEM → SYNTH → AGC.
+    /// Full radio initialization: clocks → RAC → BUFC → FRC → MODEM → SYNTH → AGC.
     fn init_hardware(&mut self) {
         self.enable_clocks();
         self.load_rac_sequences();
         self.configure_rac();
+        self.configure_bufc();
         self.configure_frc();
         self.configure_modem();
         self.configure_synth();
@@ -341,7 +428,9 @@ impl Efr32Driver {
     ///
     /// The RAC radio sequencer runs a custom instruction set from RAM.
     /// This blob was dumped from a working RAIL firmware and contains
-    /// the TX/RX state machine programs.
+    /// the TX/RX state machine programs. The sequencer is essential —
+    /// RAC_CMD_TXEN/RXEN trigger the sequencer to coordinate SYNTH
+    /// calibration, PA enable, FRC TX/RX, and return to idle.
     fn load_rac_sequences(&self) {
         let seq_data = &super::rac_seq::RAC_SEQ_DATA;
         let dst_base = 0x2100_0000u32;
@@ -359,35 +448,55 @@ impl Efr32Driver {
 
     /// Enable peripheral clocks for all radio blocks via CMU.
     ///
-    /// Sequence: enable HFXO (32 MHz crystal) → switch HFCLK to HFXO →
-    /// enable radio peripheral clocks (RAC + FRC + MODEM via HFRADIOCLKEN0).
+    /// CRITICAL: EFR32 CMU register offsets differ from other ARM chips!
+    /// From CMSIS efr32fg1v_cmu.h TypeDef struct:
+    ///   OSCENCMD   = 0x060 (oscillator enable command)
+    ///   HFCLKSEL   = 0x074 (HF clock source select)
+    ///   STATUS     = 0x090 (clock status)
+    ///   HFBUSCLKEN0 = 0x0B0 (bus clock enables)
+    ///   HFPERCLKEN0 = 0x0C0 (peripheral clock enables)
+    ///   RADIOCLKEN0 = 0x0C8 (radio peripheral clock enables!)
     fn enable_clocks(&self) {
-        // Enable HFXO (bit 3 of OSCENCMD = HFXOEN)
-        reg_write(CMU_OSCENCMD, 1 << 3);
+        // 1. Enable HFXO (38.4 MHz crystal)
+        //    OSCENCMD: bit 2 = HFXOEN (from CMSIS: _CMU_OSCENCMD_HFXOEN_SHIFT = 2)
+        reg_write(CMU_OSCENCMD, 1 << 2);
 
-        // Wait for HFXO ready (bit 4 of CMU_STATUS = HFXORDY)
-        for _ in 0..100_000u32 {
-            if reg_read(CMU_STATUS) & (1 << 4) != 0 {
+        // 2. Wait for HFXO ready
+        //    STATUS: bit 3 = HFXORDY (from CMSIS: _CMU_STATUS_HFXORDY_SHIFT = 3)
+        let mut ready = false;
+        for _ in 0..500_000u32 {
+            if reg_read(CMU_STATUS) & (1 << 3) != 0 {
+                ready = true;
                 break;
             }
             core::hint::spin_loop();
         }
+        if !ready {
+            log::warn!("efr32: HFXO did not become ready!");
+        }
 
-        // Switch HFCLK source to HFXO (write 2 to HFCLKSEL)
+        // 3. Switch HFCLK source to HFXO
+        //    HFCLKSEL: write 2 = HFXO
         reg_write(CMU_HFCLKSEL, 2);
 
-        // Enable RADIO clock (bit 16 of HFCORECLKEN0)
-        // This enables RAC, FRC, MODEM peripheral clocking on Series 1.
-        let val = reg_read(CMU_HFCORECLKEN0);
-        reg_write(CMU_HFCORECLKEN0, val | (1 << 16));
+        // 4. Enable all radio peripheral clocks via RADIOCLKEN0 (0x0C8)
+        //    Bits 0-8: PROTIMER, ?, CRC, FRC, RAC, MODEM, SYNTH, AGC, BUFC
+        //    Set all 10 bits (0x3FF) to enable everything
+        reg_write(CMU_RADIOCLKEN0, 0x3FF);
 
-        // Enable HFPERCLK for GPIO/Timer
+        // 5. Enable HFPERCLK for GPIO/Timer
         let val = reg_read(CMU_HFPERCLKEN0);
         reg_write(CMU_HFPERCLKEN0, val | 1);
 
-        // Enable HFBUSCLK for GPIO
+        // 6. Enable HFBUSCLK for GPIO
         let val = reg_read(CMU_HFBUSCLKEN0);
         reg_write(CMU_HFBUSCLKEN0, val | (1 << 1)); // GPIO
+
+        log::info!(
+            "efr32: clocks enabled, STATUS={:#010X}, RADIOCLKEN0={:#010X}",
+            reg_read(CMU_STATUS),
+            reg_read(CMU_RADIOCLKEN0)
+        );
     }
 
     /// Configure RAC (Radio Controller) for 802.15.4 operation.
@@ -438,24 +547,64 @@ impl Efr32Driver {
         reg_write(RAC_IEN, RAC_IF_TXDONE | RAC_IF_RXDONE);
     }
 
+    /// Configure BUFC (Buffer Controller) with RAM buffer addresses.
+    ///
+    /// BUFC requires static RAM buffers for TX (BUF0) and RX (BUF1).
+    /// The buffer addresses and sizes must be set before any TX/RX.
+    fn configure_bufc(&self) {
+        // Buffer 0 = TX: 256 bytes
+        let tx_addr = BUFC_TX_RAM.get() as u32;
+        reg_write(BUFC_BUF0_CTRL, BUFC_BUFSIZE_256);
+        reg_write(BUFC_BUF0_ADDR, tx_addr);
+        reg_write(BUFC_BUF0_CMD, 1); // clear
+
+        // Buffer 1 = RX: 256 bytes
+        let rx_addr = BUFC_RX_RAM.get() as u32;
+        reg_write(BUFC_BUF1_CTRL, BUFC_BUFSIZE_256);
+        reg_write(BUFC_BUF1_ADDR, rx_addr);
+        reg_write(BUFC_BUF1_CMD, 1); // clear
+
+        // Buffer 2 = RX length: clear
+        reg_write(_BUFC_BUF2_CMD, 1);
+
+        log::info!(
+            "efr32: BUFC configured, TX@{:#010X} RX@{:#010X}",
+            tx_addr,
+            rx_addr
+        );
+    }
+
     /// Configure FRC (Frame Controller) for IEEE 802.15.4 frame format.
     ///
-    /// Register values from a working RAIL-based firmware on EFR32MG1P.
+    /// Register offsets from CMSIS TypeDef. Values for 802.15.4:
+    /// - CTRL: BITSPERWORD=7 (8 bits/word)
+    /// - FCD0: TX descriptor — CALCCRC | INCLUDECRC, buffer 0, WORDS=0xFF
+    /// - FCD2: RX descriptor — CALCCRC | INCLUDECRC, buffer 1, WORDS=0xFF
     fn configure_frc(&self) {
-        reg_write(FRC_CTRL,         0x0000_0000); // frame format control
-        reg_write(FRC_RXCTRL,       0x0014_8001); // RX control
-        reg_write(FRC_TRAILRXDATA,  0x0000_007F); // trailing RX data
-        reg_write(FRC_FECCTRL,      0x0000_07A0); // FEC control
-        reg_write(FRC_SNIFFCTRL,    0x0000_0068); // sniff control
-        reg_write(FRC_BLOCKRAMADDR, 0x0000_001B); // block RAM address
-        reg_write(FRC_CONVRAMADDR,  0x0000_A002); // convolutional RAM address
-        reg_write(FRC_MAXLENGTH,    0x0001_7F8);  // max frame length
+        // CTRL at 0x040: bits[10:8]=BITSPERWORD=7 → 0x700
+        reg_write(FRC_CTRL, 0x0000_0700);
+        // RXCTRL at 0x044
+        reg_write(FRC_RXCTRL, 0x0014_8001);
+        // TRAILRXDATA at 0x04C
+        reg_write(FRC_TRAILRXDATA, 0x0000_001B);
+        // FECCTRL at 0x034: BLOCKWHITEMODE = 1
+        reg_write(FRC_FECCTRL, 0x0000_0001);
+        // BLOCKRAMADDR at 0x038
+        reg_write(FRC_BLOCKRAMADDR, 0x0000_001B);
+        // CONVRAMADDR at 0x03C
+        reg_write(FRC_CONVRAMADDR, 0x0000_A002);
 
-        // Address filter control registers
-        reg_write(FRC_ADDRFILTCTRL + 0x00, 0x0000_4000);
-        reg_write(FRC_ADDRFILTCTRL + 0x04, 0x0000_4CFF);
-        reg_write(FRC_ADDRFILTCTRL + 0x08, 0x0000_4100);
-        reg_write(FRC_ADDRFILTCTRL + 0x0C, 0x0000_4DFF);
+        // Frame Control Descriptors:
+        // FCD0 (TX): CALCCRC=1 | INCLUDECRC=1 | buffer=0 | WORDS=0xFF → 0x0CFF
+        reg_write(FRC_FCD0, 0x0000_0CFF);
+        // FCD2 (RX): CALCCRC=1 | INCLUDECRC=1 | buffer=1 | WORDS=0xFF → 0x0DFF
+        reg_write(FRC_FCD2, 0x0000_0DFF);
+
+        // Clear all pending FRC interrupt flags
+        reg_write(FRC_IFC, 0xFFFF_FFFF);
+
+        // Enable FRC interrupts: TXDONE(0) | RXDONE(4) | FRAMEERROR(6) = 0x51
+        reg_write(FRC_IEN, FRC_IF_TXDONE | FRC_IF_RXDONE | FRC_IF_FRAMEERROR);
     }
 
     /// Configure MODEM for IEEE 802.15.4 O-QPSK modulation at 250 kbps.
@@ -608,6 +757,13 @@ impl Efr32Driver {
     ///
     /// The frame should contain the full MAC header + payload. The radio
     /// hardware appends the 2-byte FCS (CRC-16) automatically.
+    ///
+    /// TX flow (from working baremetal code):
+    ///   1. Clear BUFC buffer 0 (TX)
+    ///   2. Write frame bytes to BUF0_WRITEDATA (0x018)
+    ///   3. Set FRC_WCNTCMP0 = payload_bytes - 1
+    ///   4. RAC_CMD = RAC_CMD_TXEN → RAC sequencer starts TX
+    ///   5. Wait for FRC_IF_TXDONE (bit 0 at FRC+0x060)
     pub async fn transmit(&mut self, frame: &[u8]) -> Result<(), RadioError> {
         if !self.initialized {
             return Err(RadioError::NotInitialized);
@@ -628,21 +784,26 @@ impl Efr32Driver {
             core::hint::spin_loop();
         }
 
-        // Clear TX buffer
-        reg_write(BUFC_CMD, 0x0000_0001); // reset TX FIFO
+        // Clear TX buffer (BUF0_CMD bit 0 = CLEAR)
+        reg_write(BUFC_BUF0_CMD, 1);
 
-        // Write frame to TX buffer:
-        // First byte is the PHR (PHY header = PSDU length including FCS)
-        let phr = (frame.len() + 2) as u32; // +2 for CRC appended by hardware
-        reg_write(BUFC_BUF0_DATA, phr);
+        // Write frame bytes to TX buffer one by one via BUF0_WRITEDATA.
+        // The PHR (length byte) is written first, then the PSDU payload.
+        let phr = (frame.len() + 2) as u8; // +2 for FCS appended by hardware
+        reg_write(BUFC_BUF0_WRITEDATA, phr as u32);
         for &b in frame {
-            reg_write(BUFC_BUF0_DATA, b as u32);
+            reg_write(BUFC_BUF0_WRITEDATA, b as u32);
         }
 
-        // Clear IRQ flags and enable TX done interrupt
+        // Tell FRC how many payload bytes to transmit (PHR + frame bytes)
+        let total_bytes = 1 + frame.len(); // 1 for PHR + payload
+        reg_write(FRC_WCNTCMP0, (total_bytes - 1) as u32);
+
+        // Clear pending FRC and RAC TX-done flags before starting
+        reg_write(FRC_IFC, FRC_IF_TXDONE);
         reg_write(RAC_IFC, RAC_IF_TXDONE);
 
-        // Trigger TX
+        // Start TX via RAC — the sequencer handles SYNTH cal, PA, FRC
         reg_write(RAC_CMD, RAC_CMD_TXEN);
 
         log::trace!(
@@ -651,7 +812,7 @@ impl Efr32Driver {
             self.config.channel
         );
 
-        // Wait for TX completion IRQ
+        // Wait for TX completion IRQ (FRC_IF_TXDONE)
         let ok = TX_DONE.wait().await;
         if ok {
             Ok(())
@@ -664,6 +825,13 @@ impl Efr32Driver {
     ///
     /// Enables the receiver and waits for a frame. Returns the frame data
     /// with RSSI and LQI. Frames failing CRC are rejected.
+    ///
+    /// RX flow (from working baremetal code):
+    ///   1. Clear BUFC buffer 1 (RX) and buffer 2 (RX length)
+    ///   2. RAC_CMD = RAC_CMD_RXEN → sequencer starts RX
+    ///   3. FRC captures frame, checks CRC
+    ///   4. Data appears in BUF1, length in BUF1_STATUS
+    ///   5. FRC_IF_RXDONE (bit 4) signals completion
     pub async fn receive(&mut self) -> Result<RxFrame, RadioError> {
         if !self.initialized {
             return Err(RadioError::NotInitialized);
@@ -671,14 +839,15 @@ impl Efr32Driver {
 
         RX_DONE.reset();
 
-        // Clear RX buffer
-        reg_write(BUFC_CMD, 0x0000_0002); // reset RX FIFO
+        // Clear RX buffer (BUF1) and length buffer (BUF2)
+        reg_write(BUFC_BUF1_CMD, 1);
+        reg_write(_BUFC_BUF2_CMD, 1);
 
-        // Clear IRQ flags and enable RX interrupts
+        // Clear pending FRC and RAC RX flags
+        reg_write(FRC_IFC, FRC_IF_RXDONE | FRC_IF_RXOF | FRC_IF_FRAMEERROR);
         reg_write(RAC_IFC, RAC_IF_RXDONE | RAC_IF_RXOF);
-        reg_write(FRC_IFC, 0xFFFF_FFFF); // clear all FRC flags
 
-        // Enable RX
+        // Start RX via RAC — sequencer handles LNA, SYNTH, FRC
         reg_write(RAC_CMD, RAC_CMD_RXEN);
 
         // Wait for RX completion
@@ -760,6 +929,10 @@ impl Efr32Driver {
         if !self.initialized {
             return;
         }
+        // Clear RX buffer (BUF1) and length buffer (BUF2)
+        reg_write(BUFC_BUF1_CMD, 1);
+        reg_write(_BUFC_BUF2_CMD, 1);
+        reg_write(FRC_IFC, FRC_IF_RXDONE | FRC_IF_RXOF | FRC_IF_FRAMEERROR);
         reg_write(RAC_IFC, RAC_IF_RXDONE | RAC_IF_RXOF);
         reg_write(RAC_CMD, RAC_CMD_RXEN);
     }
@@ -767,6 +940,7 @@ impl Efr32Driver {
     /// Disable the receiver.
     pub fn disable_rx(&self) {
         reg_write(RAC_CMD, RAC_CMD_RXDIS);
+        reg_write(FRC_IFC, FRC_IF_RXDONE | FRC_IF_RXOF | FRC_IF_FRAMEERROR);
         reg_write(RAC_IFC, RAC_IF_RXDONE | RAC_IF_RXOF);
     }
 
@@ -777,16 +951,14 @@ impl Efr32Driver {
     pub fn radio_sleep(&self) {
         reg_write(RAC_CMD, RAC_CMD_TXDIS | RAC_CMD_RXDIS);
         reg_write(RAC_IFC, RAC_IF_TXDONE | RAC_IF_RXDONE | RAC_IF_RXOF);
-        // Disable RADIO clock (bit 16 of HFCORECLKEN0)
-        let val = reg_read(CMU_HFCORECLKEN0);
-        reg_write(CMU_HFCORECLKEN0, val & !(1 << 16));
+        // Disable all radio peripheral clocks via RADIOCLKEN0
+        reg_write(CMU_RADIOCLKEN0, 0);
     }
 
     /// Re-enable radio after `radio_sleep()`.
     pub fn radio_wake(&mut self) {
-        // Re-enable RADIO clock
-        let val = reg_read(CMU_HFCORECLKEN0);
-        reg_write(CMU_HFCORECLKEN0, val | (1 << 16));
+        // Re-enable all radio peripheral clocks
+        reg_write(CMU_RADIOCLKEN0, 0x3FF);
         for _ in 0..1_000u32 { core::hint::spin_loop(); }
         self.set_channel(self.config.channel);
     }
@@ -796,13 +968,11 @@ impl Efr32Driver {
 
 /// RAC/FRC interrupt handler for EFR32MG1P radio.
 ///
-/// This must be registered as the interrupt handler for the radio IRQ
-/// (varies by device — typically IRQ #30 or FRC_PRI_IRQn on EFR32xG1).
-/// The handler reads IRQ status from both RAC and FRC, processes TX/RX
-/// completion, and signals the async driver via Embassy Signal.
+/// Reads IRQ status from both RAC and FRC, processes TX/RX completion,
+/// and signals the async driver via Embassy Signal.
 ///
-/// The function name `FRC_PRI` matches the `device.x` linker symbol,
-/// overriding the weak `DefaultHandler` alias.
+/// TX data was written to BUFC BUF0; RX data arrives in BUFC BUF1.
+/// FRC_IF_TXDONE = bit 0, FRC_IF_RXDONE = bit 4.
 #[unsafe(no_mangle)]
 pub extern "C" fn FRC_PRI() {
     let rac_flags = reg_read(RAC_IF);
@@ -812,35 +982,37 @@ pub extern "C" fn FRC_PRI() {
     reg_write(RAC_IFC, rac_flags);
     reg_write(FRC_IFC, frc_flags);
 
-    // TX completion
-    if rac_flags & RAC_IF_TXDONE != 0 {
+    // TX completion (FRC_IF_TXDONE = bit 0)
+    if frc_flags & FRC_IF_TXDONE != 0 || rac_flags & RAC_IF_TXDONE != 0 {
         TX_DONE.signal(true);
     }
 
-    // RX completion
-    if rac_flags & RAC_IF_RXDONE != 0 {
-        // Check CRC result from FRC
-        let crc_ok = frc_flags & 0x0000_0010 != 0; // FRC CRC OK bit
+    // RX completion (FRC_IF_RXDONE = bit 4)
+    let frc_rx_done = frc_flags & FRC_IF_RXDONE != 0;
+    let rac_rx_done = rac_flags & RAC_IF_RXDONE != 0;
 
+    if frc_rx_done || rac_rx_done {
+        // FRC_IF_RXDONE signals good CRC
+        let crc_ok = frc_rx_done;
         RX_CRC_OK.store(crc_ok, Ordering::Release);
 
         if crc_ok {
-            // Read frame length from RX buffer
-            let len_word = reg_read(BUFC_BUF1_RCNT);
-            let len = (len_word as usize).min(MAX_FRAME_LEN);
+            // Read byte count from BUFC BUF1 (RX) status, bits [12:0]
+            let status = reg_read(BUFC_BUF1_STATUS);
+            let len = ((status & 0x1FFF) as usize).min(MAX_FRAME_LEN);
 
             RX_LEN.store(len as u8, Ordering::Release);
 
-            // Read RSSI
+            // Read RSSI from AGC
             let rssi_raw = reg_read(AGC_RSSI);
             let rssi = (rssi_raw & 0xFF) as i8;
             RX_RSSI.store(rssi, Ordering::Release);
 
-            // Copy frame data from RX FIFO
+            // Read frame data byte-by-byte from BUFC BUF1 (RX buffer)
             unsafe {
                 let buf = &mut *RX_BUF.get();
                 for i in 0..len {
-                    buf[i] = (reg_read(BUFC_BUF1_DATA) & 0xFF) as u8;
+                    buf[i] = (reg_read(BUFC_BUF1_READDATA) & 0xFF) as u8;
                 }
             }
         } else {
@@ -850,8 +1022,8 @@ pub extern "C" fn FRC_PRI() {
         RX_DONE.signal(());
     }
 
-    // RX overflow — signal with empty frame
-    if rac_flags & RAC_IF_RXOF != 0 {
+    // RX overflow (FRC_IF_RXOF = bit 8) or frame error (bit 6)
+    if frc_flags & (FRC_IF_RXOF | FRC_IF_FRAMEERROR) != 0 || rac_flags & RAC_IF_RXOF != 0 {
         RX_CRC_OK.store(false, Ordering::Release);
         RX_LEN.store(0, Ordering::Release);
         RX_DONE.signal(());
