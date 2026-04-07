@@ -512,43 +512,51 @@ impl Efr32Driver {
     /// RAC_CMD_TXEN/RXEN trigger the sequencer to coordinate SYNTH
     /// calibration, PA enable, FRC TX/RX, and return to idle.
     fn load_rac_sequences(&self) {
-        // 1. Halt the sequencer before loading
+        // Matches VDowbensky/efr32_baremetal RADIO_SeqInit() exactly.
+        // ORDER IS CRITICAL: variables must be set AFTER resume, not before!
+
+        // 1. Halt sequencer
         reg_write(RAC_SEQCMD, RAC_SEQCMD_HALT);
 
-        // 2. Clear sequencer RAM (4KB at 0x21000000)
+        // 2. Clear ALL sequencer RAM (4KB)
         let dst_base = 0x2100_0000u32;
         for i in 0..1024u32 {
             reg_write(dst_base + i * 4, 0);
         }
 
-        // 3. Set vector address BEFORE loading code
+        // 3. Set vector address and compact mode
         reg_write(RAC_VECTADDR, dst_base);
-
-        // 4. Enable compact mode
         reg_write(RAC_SEQCTRL, 1); // COMPACT = bit 0
 
-        // 5. Load microcode
+        // 4. Load microcode
         let seq_data = &super::rac_seq::RAC_SEQ_DATA;
         for (i, &word) in seq_data.iter().enumerate() {
-            let addr = dst_base + (i as u32) * 4;
-            reg_write(addr, word);
+            reg_write(dst_base + (i as u32) * 4, word);
         }
 
-        // 6. Initialize sequencer variables in RAM
-        // From VDowbensky/efr32_baremetal generic_seq.h:
-        //   SEQ_CONTROL_REG    = 0x21000EFC
-        //   RADIO_TRANSITIONS  = 0x21000F00 (SEQ->REG000)
-        //   RX_WARMTIME        = 0x21000F9C (SEQ->REG09C)
-        //   TX_WARMTIME        = 0x21000FAC (SEQ->REG0AC)
-        //   TX_RX_TIME etc.    = various
-        //   PHYINFO            = 0x21000FF0
-        //   SYNTHLPFCTRLRX     = 0x21000FF8
-        //   SYNTHLPFCTRLTX     = 0x21000FFC
+        // 5. Set R6 pointer
+        reg_write(_RAC_R6, 0x2100_0FCC);
 
-        // SEQ_CONTROL_REG: bit 3 = enable, bit 5 = disable flag
-        reg_write(SEQ_CONTROL_REG, 0x08); // Enable sequencer
+        // 6. Clear SEQ variable areas (baremetal does TWO clears):
+        //    a) 0x21000F6C-0x21000FFF (SEQ config area)
+        for addr in (0x2100_0F6Cu32..=0x2100_0FFCu32).step_by(4) {
+            reg_write(addr, 0);
+        }
+        //    b) 0x21000EFC-0x21000F6B (SEQ variables)
+        for addr in (0x2100_0EFCu32..0x2100_0F6Cu32).step_by(4) {
+            reg_write(addr, 0);
+        }
 
-        // Warm-up times (in µs, from baremetal: all set to 100)
+        // 7. Resume sequencer — runs init with ALL variables at 0
+        reg_write(RAC_SEQCMD, RAC_SEQCMD_RESUME);
+        reg_write(_RAC_SR0, 0);
+        reg_write(_RAC_SR1, 0);
+        reg_write(_RAC_SR2, 0);
+
+        // 8. Set variables AFTER sequencer is running
+        reg_write(SEQ_CONTROL_REG, reg_read(SEQ_CONTROL_REG) | 0x08);
+
+        // Warm-up times
         reg_write(SEQ_RX_WARMTIME, 100);
         reg_write(SEQ_TX_WARMTIME, 100);
         reg_write(SEQ_RX_TX_TIME, 100);
@@ -558,39 +566,25 @@ impl Efr32Driver {
         reg_write(SEQ_RX_SEARCHTIME, 0);
         reg_write(SEQ_TX_RX_SEARCHTIME, 0);
 
-        // CRITICAL: Configure state transitions (RADIO_TRANSITIONS at SEQ->REG000)
-        // Without this, the sequencer ignores TXEN/RXEN commands!
-        // From baremetal radio_phy.c:
-        //   TX success → RX (bit 18), TX error → RX (bit 26)
-        //   RX success → RX (bit 2), RX error → RX (bit 10)
-        // RAIL_RF_STATE_IDLE=1, RAIL_RF_STATE_RX=2, RAIL_RF_STATE_TX=3
-        reg_write(_SEQ_TRANSITIONS, 0x0404_0404); // all transitions → RX
+        // State transitions: all → RX
+        reg_write(_SEQ_TRANSITIONS, 0x0404_0404);
 
-        // SYNTH LPF control for RX and TX
+        // SYNTH LPF control
         reg_write(SEQ_SYNTHLPFCTRLRX, 0x0003_C002);
         reg_write(SEQ_SYNTHLPFCTRLTX, 0x0003_C002);
 
-        // R6 pointer (used by sequencer for state management)
-        reg_write(_RAC_R6, 0x21000FCC);
-
-        // Clear sequencer scratch registers
-        reg_write(_RAC_SR0, 0);
-        reg_write(_RAC_SR1, 0);
-        reg_write(_RAC_SR2, 0);
-        reg_write(_RAC_SR3, 0);
-
-        // 7. Resume sequencer
-        reg_write(RAC_SEQCMD, RAC_SEQCMD_RESUME);
-
-        // Enable RXENSRCEN software RX enable
+        // 9. Start RX
         reg_write(_RAC_RXENSRCEN, 0x02);
+        for _ in 0..50_000u32 { core::hint::spin_loop(); }
 
-        log::info!(
-            "efr32: RAC seq loaded {} words, SEQSTATUS={:#X}",
+        rtt_target::rprintln!(
+            "efr32: SEQ {} words, SEQST={:#X} RAC={:#X}",
             seq_data.len(),
-            reg_read(RAC_SEQSTATUS)
+            reg_read(RAC_SEQSTATUS),
+            reg_read(RAC_STATUS)
         );
     }
+
 
     /// Enable peripheral clocks for all radio blocks via CMU.
     ///
