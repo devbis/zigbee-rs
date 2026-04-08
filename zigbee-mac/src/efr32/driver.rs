@@ -507,6 +507,7 @@ impl Efr32Driver {
         self.configure_rac();        // MUST be before sequencer load!
         self.configure_protimer();
         self.load_rac_sequences();   // Now RAC regs are set when seq runs
+        self.configure_crc();        // CRC must be configured for FRC frame validation
         self.configure_frc();
         self.configure_modem();
         self.configure_bufc();
@@ -841,6 +842,28 @@ impl Efr32Driver {
             tx_addr,
             rx_addr
         );
+    }
+
+    /// Configure CRC peripheral for IEEE 802.15.4 CRC-16-CCITT.
+    ///
+    /// CRC base = 0x40082000 (separate from BUFC at 0x40081000).
+    /// The FRC uses this CRC engine when CALCCRC/INCLUDECRC are set in FCD.
+    /// Without configuring CRC, all received frames fail CRC validation
+    /// and are silently dropped by the FRC — no RXDONE interrupt fires.
+    fn configure_crc(&self) {
+        const CRC_BASE: u32 = 0x4008_2000;
+        const CRC_CTRL: u32 = CRC_BASE + 0x000;
+        const CRC_INIT: u32 = CRC_BASE + 0x010;
+        const CRC_POLY: u32 = CRC_BASE + 0x018;
+
+        // CRC-16-CCITT for 802.15.4:
+        //   Polynomial: 0x1021 → reversed for hardware = 0x0840
+        //   Seed: 0x0000
+        //   CTRL: BITSPERWORD=7(8bit), CRCWIDTH=1(16bit), INPUTBITORDER=1(LSB),
+        //         BYTEREVERSE=1
+        reg_write(CRC_CTRL, 0x0000_0768);
+        reg_write(CRC_POLY, 0x0000_0840);
+        reg_write(CRC_INIT, 0x0000_0000);
     }
 
     /// Configure FRC (Frame Controller) for IEEE 802.15.4 frame format.
