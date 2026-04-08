@@ -289,9 +289,13 @@ impl MacDriver for Efr32Mac {
                     });
                 }
                 ScanType::Active => {
-                    rtt_target::rprintln!("scan TX ch{}", ch);
                     let seq = self.next_bsn();
                     let beacon_req = build_beacon_request(seq);
+                    // Dump first beacon request frame bytes
+                    if ch == 11 {
+                        rtt_target::rprintln!("beacon_req[{}]: {:02X?}", beacon_req.len(), &beacon_req);
+                    }
+                    rtt_target::rprintln!("scan TX ch{}", ch);
                     let tx_result = self.driver.transmit(&beacon_req).await;
                     rtt_target::rprintln!("  tx={}", if tx_result.is_ok() { "ok" } else { "FAIL" });
 
