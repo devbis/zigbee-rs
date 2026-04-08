@@ -1253,26 +1253,25 @@ impl Efr32Driver {
 
         RX_DONE.reset();
 
-        // Abort any in-progress RX before clearing buffers.
-        // After TX, the sequencer auto-transitions to RX (SEQ_TRANSITIONS=0x0202).
-        // If we clear BUF1 while FRC is writing to it, we corrupt state.
-        // FRC_CMD bit 0 = RXABORT.
+        // Full radio stop + restart RX (matches baremetal radio_Enable(0) + radio_startrx):
+        // 1. Disable radio (set bit 5, clear RXENSRCEN, abort RX, disable TX)
+        let ctrl = reg_read(SEQ_CONTROL_REG);
+        reg_write(SEQ_CONTROL_REG, ctrl | 0x20);
+        reg_write(_RAC_RXENSRCEN, 0x00);
         reg_write(FRC_CMD, FRC_CMD_RXABORT);
+        reg_write(RAC_CMD, RAC_CMD_TXDIS);
 
-        // Clear RX buffer (BUF1) and length buffer (BUF2)
+        // 2. Clear RX buffers
         reg_write(BUFC_BUF1_CMD, 1);
         reg_write(_BUFC_BUF2_CMD, 1);
 
-        // Clear pending FRC and RAC RX flags
-        reg_write(FRC_IFC, FRC_IF_RXDONE | FRC_IF_RXOF | FRC_IF_FRAMEERROR);
-        reg_write(RAC_IFC, 0xFFFF_FFFF);
+        // 3. Clear all pending FRC flags
+        reg_write(FRC_IFC, 0xFFFF_FFFF);
 
-        // Clear sequencer disable flag and set band select (same as TX)
-        let seq_ctrl = reg_read(SEQ_CONTROL_REG);
-        reg_write(SEQ_CONTROL_REG, seq_ctrl & !0x20);
+        // 4. Restart RX (matches baremetal radio_startrx)
+        let ctrl2 = reg_read(SEQ_CONTROL_REG);
+        reg_write(SEQ_CONTROL_REG, ctrl2 & !0x20);
         reg_write(RAC_IFPGACTRL, 0x0000_87F6);
-
-        // Start RX via RXENSRCEN (software RX enable, as the baremetal does)
         reg_write(_RAC_RXENSRCEN, 0x02);
 
         // Debug: verify radio enters RX state
@@ -1282,7 +1281,26 @@ impl Efr32Driver {
             rtt_target::rprintln!("  RX: state={} (expected 2)", rac_state);
         }
 
-        // Wait for RX completion
+        // Wait for RX with periodic status polling (debug)
+        static RX_DBG_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+        let dbg = RX_DBG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if dbg < 3 {
+            // Poll FRC_IF every 5ms for up to 50ms to see if anything arrives
+            for i in 0..10u8 {
+                for _ in 0..200_000u32 { core::hint::spin_loop(); } // ~5ms at 40MHz
+                let frc_if = reg_read(FRC_IF);
+                let rac_st = (reg_read(RAC_STATUS) >> 24) & 0x0F;
+                let buf1_st = reg_read(BUFC_BUF1_STATUS) & 0x1FFF;
+                if frc_if != 0 || buf1_st != 0 {
+                    rtt_target::rprintln!("  RX poll[{}]: FRC_IF={:#X} RAC={} BUF1={}", 
+                        i, frc_if, rac_st, buf1_st);
+                }
+            }
+            let frc_if = reg_read(FRC_IF);
+            let rac_st = (reg_read(RAC_STATUS) >> 24) & 0x0F;
+            rtt_target::rprintln!("  RX 50ms: FRC_IF={:#X} RAC={}", frc_if, rac_st);
+        }
+
         RX_DONE.wait().await;
 
         if !RX_CRC_OK.load(Ordering::Acquire) {
