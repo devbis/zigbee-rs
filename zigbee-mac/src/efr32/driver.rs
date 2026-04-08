@@ -856,13 +856,12 @@ impl Efr32Driver {
         const CRC_INIT: u32 = CRC_BASE + 0x010;
         const CRC_POLY: u32 = CRC_BASE + 0x018;
 
-        // CRC-16-CCITT for 802.15.4:
-        //   Polynomial: 0x1021 → reversed for hardware = 0x0840
-        //   Seed: 0x0000
-        //   CTRL: BITSPERWORD=7(8bit), CRCWIDTH=1(16bit), INPUTBITORDER=1(LSB),
-        //         BYTEREVERSE=1
-        reg_write(CRC_CTRL, 0x0000_0768);
-        reg_write(CRC_POLY, 0x0000_0840);
+        // Values from reference firmware register dump:
+        //   CTRL = 0x704: BITSPERWORD=7 (bits[10:8]), CRCWIDTH=0 (bits[4:3])
+        //   POLY = 0x8408: reversed CRC-CCITT polynomial
+        //   INIT = 0x0000: initial seed
+        reg_write(CRC_CTRL, 0x0000_0704);
+        reg_write(CRC_POLY, 0x0000_8408);
         reg_write(CRC_INIT, 0x0000_0000);
     }
 
