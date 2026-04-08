@@ -805,14 +805,15 @@ impl Efr32Driver {
         // IFADCCTRL (0x144): from reference dump = 0x115E6C0
         reg_write(RAC_IFADCCTRL, 0x1153_E6C0);
 
-        // PA registers (0x100-0x150) — power amplifier configuration
-        reg_write(RAC_BASE + 0x100, 0x0000_0004); // PACTRL0
+        // PA registers — values from ACTIVE reference dump (not sleeping!)
+        reg_write(RAC_BASE + 0x0F4, 0x0000_1000); // RFENCTRL — RF front-end enable!
+        reg_write(RAC_BASE + 0x100, 0x0000_000C); // PACTRL0 (ref=0x0C, was 0x04)
         reg_write(RAC_BASE + 0x104, 0x0104_D700); // PAPKDCTRL
-        reg_write(RAC_BASE + 0x108, 0x0040_0484); // PABIASCTRL0
+        reg_write(RAC_BASE + 0x108, 0x0000_0485); // PABIASCTRL0 (ref=0x485, was 0x400484!)
         reg_write(RAC_BASE + 0x10C, 0x0002_4525); // PABIASCTRL1
         reg_write(RAC_BASE + 0x150, 0x001E_0044); // PACTUNECTRL
 
-        // Sub-GHz PA registers (set to reference values)
+        // Sub-GHz PA registers
         reg_write(RAC_BASE + 0x110, 0x0000_0000); // SGRFENCTRL0
         reg_write(RAC_BASE + 0x114, 0x0186_DB00); // SGLNAMIXCTRL
         reg_write(RAC_BASE + 0x118, 0x4000_0008); // SGPACTRL0
@@ -820,8 +821,11 @@ impl Efr32Driver {
         reg_write(RAC_BASE + 0x120, 0x0700_0444); // SGPABIASCTRL0
         reg_write(RAC_BASE + 0x124, 0x0008_4523); // SGPABIASCTRL1
 
-        // RFBIASCAL (0x130): from reference dump
-        reg_write(RAC_BASE + 0x130, 0x0025_1504); // RFBIASCAL
+        // RFBIASCAL (0x130)
+        reg_write(RAC_BASE + 0x130, 0x0025_1504);
+
+        // AUXCTRL (0x0C0): from reference dump = 0x01360010
+        reg_write(RAC_BASE + 0x0C0, 0x0136_0010);
 
         // RAC interrupt enable — the sequencer needs specific RAC interrupts
         reg_write(RAC_BASE + 0x020, 0x002C_0004); // IEN from reference
@@ -1078,14 +1082,9 @@ impl Efr32Driver {
     ///
     /// Reference firmware values at RAC 0x100-0x15C for PA configuration.
     fn set_tx_power(&self, _dbm: i8) {
-        // PA registers from reference dump (RAC_BASE + 0x100+)
-        // PACTRL0: configures PA slices and power level
-        reg_write(RAC_BASE + 0x100, 0x0000_0004); // PACTRL0
-        reg_write(RAC_BASE + 0x104, 0x0104_D700); // PAPKDCTRL
-        reg_write(RAC_BASE + 0x108, 0x0040_0484); // PABIASCTRL0
-        reg_write(RAC_BASE + 0x10C, 0x0002_4525); // PABIASCTRL1
-        // PACTUNECTRL (0x150): PA tuning
-        reg_write(RAC_BASE + 0x150, 0x001E_0044); // CTune TX/RX
+        // PA registers from ACTIVE reference dump
+        reg_write(RAC_BASE + 0x100, 0x0000_000C); // PACTRL0
+        reg_write(RAC_BASE + 0x108, 0x0000_0485); // PABIASCTRL0
     }
 
     /// Set RF channel for IEEE 802.15.4.
