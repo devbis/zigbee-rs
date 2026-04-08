@@ -671,12 +671,21 @@ impl Efr32Driver {
         reg_write(SEQ_CONTROL_REG, reg_read(SEQ_CONTROL_REG) | 0x08);
 
         // Warm-up times (µs)
-        reg_write(SEQ_RX_WARMTIME, 100);
-        reg_write(SEQ_TX_WARMTIME, 100);
-        reg_write(SEQ_RX_TX_TIME, 100);
-        reg_write(SEQ_TX_RX_TIME, 100);
-        reg_write(SEQ_TX_TX_TIME, 100);
-        reg_write(SEQ_RXFRAME_TX_TIME, 100);
+        // Warm-up times in STIMER TICKS (NOT microseconds!).
+        // STIMER runs at HFXO/8 = 38.4MHz/8 = 4.8 MHz.
+        // 100µs × 4.8 ticks/µs = 480 ticks.
+        // VDowbensky subtracts 4µs for overhead: (100-4) × 4.8 = 461.
+        // With raw µs (100), warm-up was only 20.8µs — too short for
+        // DCCAL (~50-80µs), causing RX to never detect frames!
+        const RX_WARM_TICKS: u32 = 461;  // (100-4) × 4.8
+        const TX_WARM_TICKS: u32 = 432;  // (100-10) × 4.8
+        const TX_PRE_TICKS: u32 = 336;   // (100-10-20) × 4.8
+        reg_write(SEQ_RX_WARMTIME, RX_WARM_TICKS);
+        reg_write(SEQ_TX_WARMTIME, TX_WARM_TICKS | (TX_PRE_TICKS << 16));
+        reg_write(SEQ_RX_TX_TIME, TX_WARM_TICKS | (TX_PRE_TICKS << 16));
+        reg_write(SEQ_TX_RX_TIME, RX_WARM_TICKS);
+        reg_write(SEQ_TX_TX_TIME, TX_WARM_TICKS | (TX_PRE_TICKS << 16));
+        reg_write(SEQ_RXFRAME_TX_TIME, TX_WARM_TICKS | (TX_PRE_TICKS << 16));
         reg_write(SEQ_RX_SEARCHTIME, 0);
         reg_write(SEQ_TX_RX_SEARCHTIME, 0);
 
