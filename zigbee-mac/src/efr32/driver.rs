@@ -1295,24 +1295,17 @@ impl Efr32Driver {
 
         RX_DONE.reset();
 
-        // Full radio stop + restart RX (matches baremetal radio_Enable(0) + radio_startrx):
-        // 1. Disable radio (set bit 5, clear RXENSRCEN, abort RX, disable TX)
+        // After TX, the sequencer returned to IDLE (RADIO_TRANSITIONS).
+        // We need to restart RX. But DON'T use RXABORT — that kills the
+        // FRC RX FCD which never reactivates.
+        // Just clear flags, clear buffers, and re-enable RXENSRCEN.
+        reg_write(BUFC_BUF1_CMD, 1);  // clear RX buffer
+        reg_write(_BUFC_BUF2_CMD, 1); // clear length buffer
+        reg_write(FRC_IFC, 0xFFFF_FFFF); // clear FRC flags
+
+        // Restart RX via sequencer
         let ctrl = reg_read(SEQ_CONTROL_REG);
-        reg_write(SEQ_CONTROL_REG, ctrl | 0x20);
-        reg_write(_RAC_RXENSRCEN, 0x00);
-        reg_write(FRC_CMD, FRC_CMD_RXABORT);
-        reg_write(RAC_CMD, RAC_CMD_TXDIS);
-
-        // 2. Clear RX buffers
-        reg_write(BUFC_BUF1_CMD, 1);
-        reg_write(_BUFC_BUF2_CMD, 1);
-
-        // 3. Clear all pending FRC flags
-        reg_write(FRC_IFC, 0xFFFF_FFFF);
-
-        // 4. Restart RX (matches baremetal radio_startrx)
-        let ctrl2 = reg_read(SEQ_CONTROL_REG);
-        reg_write(SEQ_CONTROL_REG, ctrl2 & !0x20);
+        reg_write(SEQ_CONTROL_REG, ctrl & !0x20);
         reg_write(RAC_IFPGACTRL, 0x0000_87F6);
         reg_write(_RAC_RXENSRCEN, 0x02);
 
