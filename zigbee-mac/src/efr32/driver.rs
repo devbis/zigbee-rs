@@ -802,8 +802,14 @@ impl Efr32Driver {
         // IFFILTCTRL (0x140): from reference dump = 0x0088006D
         reg_write(RAC_IFFILTCTRL, 0x0088_006D);
 
-        // IFADCCTRL (0x144): from reference dump = 0x115E6C0
-        reg_write(RAC_IFADCCTRL, 0x1153_E6C0);
+        // IFADCCTRL (0x144): IF ADC configuration — CRITICAL!
+        // Reference dump = 0x0115_E6C0. Previous code had 0x1153_E6C0 (WRONG!
+        // 6 bits differ in upper half — VCM, OTA2CURRENT, REGENCLKDELAY fields).
+        // With wrong value, IF ADC outputs garbage → MODEM can't decode anything.
+        reg_write(RAC_IFADCCTRL, 0x0115_E6C0);
+
+        // IFADCCAL (0x148): Enable IF ADC RC calibration
+        reg_write(RAC_BASE + 0x148, 0x0000_0010);
 
         // PA registers — values from ACTIVE reference dump (not sleeping!)
         reg_write(RAC_BASE + 0x0F4, 0x0000_1000); // RFENCTRL — RF front-end enable!
@@ -1007,10 +1013,15 @@ impl Efr32Driver {
             reg_write(MODEM_BASE + 0x14 + (i as u32) * 4, val);
         }
 
-        // DCCOMP (0x098): DC offset compensation — CRITICAL for RX!
-        // Without this, I/Q baseband has DC offset that prevents
-        // preamble/SFD detection. Reference value = 0x33.
+        // DCCOMP (0x098): DC offset compensation for RX.
         reg_write(MODEM_BASE + 0x098, 0x0000_0033);
+
+        // CRITICAL: Enable MODEM DC calibration via RAC_SR3 bit 0.
+        // VDowbensky MODEM_init() calls MODEM_DccalEnable() = RAC->SR3 |= 1.
+        // Without this, the demodulator can't extract the signal from DC offset
+        // — RSSI shows energy but no frames are ever detected!
+        let sr3 = reg_read(_RAC_SR3);
+        reg_write(_RAC_SR3, sr3 | 0x0000_0001);
 
         // MODEM RAM (0x400-0x43C): DSSS correlation lookup table.
         // CRITICAL FOR RX: the O-QPSK demodulator uses this table to
@@ -1296,11 +1307,18 @@ impl Efr32Driver {
         reg_write(RAC_IFPGACTRL, 0x0000_87F6);
         reg_write(_RAC_RXENSRCEN, 0x02);
 
-        // Debug: verify radio enters RX state
-        for _ in 0..5_000u32 { core::hint::spin_loop(); }
-        let rac_state = (reg_read(RAC_STATUS) >> 24) & 0x0F;
-        if rac_state != 2 {
-            rtt_target::rprintln!("  RX: state={} (expected 2)", rac_state);
+        // Debug: check RX warm-up progression
+        for delay in [5_000u32, 50_000, 200_000] {
+            for _ in 0..delay { core::hint::spin_loop(); }
+            let rac_state = (reg_read(RAC_STATUS) >> 24) & 0x0F;
+            let frc_st = reg_read(FRC_BASE + 0x000);
+            if frc_st & 0x02 != 0 {
+                // ACTIVERXFCD is set — warm-up complete!
+                break;
+            }
+            if delay == 200_000 {
+                rtt_target::rprintln!("  RX warmup: RAC={} FRC_ST={:#X}", rac_state, frc_st);
+            }
         }
 
         // Wait for RX with periodic status polling (debug)
@@ -1320,7 +1338,12 @@ impl Efr32Driver {
             }
             let frc_if = reg_read(FRC_IF);
             let rac_st = (reg_read(RAC_STATUS) >> 24) & 0x0F;
-            rtt_target::rprintln!("  RX 50ms: FRC_IF={:#X} RAC={}", frc_if, rac_st);
+            // Key diagnostics from multi-model analysis
+            let synth_st = reg_read(SYNTH_BASE + 0x000);
+            let dcesti = reg_read(MODEM_BASE + 0x100);
+            let frc_st = reg_read(FRC_BASE + 0x000);
+            rtt_target::rprintln!("  RX 50ms: FRC_IF={:#X} RAC={} SYNTH_LOCK={} DCESTI={:#X} FRC_ST={:#X}",
+                frc_if, rac_st, synth_st & 1, dcesti, frc_st);
         }
 
         RX_DONE.wait().await;
