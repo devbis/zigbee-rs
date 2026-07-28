@@ -13,7 +13,15 @@ zigbee-runtime = { path = "../../zigbee-runtime", features = ["router"] }
 zigbee-bl0937 = { path = "../../drivers/power_monitoring/bl0937" }
 tlsr8258-hal = { path = "../../tlsr8258-hal" }
 tlsr8258-rt = { path = "../../tlsr8258-rt" }
-tlsr8258-ts011f = { path = "../../boards/tlsr8258-ts011f" }
+tlsr8258-ts011f = { path = "../../boards/tlsr8258-ts011f", default-features = false }
+
+[features]
+# Target board flash size — forwards to the board crate, which owns the flash
+# map (linker script + partition offsets). Build the production 1M plug with:
+#   cargo ... --no-default-features --features flash-1m
+default = ["flash-512k"]
+flash-512k = ["tlsr8258-ts011f/flash-512k"]
+flash-1m = ["tlsr8258-ts011f/flash-1m"]
 
 [profile.release]
 opt-level = "s"

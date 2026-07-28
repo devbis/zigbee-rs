@@ -11,7 +11,7 @@ TLSRPGM="${TLSRPGM:-$HOME/TLSRPGM/TlsrPgm.py}"
 TELINK_PORT="${TELINK_PORT:-/dev/cu.usbserial-1410}"
 
 usage() {
-    echo "usage: $0 <check|build|flash> <crate-directory> <binary-name>" >&2
+    echo "usage: $0 <check|build|flash> <crate-directory> <binary-name> [extra cargo args...]" >&2
     exit 2
 }
 
@@ -94,10 +94,14 @@ verify_layout() {
         "$size" "$((ramcode_end - ramcode_start))" "$sdata" "$ebss"
 }
 
-[[ $# -eq 3 ]] || usage
+[[ $# -ge 3 ]] || usage
 command="$1"
 crate_dir="$2"
 binary_name="$3"
+shift 3
+# Remaining args (e.g. --no-default-features --features flash-1m) pass through
+# to cargo for both `check` and `build`/`flash`.
+cargo_args=("$@")
 
 if [[ "$crate_dir" != /* ]]; then
     crate_dir="${ROOT_DIR}/${crate_dir}"
@@ -111,12 +115,14 @@ bin="${elf}.bin"
 
 case "$command" in
     check)
-        (cd "$crate_dir" && "$CARGO_BIN" check --release --bin "$binary_name")
+        (cd "$crate_dir" && "$CARGO_BIN" check --release --bin "$binary_name" \
+            "${cargo_args[@]+"${cargo_args[@]}"}")
         ;;
     build|flash)
         (
             cd "$crate_dir"
-            "$CARGO_BIN" rustc --release --bin "$binary_name" -- \
+            "$CARGO_BIN" rustc --release --bin "$binary_name" \
+                "${cargo_args[@]+"${cargo_args[@]}"}" -- \
                 -C lto=fat -C opt-level=s -C codegen-units=1
         )
         require_file "$LLVM_OBJCOPY" "llvm-objcopy"

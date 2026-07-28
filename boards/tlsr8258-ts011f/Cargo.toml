@@ -13,5 +13,12 @@ tlsr8258-hal = { path = "../../tlsr8258-hal" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 zigbee-bl0937 = { path = "../../drivers/power_monitoring/bl0937" }
 
+[features]
+# Flash size of the target board. Selects the linker script (build.rs) and the
+# flash partition offsets (src/storage.rs). Pick exactly one.
+default = ["flash-512k"]
+flash-512k = [] # TLSR8258F512 sample boards (development)
+flash-1m = []   # TLSR8258F1M production Tuya TS011F plug
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

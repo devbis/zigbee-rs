@@ -5,10 +5,33 @@ use tlsr8258_hal::flash::{FlashError, Tlsr8258Flash};
 use zigbee_runtime::log_nv::LogStructuredNv;
 use zigbee_runtime::security_journal::{SECURITY_JOURNAL_SECTOR_SIZE, SecurityStateJournal};
 
-const FLASH_CAPACITY: usize = 1024 * 1024;
+// ── Flash map (board setting) ──
+//
+// Which flash size the board has is selected by this crate's Cargo features
+// (`flash-512k` default / `flash-1m`). These offsets MUST match the linker
+// script chosen in build.rs for the same feature. Partitions must lie within
+// the physical flash — on a 512 KiB part, addresses >= 0x80000 alias back into
+// the firmware image and corrupt code when written.
+#[cfg(all(feature = "flash-512k", feature = "flash-1m"))]
+compile_error!("tlsr8258-ts011f: enable exactly one of `flash-512k` / `flash-1m`, not both");
+#[cfg(not(any(feature = "flash-512k", feature = "flash-1m")))]
+compile_error!("tlsr8258-ts011f: enable a flash size feature (`flash-512k` or `flash-1m`)");
+
+#[cfg(all(feature = "flash-1m", not(feature = "flash-512k")))]
+mod flash_map {
+    pub const FLASH_CAPACITY: usize = 1024 * 1024;
+    pub const NV_PARTITION_START: u32 = 0x000E_0000;
+    pub const SECURITY_PARTITION_START: u32 = 0x000F_0000;
+}
+#[cfg(all(feature = "flash-512k", not(feature = "flash-1m")))]
+mod flash_map {
+    pub const FLASH_CAPACITY: usize = 512 * 1024;
+    pub const NV_PARTITION_START: u32 = 0x0007_6000;
+    pub const SECURITY_PARTITION_START: u32 = 0x0007_8000;
+}
+use flash_map::{FLASH_CAPACITY, NV_PARTITION_START, SECURITY_PARTITION_START};
 
 // ── Security journal partition ──
-const SECURITY_PARTITION_START: u32 = 0x000F_0000;
 const SECURITY_PARTITION_SIZE: usize = SECURITY_JOURNAL_SECTOR_SIZE * 2;
 const SECURITY_SECTOR_A: u32 = 0;
 const SECURITY_SECTOR_B: u32 = SECURITY_JOURNAL_SECTOR_SIZE as u32;
@@ -17,7 +40,6 @@ const _: () =
     assert!(SECURITY_PARTITION_START as usize + SECURITY_PARTITION_SIZE <= FLASH_CAPACITY);
 
 // ── NV storage partition (energy persistence) ──
-const NV_PARTITION_START: u32 = 0x000E_0000;
 const NV_SECTOR_SIZE: u32 = 4096;
 const NV_NUM_SECTORS: u32 = 2;
 const NV_PARTITION_SIZE: u32 = NV_SECTOR_SIZE * NV_NUM_SECTORS;

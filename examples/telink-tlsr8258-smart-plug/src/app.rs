@@ -11,11 +11,13 @@ use core::mem::MaybeUninit;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::{MacError, telink::TelinkMac};
 use zigbee_nwk::DeviceType;
-use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::event_loop::{StackEvent, StartError};
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::profile::smart_plug::{ElectricalReading, SmartPlug, SmartPlugReporting};
+use zigbee_runtime::profile::{ApplicationClusters, ProfileComponent};
+use zigbee_runtime::{ClusterRef, ZigbeeDevice};
 use zigbee_zcl::clusters::basic::PowerSource;
+use zigbee_zcl::clusters::tuya_plug::{TUYA_CLUSTER_ID, TuyaPlugCluster};
 use zigbee_zcl::{ClusterId, DeviceId};
 
 use tlsr8258_ts011f::{leds as board, storage};
@@ -103,6 +105,8 @@ pub fn run() -> ! {
                     .cluster_server(ClusterId::IDENTIFY)
                     .cluster_server(ClusterId::ON_OFF)
                     .cluster_server(ClusterId::ELECTRICAL_MEASUREMENT)
+                    .cluster_server(ClusterId::METERING)
+                    .cluster_server(TUYA_CLUSTER_ID)
             },
         )
         .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
@@ -132,6 +136,9 @@ pub fn run() -> ! {
     // Load saved energy from flash
     energy::load_energy(&mut nv_store, &mut smart_plug);
 
+    // Manufacturer-specific configuration cluster (0xFC01).
+    let mut tuya = TuyaPlugCluster::new();
+
     'commission: loop {
         let mut attempts = 0u8;
         loop {
@@ -151,6 +158,13 @@ pub fn run() -> ! {
         board::LED_GREEN.write(true);
         board::LED_BLUE.write(false);
 
+        // Install the archetype's default attribute reporting (On/Off,
+        // electrical RMS, metering) so the coordinator's interview
+        // bind + configure-reporting step has reports to bind to.
+        if smart_plug.configure_default_reporting(1, device).is_err() {
+            failure();
+        }
+
         let mut identify_elapsed = 0u32;
         let one_second = tlsr8258_hal::timer::ms(1_000);
         let mut tick_anchor = tlsr8258_hal::timer::now_ticks();
@@ -158,11 +172,14 @@ pub fn run() -> ! {
         loop {
             match tlsr8258_rt::block_on(device.receive()) {
                 Ok(indication) => {
-                    let event = tlsr8258_rt::block_on(device.process_incoming_with_security_store(
-                        &indication,
-                        &mut [],
-                        &mut security_store,
-                    ));
+                    let event = {
+                        let mut clusters = cluster_refs(&mut smart_plug, &mut tuya);
+                        tlsr8258_rt::block_on(device.process_incoming_with_security_store(
+                            &indication,
+                            clusters.as_mut_slice(),
+                            &mut security_store,
+                        ))
+                    };
                     match event {
                         Ok(Some(StackEvent::RejoinRequested)) => {
                             let _ = tlsr8258_rt::block_on(
@@ -185,13 +202,16 @@ pub fn run() -> ! {
                         Err(_) => failure(),
                     }
 
-                    if tlsr8258_rt::block_on(device.tick_with_security_store(
-                        0,
-                        &mut [],
-                        &mut security_store,
-                    ))
-                    .is_err()
-                    {
+                    let tick_ok = {
+                        let mut clusters = cluster_refs(&mut smart_plug, &mut tuya);
+                        tlsr8258_rt::block_on(device.tick_with_security_store(
+                            0,
+                            clusters.as_mut_slice(),
+                            &mut security_store,
+                        ))
+                        .is_ok()
+                    };
+                    if !tick_ok {
                         failure();
                     }
                 }
@@ -257,13 +277,16 @@ pub fn run() -> ! {
                     energy::save_energy(&mut nv_store, &smart_plug);
                 }
 
-                if tlsr8258_rt::block_on(device.tick_with_security_store(
-                    elapsed_secs,
-                    &mut [],
-                    &mut security_store,
-                ))
-                .is_err()
-                {
+                let tick_ok = {
+                    let mut clusters = cluster_refs(&mut smart_plug, &mut tuya);
+                    tlsr8258_rt::block_on(device.tick_with_security_store(
+                        elapsed_secs,
+                        clusters.as_mut_slice(),
+                        &mut security_store,
+                    ))
+                    .is_ok()
+                };
+                if !tick_ok {
                     failure();
                 }
 
@@ -278,4 +301,27 @@ pub fn run() -> ! {
             }
         }
     }
+}
+
+/// Build the live application-cluster handlers for endpoint 1.
+///
+/// The stack borrows these per call to dispatch ZCL reads/commands and emit
+/// attribute reports. Without them the endpoint advertises On/Off, Electrical
+/// Measurement, Metering and the 0xFC01 cluster in its descriptor but answers
+/// nothing — which stalls the coordinator's interview after the descriptor
+/// stage. Rebuilt per call (like the sensor examples) because the borrow must
+/// be released before the measurement code touches `smart_plug` again.
+fn cluster_refs<'a>(
+    smart_plug: &'a mut SmartPlug,
+    tuya: &'a mut TuyaPlugCluster,
+) -> ApplicationClusters<'a> {
+    let mut clusters = ApplicationClusters::new();
+    // On/Off, Electrical Measurement, and (since metering is configured)
+    // Simple Metering come from the SmartPlug archetype.
+    let _ = smart_plug.collect_clusters(1, &mut clusters);
+    let _ = clusters.push(ClusterRef {
+        endpoint: 1,
+        cluster: tuya,
+    });
+    clusters
 }

@@ -2,9 +2,12 @@
 target = "tc32-unknown-none-elf"
 
 [target.tc32-unknown-none-elf]
+# `memory.x` is supplied by the tlsr8258-ts011f board crate: its build.rs
+# selects memory-512k.x / memory-1m.x per the flash-* feature and adds it to
+# the linker search path, so we link it by bare name here.
 rustflags = [
     "-C", "llvm-args=-enable-tail-merge=false",
-    "-C", "link-arg=-T../../boards/tlsr8258-ts011f/memory.x",
+    "-C", "link-arg=-Tmemory.x",
     "-C", "link-arg=--gc-sections",
 ]
 

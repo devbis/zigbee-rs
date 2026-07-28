@@ -1,5 +1,8 @@
 /* Production TLSR8258 TS011F (1M flash) runtime layout.
  *
+ * Selected by the board crate's `flash-1m` feature (see build.rs). This is the
+ * production Tuya TS011F plug, which ships a TLSR8258F1M (1 MiB flash).
+ *
  * Writable data follows the Telink SDK cache reservation:
  *   0x840000 + A         RAM-code backing end / I-cache tag start
  *   0x840100 + A         I-cache tag end / I-cache data start
@@ -103,7 +106,7 @@ SECTIONS
     _bin_size_div_16 = (_bin_size_ + 15) / 16;
     _etext = _dstored_;
     _security_nv_start_ = 0xE0000;
-    _security_nv_end_ = 0xF0000;
+    _security_nv_end_ = 0x100000;
 
     _ramcode_stored_ = LOADADDR(.ram_code);
     _start_data_ = _sdata;
@@ -129,6 +132,8 @@ SECTIONS
         "ERROR: .rf_dma extends into the SVC stack region");
     _assert_image_below_security_nv = ASSERT(_bin_size_ <= _security_nv_start_,
         "ERROR: firmware image overlaps NV storage at 0xE0000");
+    _assert_partitions_within_flash = ASSERT(_security_nv_end_ <= 0x100000,
+        "ERROR: NV/security partitions extend past the 1 MiB physical flash");
 
     /DISCARD/ :
     {
