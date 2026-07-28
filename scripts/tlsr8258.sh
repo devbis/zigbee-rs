@@ -7,11 +7,12 @@ mode="${2:-sensor}"
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/tlsr8258.sh <check|build|flash> [sensor|router|diag-assoc|diag-beacon|diag-smoke|diag-pm|lab-sensor]
+usage: scripts/tlsr8258.sh <check|build|flash> [sensor|router|smart-plug|lab-sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm]
 
 Production firmware:
   sensor       polling end-device sensor
   router       always-on join/relay router
+  smart-plug   TS011F smart plug with BL0937 energy monitoring
 
 Hardware lab:
   diag-assoc   association and MAC stress
@@ -35,6 +36,10 @@ case "$action:$mode" in
     check:runtime-router|build:runtime-router|flash:runtime-router)
         exec "$ROOT_DIR/tools/tlsr8258-firmware.sh" "$action" \
             examples/telink-tlsr8258-router telink-tlsr8258-router
+        ;;
+    check:smart-plug|build:smart-plug|flash:smart-plug)
+        exec "$ROOT_DIR/tools/tlsr8258-firmware.sh" "$action" \
+            examples/telink-tlsr8258-smart-plug telink-tlsr8258-smart-plug
         ;;
     check:lab-sensor|build:lab-sensor|flash:lab-sensor)
         exec "$ROOT_DIR/tools/telink-tlsr8258-lab/scripts/tlsr8258.sh" "$action" sensor

@@ -1,0 +1,13 @@
+[package]
+name = "zigbee-bl0942"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Platform-agnostic BL0942 energy metering IC driver (UART)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+heapless = "0.9"

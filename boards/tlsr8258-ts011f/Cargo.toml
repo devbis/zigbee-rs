@@ -1,0 +1,17 @@
+[package]
+name = "tlsr8258-ts011f"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for Tuya TS011F Zigbee smart plug with BL0937 energy monitoring"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[dependencies]
+embedded-storage = "0.3"
+tlsr8258-hal = { path = "../../tlsr8258-hal" }
+zigbee-runtime = { path = "../../zigbee-runtime" }
+zigbee-bl0937 = { path = "../../drivers/power_monitoring/bl0937" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

@@ -11,6 +11,7 @@ pub mod clocks;
 #[cfg(target_arch = "tc32")]
 pub mod flash;
 pub mod gpio;
+pub mod gpio_irq;
 pub mod mmio;
 pub mod pm;
 pub mod radio;

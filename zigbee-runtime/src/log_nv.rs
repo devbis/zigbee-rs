@@ -466,7 +466,9 @@ fn raw_to_nv_item_id(raw: u16) -> Option<NvItemId> {
         0x0100 => Some(NvItemId::AppEndpoint1),
         0x0101 => Some(NvItemId::AppEndpoint2),
         0x0102 => Some(NvItemId::AppEndpoint3),
-        _ if raw >= 0x0200 => Some(NvItemId::AppCustomBase),
+        0x0200 => Some(NvItemId::AppEnergyWh),
+        0x0201 => Some(NvItemId::AppPlugSettings),
+        _ if raw >= 0x0210 => Some(NvItemId::AppCustomBase),
         _ => None,
     }
 }

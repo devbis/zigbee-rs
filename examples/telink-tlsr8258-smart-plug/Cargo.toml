@@ -1,0 +1,21 @@
+[package]
+name = "telink-tlsr8258-smart-plug"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-zcl = { path = "../../zigbee-zcl" }
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["router"] }
+zigbee-bl0937 = { path = "../../drivers/power_monitoring/bl0937" }
+tlsr8258-hal = { path = "../../tlsr8258-hal" }
+tlsr8258-rt = { path = "../../tlsr8258-rt" }
+tlsr8258-ts011f = { path = "../../boards/tlsr8258-ts011f" }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1

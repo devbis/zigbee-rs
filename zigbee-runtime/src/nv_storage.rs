@@ -45,7 +45,11 @@ pub enum NvItemId {
     AppEndpoint1 = 0x0100,
     AppEndpoint2 = 0x0101,
     AppEndpoint3 = 0x0102,
-    AppCustomBase = 0x0200,
+
+    // Power monitoring / smart plug (0x0200+)
+    AppEnergyWh = 0x0200,
+    AppPlugSettings = 0x0201,
+    AppCustomBase = 0x0210,
 }
 
 /// NV storage error.

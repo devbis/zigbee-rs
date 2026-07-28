@@ -48,6 +48,7 @@ pub mod thermostat;
 pub mod thermostat_ui;
 pub mod time;
 pub mod touchlink;
+pub mod tuya_plug;
 pub mod window_covering;
 
 use crate::attribute::AttributeStore;

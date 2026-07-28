@@ -67,7 +67,7 @@ pub enum Port {
 }
 
 impl Port {
-    const fn index(self) -> u8 {
+    pub(crate) const fn index(self) -> u8 {
         match self {
             Port::A => 0,
             Port::B => 1,
