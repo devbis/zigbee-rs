@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EXAMPLE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 REPO_DIR="$(cd -- "${EXAMPLE_DIR}/../.." && pwd)"
 
-DEFAULT_TC32_TOOLCHAIN="${REPO_DIR}/.toolchains/tc32-stage2-tc32-45"
+DEFAULT_TC32_TOOLCHAIN="${REPO_DIR}/.toolchains/tc32-1.98.1-20261003-31a272"
 TC32_TOOLCHAIN="${TC32_TOOLCHAIN:-$DEFAULT_TC32_TOOLCHAIN}"
 CARGO_BIN="${CARGO_BIN:-$TC32_TOOLCHAIN/bin/cargo}"
 LLVM_OBJCOPY="${LLVM_OBJCOPY:-$TC32_TOOLCHAIN/llvm/bin/llvm-objcopy}"
@@ -56,7 +56,7 @@ Usage:
   scripts/tlsr8258.sh probe-gdb [sensor|diag-assoc|diag-beacon|diag-smoke|diag-pm|diag-retention]
 
 Environment overrides:
-  TC32_TOOLCHAIN  Path to tc32-stage2 toolchain root
+  TC32_TOOLCHAIN  Path to TC32 toolchain root
   CARGO_BIN       Cargo binary to use instead of $TC32_TOOLCHAIN/bin/cargo
   LLVM_OBJCOPY    llvm-objcopy binary to emit the flashable .bin
   CARGO_HOME      Cargo home for registry/cache

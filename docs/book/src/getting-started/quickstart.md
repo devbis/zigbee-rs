@@ -86,7 +86,7 @@ cargo +nightly-2026-03-23 build --release --locked
 ```
 
 ESP32 and PHY6222 use `nightly-2026-08-01`. Telink uses
-`tc32-stage2-tc32-45`. See the
+`tc32-1.98.1-20261003-31a272`. See the
 [platform guides](../platform-guides/nrf.md) and
 [`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/experiment/r22-bdb-complete/BUILD.md)
 before flashing.

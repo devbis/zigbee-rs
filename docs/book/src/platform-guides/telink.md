@@ -1,6 +1,7 @@
 # Telink TLSR8258
 
-TLSR8258 uses the custom `tc32-stage2-tc32-45` Rust target. The production
+TLSR8258 uses the custom `tc32-1.98.1-20261003-31a272` Rust toolchain
+(LLVM 23.1.2), targeting `tc32-unknown-none-elf`. The production
 sensor and router use the same shared application frontends as the ARM and
 RISC-V products.
 
@@ -120,8 +121,13 @@ sector erase and fail closed on missing, unstable, or low voltage.
 
 ## Build
 
-Install the target toolchain under `.toolchains/tc32-stage2-tc32-45`. Host
-tools use Rust `1.94.1`.
+Install the [pinned release](https://github.com/modern-tc32/rust/releases/tag/tc32-1.98.1-20261003-31a272)
+under `.toolchains/tc32-1.98.1-20261003-31a272`, stripping the archive's
+top-level directory. Archive checksums are listed in
+[`BUILD.md`](https://github.com/faronov/zigbee-rs/blob/master/BUILD.md#telink-tlsr8258).
+All build helpers honor `TC32_TOOLCHAIN`; Actions uses the same release and
+verifies its Linux archive checksum, compiler version, and TC32 target.
+Host tools remain on Rust `1.94.1`.
 
 ```bash
 ./scripts/tlsr8258.sh build sensor
@@ -129,6 +135,13 @@ tools use Rust `1.94.1`.
 ./scripts/tlsr8258.sh build sensor-retention-10s
 ./scripts/tlsr8258.sh build router
 ```
+
+The October 4 controlled rebuild with the new compiler measured **203,640 B**
+for the default sensor and **300,116 B** for the router, reductions of 29.7%
+and 31.2% respectively. See the
+[compiler comparison](../advanced/firmware-size.md#tlsr8258-compiler-comparison-2026-10-04)
+for both LOW32K variants, unchanged build settings, and physical headroom.
+These new images have not been run on hardware.
 
 Recorded images (sensor baseline 2026-09-06; router refreshed 2026-09-10).
 Former regression budgets are historical comparisons, no longer enforced:

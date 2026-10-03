@@ -28,7 +28,7 @@ file is a certification claim.
 | workspace, nRF, BL702, CC2340, EFR32 | `nightly-2026-03-23` |
 | ESP32-C6/H2 and PHY6222 | `nightly-2026-08-01` |
 | Telink host tools | Rust `1.94.1` |
-| Telink target | `tc32-stage2-tc32-45` |
+| Telink target | `tc32-1.98.1-20261003-31a272` (LLVM 23.1.2) |
 | `espflash` | `4.5.0` |
 | TI CC2340 SDK source | commit `68ca021502383f367d0bf2a5517fdd0dcb0ef909` |
 | Microsoft UF2 | revision `90e9741f217f5a40c98ba74d663e408041037578` |
@@ -362,8 +362,24 @@ MG21 hardware path remains HIL-unverified. The current raw image is 202,820 B;
 
 ## Telink TLSR8258
 
-Install the repository's `tc32-stage2-tc32-45` target toolchain under
-`.toolchains/tc32-stage2-tc32-45`, then run:
+Install the [pinned TC32 release](https://github.com/modern-tc32/rust/releases/tag/tc32-1.98.1-20261003-31a272)
+under `.toolchains/tc32-1.98.1-20261003-31a272`, stripping the archive's
+single top-level directory. Select the archive matching the build host:
+
+| host | archive | SHA-256 |
+|---|---|---|
+| Linux x86-64 (Actions) | `tc32-rust-toolchain-linux-amd64.tar.gz` | `d72e68cfb7490583911323c358fd9dcc760baaa7ebdf1145cdc7208bae6b931b` |
+| macOS x86-64 | `tc32-rust-toolchain-macos-amd64.tar.gz` | `6c8fb85675a97a79eb51d52f69005620516d49a32e5202c9fb527ec6fa2138cf` |
+| macOS ARM64 | `tc32-rust-toolchain-macos-arm64.tar.gz` | `5f4eca476474d91c20b5dcc9b6779fbb7a6b9bdf77696c788a5886e16da9653d` |
+
+Verify the archive checksum before extraction (`sha256sum` on Linux,
+`shasum -a 256` on macOS). The packaged compiler identifies itself as
+`1.98.1-dev`, LLVM `23.1.2`, with `commit-hash: unknown`; the pinned release
+asset checksum, not that missing compiler metadata, establishes provenance.
+`TC32_TOOLCHAIN` can override the installation path for all production,
+lab, and radio helpers. Host tests/Clippy remain on Rust `1.94.1`.
+
+Then run:
 
 ```bash
 ./scripts/tlsr8258.sh build sensor
@@ -371,6 +387,13 @@ Install the repository's `tc32-stage2-tc32-45` target toolchain under
 ./scripts/tlsr8258.sh build sensor-retention-10s
 ./scripts/tlsr8258.sh build router
 ```
+
+With unchanged firmware sources and build flags, the October 4 macOS rebuild
+measured 203,640 B for the default sensor, 206,904/206,908 B for the two LOW32K
+variants, and 300,116 B for the router. See the
+[controlled compiler comparison](docs/book/src/advanced/firmware-size.md#tlsr8258-compiler-comparison-2026-10-04).
+The earlier measurements below remain historical; the new images are not
+hardware-qualified.
 
 The default sensor uses:
 

@@ -12,7 +12,8 @@ From the repository root, prefer the public wrapper:
 ./scripts/tlsr8258.sh build lab-sensor
 ```
 
-The helper uses tc32-45 from `.toolchains/tc32-stage2-tc32-45` by default.
+The helper uses `tc32-1.98.1-20261003-31a272` from
+`.toolchains/tc32-1.98.1-20261003-31a272` by default.
 Override `TC32_TOOLCHAIN`, `TELINK_PORT`, `TLSRPGM`, `TLSR_DEBUG`, or
 `PROBE_RS` when the local tools use different paths.
 

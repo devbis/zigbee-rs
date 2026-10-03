@@ -254,7 +254,8 @@ cargo +nightly-2026-03-23 fmt --all -- --check
 ```
 
 ESP32 and PHY6222 use `nightly-2026-08-01`. TLSR8258 uses the
-`tc32-stage2-tc32-45` target toolchain; its host-side tools use Rust `1.94.1`.
+`tc32-1.98.1-20261003-31a272` target toolchain (LLVM 23.1.2); its host-side
+tools use Rust `1.94.1`.
 
 ## Documentation
 

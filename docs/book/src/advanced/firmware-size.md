@@ -9,6 +9,32 @@ longer enforced. A larger image does not fail a build merely for exceeding a
 previous snapshot's budget. Physical Flash/RAM limits, protected partitions,
 OTA-slot bounds, stack reserves, and linker/layout checks remain mandatory.
 
+## TLSR8258 compiler comparison (2026-10-04)
+
+The current pinned toolchain is
+[`tc32-1.98.1-20261003-31a272`](https://github.com/modern-tc32/rust/releases/tag/tc32-1.98.1-20261003-31a272),
+using LLVM 23.1.2. A controlled macOS x86-64 rebuild of the `df6e934`
+firmware sources and locked dependencies produced:
+
+| image | old `tc32-45` | new toolchain | reduction | new physical headroom |
+|---|---:|---:|---:|---:|
+| default SUSPEND sensor | 289,540 B | 203,640 B | 85,900 B (29.7%) | 255,112 B |
+| LOW32K 250 ms proof | 294,444 B | 206,904 B | 87,540 B (29.7%) | 251,848 B |
+| LOW32K 10 s proof | 294,448 B | 206,908 B | 87,540 B (29.7%) | 251,844 B |
+| parent router | 436,072 B | 300,116 B | 135,956 B (31.2%) | 158,636 B |
+
+These are complete raw binaries, including the unchanged fixed `.text`
+placement at `0x8000`. The source, features, linker scripts, `opt-level=s`,
+fat LTO, single codegen unit, and disabled tail merge were held constant:
+no protocol functionality or memory safeguards were removed for this reduction.
+Physical headroom is relative to the unchanged `0x70000` application boundary,
+not a new regression budget or a promise of dual-slot OTA support.
+
+All four production variants and the six lab modes plus the standalone radio
+harness passed their local link/layout checks. This is build evidence, not
+exact-image hardware validation; no device was flashed. The LOW32K SVC stack
+reserve remains 8,448 B.
+
 ## Local image snapshots
 
 Baseline snapshot: **2026-09-06**. EFR32MG1 was refreshed **2026-09-08**.
@@ -52,7 +78,9 @@ The measurements use:
 - `nightly-2026-08-01` for ESP32 and PHY6222;
 - `tc32-stage2-tc32-45` for TLSR8258.
 
-Changing the compiler invalidates direct size comparisons.
+These older snapshots use their listed compilers, not the current TC32 pin.
+Compiler comparisons require holding source, features, and build flags constant,
+as in the controlled TLSR8258 rebuild above.
 
 The September 15 PHY62x2 measurements keep `nightly-2026-08-01` and the
 existing product feature sets, with target-local identical-code folding.

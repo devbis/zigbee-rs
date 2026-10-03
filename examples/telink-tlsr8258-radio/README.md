@@ -64,7 +64,7 @@ and `diag`'s checksum/canary/record logic have **no** such gate and are
 unit-tested on the host via `cargo test` (`#![cfg_attr(not(test), no_std)]` /
 `#![cfg_attr(not(test), no_main)]`). See [Testing](#testing).
 
-> **Important — target arch note:** the tc32-45/tc32-43 forked toolchains'
+> **Important — target arch note:** the pinned forked toolchain's
 > *built-in* `tc32-unknown-none-elf` target reports `target_arch = "tc32"`
 > (confirmed via `rustc --print target-spec-json`), **not** `"arm"` — despite
 > the standalone `targets/tc32-none-eabi*.json` target-spec files in this
@@ -74,12 +74,13 @@ unit-tested on the host via `cargo test` (`#![cfg_attr(not(test), no_std)]` /
 
 ## Building
 
-Requires one of the tc32-stage2 forked toolchains at
-`.toolchains/tc32-stage2-tc32-45` (default) or `tc32-stage2-tc32-43`
-(comparison), same as `examples/telink-tlsr8258-sensor`.
+Requires `tc32-1.98.1-20261003-31a272` at
+`.toolchains/tc32-1.98.1-20261003-31a272`, same as
+`examples/telink-tlsr8258-sensor`. See
+[`BUILD.md`](../../BUILD.md#telink-tlsr8258) for archive checksums.
 
 ```sh
-# Default toolchain (tc32-45)
+# Default pinned toolchain
 scripts/tlsr8258.sh build
 
 # Local ZHA RX control on channel 15
@@ -102,7 +103,7 @@ scripts/tlsr8258.sh check
 Equivalent raw `cargo` invocation (what the script wraps):
 
 ```sh
-TC32=../../.toolchains/tc32-stage2-tc32-45
+TC32=../../.toolchains/tc32-1.98.1-20261003-31a272
 env CARGO_HOME="$HOME/.cargo" "$TC32/bin/cargo" rustc --release \
     --target tc32-unknown-none-elf \
     -Z build-std=core -Z build-std-features=compiler-builtins-mem \

@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EXAMPLE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 REPO_DIR="$(cd -- "${EXAMPLE_DIR}/../.." && pwd)"
 
-DEFAULT_TC32_TOOLCHAIN="${REPO_DIR}/.toolchains/tc32-stage2-tc32-45"
+DEFAULT_TC32_TOOLCHAIN="${REPO_DIR}/.toolchains/tc32-1.98.1-20261003-31a272"
 TC32_TOOLCHAIN="${TC32_TOOLCHAIN:-$DEFAULT_TC32_TOOLCHAIN}"
 CARGO_BIN="${CARGO_BIN:-$TC32_TOOLCHAIN/bin/cargo}"
 LLVM_NM="${LLVM_NM:-$TC32_TOOLCHAIN/llvm/bin/llvm-nm}"
@@ -47,7 +47,7 @@ Usage:
   scripts/tlsr8258.sh dump-activate <address> [word-count]
 
 Environment overrides:
-  TC32_TOOLCHAIN  Path to tc32-stage2 toolchain root (default: tc32-45)
+  TC32_TOOLCHAIN  Path to TC32 toolchain root (default: tc32-1.98.1-20261003-31a272)
   CARGO_BIN       Cargo binary to use instead of $TC32_TOOLCHAIN/bin/cargo
   LLVM_NM         llvm-nm binary used by verify_layout
   LLVM_OBJCOPY    llvm-objcopy binary to emit the flashable .bin
@@ -58,7 +58,7 @@ Environment overrides:
   TELINK_PORT     Serial device used by both flasher and debugger
 
 Examples:
-  TC32_TOOLCHAIN=$REPO/.toolchains/tc32-stage2-tc32-43 scripts/tlsr8258.sh build
+  TC32_TOOLCHAIN=/path/to/toolchain scripts/tlsr8258.sh build
 EOF
 }
 

@@ -64,8 +64,9 @@ A successful build or symbol check is not the pass marker.
 
 ## Build
 
-Install `tc32-stage2-tc32-45` under
-`.toolchains/tc32-stage2-tc32-45`, then from the repository root:
+Install `tc32-1.98.1-20261003-31a272` under
+`.toolchains/tc32-1.98.1-20261003-31a272` (see the checksums and extraction
+instructions in [`BUILD.md`](../../BUILD.md#telink-tlsr8258)), then from the repository root:
 
 ```bash
 ./scripts/tlsr8258.sh build sensor
@@ -73,7 +74,12 @@ Install `tc32-stage2-tc32-45` under
 ./scripts/tlsr8258.sh build sensor-retention-10s
 ```
 
-Recorded images and former regression budgets:
+The current compiler's October 4 local builds measure 203,640 B (default),
+206,904 B (250 ms LOW32K), and 206,908 B (10 s LOW32K). See the
+[controlled comparison](../../docs/book/src/advanced/firmware-size.md#tlsr8258-compiler-comparison-2026-10-04);
+these images have not been flashed.
+
+Historical images and former regression budgets:
 
 | image | bytes | former regression budget |
 |---|---:|---:|
