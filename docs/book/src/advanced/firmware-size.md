@@ -9,12 +9,41 @@ longer enforced. A larger image does not fail a build merely for exceeding a
 previous snapshot's budget. Physical Flash/RAM limits, protected partitions,
 OTA-slot bounds, stack reserves, and linker/layout checks remain mandatory.
 
+## TLSR8258 tail merging (2026-10-04)
+
+The current production, lab, and radio Cargo configurations explicitly enable
+LLVM tail merging (`-enable-tail-merge=true`) with the pinned
+`tc32-1.98.1-20261003-31a272` toolchain. This is a separate change from the
+compiler-only comparison below; the initial compiler upgrade retained the
+old disabled setting.
+
+The macOS x86-64 rebuild with only this flag changed measured:
+
+| image | tail merge off (`19db883`) | tail merge on | additional reduction | physical headroom |
+|---|---:|---:|---:|---:|
+| default SUSPEND sensor | 203,640 B | 195,688 B | 7,952 B | 263,064 B |
+| LOW32K 250 ms proof | 206,904 B | 198,764 B | 8,140 B | 259,988 B |
+| LOW32K 10 s proof | 206,908 B | 198,768 B | 8,140 B | 259,984 B |
+| parent router | 300,116 B | 288,508 B | 11,608 B | 170,244 B |
+
+The cumulative reduction from the old `tc32-45` builds is **32.4%** for the
+default sensor and **33.8%** for the router. Production features, `opt-level=s`,
+fat LTO, single codegen unit, linker layout, and all memory checks are unchanged.
+Headroom is relative to the `0x70000` application boundary, not an OTA slot.
+The LOW32K SVC stack reserve remains 8,448 B.
+
+All four production variants, six lab modes, and the standalone radio harness
+passed their local link/layout checks. These are build results, not exact-image
+hardware qualification; no device was flashed. Actions builds the same Cargo
+configurations, and its firmware cache key includes `.cargo/config.toml` files.
+
 ## TLSR8258 compiler comparison (2026-10-04)
 
 The current pinned toolchain is
 [`tc32-1.98.1-20261003-31a272`](https://github.com/modern-tc32/rust/releases/tag/tc32-1.98.1-20261003-31a272),
-using LLVM 23.1.2. A controlled macOS x86-64 rebuild of the `df6e934`
-firmware sources and locked dependencies produced:
+using LLVM 23.1.2. The initial compiler-only upgrade, before enabling tail
+merging, used a controlled macOS x86-64 rebuild of the `df6e934`
+firmware sources and locked dependencies:
 
 | image | old `tc32-45` | new toolchain | reduction | new physical headroom |
 |---|---:|---:|---:|---:|

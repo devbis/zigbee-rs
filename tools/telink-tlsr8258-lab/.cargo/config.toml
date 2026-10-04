@@ -2,7 +2,7 @@
 target = "tc32-unknown-none-elf"
 
 [target.tc32-unknown-none-elf]
-rustflags = ["-C", "llvm-args=-enable-tail-merge=false"]
+rustflags = ["-C", "llvm-args=-enable-tail-merge=true"]
 
 [unstable]
 build-std = ["core"]

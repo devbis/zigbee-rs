@@ -388,10 +388,12 @@ Then run:
 ./scripts/tlsr8258.sh build router
 ```
 
-With unchanged firmware sources and build flags, the October 4 macOS rebuild
-measured 203,640 B for the default sensor, 206,904/206,908 B for the two LOW32K
-variants, and 300,116 B for the router. See the
-[controlled compiler comparison](docs/book/src/advanced/firmware-size.md#tlsr8258-compiler-comparison-2026-10-04).
+Production, lab, and radio builds explicitly enable LLVM tail merging with the
+pinned compiler. The October 4 macOS rebuild measured 195,688 B for the default
+sensor, 198,764/198,768 B for the two LOW32K variants, and 288,508 B for the
+router. See the
+[tail-merge comparison](docs/book/src/advanced/firmware-size.md#tlsr8258-tail-merging-2026-10-04)
+and the separate compiler-only baseline on that page.
 The earlier measurements below remain historical; the new images are not
 hardware-qualified.
 

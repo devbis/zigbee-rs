@@ -108,7 +108,7 @@ jobs:
             products/tlsr8258-tb04/target
             tools/telink-tlsr8258-lab/target
             examples/telink-tlsr8258-radio/target
-          key: ${{ env.TC32_TOOLCHAIN_TAG }}-${{ env.TC32_TOOLCHAIN_SHA256 }}-${{ env.HOST_RUST_TOOLCHAIN }}-${{ runner.os }}-tc32-unknown-none-elf-prod-retention-router-pm-retention-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/memory*.x', 'scripts/tlsr8258.sh', 'tools/tlsr8258-firmware.sh', 'tools/telink-tlsr8258-lab/scripts/tlsr8258.sh', 'examples/telink-tlsr8258-radio/scripts/tlsr8258.sh') }}
+          key: ${{ env.TC32_TOOLCHAIN_TAG }}-${{ env.TC32_TOOLCHAIN_SHA256 }}-${{ env.HOST_RUST_TOOLCHAIN }}-${{ runner.os }}-tc32-unknown-none-elf-prod-retention-router-pm-retention-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/.cargo/config.toml', '**/memory*.x', 'scripts/tlsr8258.sh', 'tools/tlsr8258-firmware.sh', 'tools/telink-tlsr8258-lab/scripts/tlsr8258.sh', 'examples/telink-tlsr8258-radio/scripts/tlsr8258.sh') }}
 
       - name: Build production sensor variants and parent router
         run: |

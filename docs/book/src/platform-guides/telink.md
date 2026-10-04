@@ -136,11 +136,13 @@ Host tools remain on Rust `1.94.1`.
 ./scripts/tlsr8258.sh build router
 ```
 
-The October 4 controlled rebuild with the new compiler measured **203,640 B**
-for the default sensor and **300,116 B** for the router, reductions of 29.7%
-and 31.2% respectively. See the
-[compiler comparison](../advanced/firmware-size.md#tlsr8258-compiler-comparison-2026-10-04)
-for both LOW32K variants, unchanged build settings, and physical headroom.
+Production, lab, and radio configurations enable LLVM tail merging. The
+October 4 rebuild measured **195,688 B** for the default sensor and
+**288,508 B** for the router, cumulative reductions of 32.4% and 33.8% from
+the old `tc32-45` builds. See the
+[tail-merge comparison](../advanced/firmware-size.md#tlsr8258-tail-merging-2026-10-04)
+for both LOW32K variants, the separate compiler-only improvement, and physical
+headroom. No features or physical memory safeguards were removed.
 These new images have not been run on hardware.
 
 Recorded images (sensor baseline 2026-09-06; router refreshed 2026-09-10).

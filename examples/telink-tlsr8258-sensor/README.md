@@ -74,9 +74,10 @@ instructions in [`BUILD.md`](../../BUILD.md#telink-tlsr8258)), then from the rep
 ./scripts/tlsr8258.sh build sensor-retention-10s
 ```
 
-The current compiler's October 4 local builds measure 203,640 B (default),
-206,904 B (250 ms LOW32K), and 206,908 B (10 s LOW32K). See the
-[controlled comparison](../../docs/book/src/advanced/firmware-size.md#tlsr8258-compiler-comparison-2026-10-04);
+LLVM tail merging is enabled with the pinned compiler. The October 4 local
+builds measure 195,688 B (default), 198,764 B (250 ms LOW32K), and
+198,768 B (10 s LOW32K). See the
+[controlled comparison](../../docs/book/src/advanced/firmware-size.md#tlsr8258-tail-merging-2026-10-04);
 these images have not been flashed.
 
 Historical images and former regression budgets:
