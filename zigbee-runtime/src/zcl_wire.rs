@@ -24,7 +24,7 @@ use zigbee_zcl::ZclStatus;
 use zigbee_zcl::data_types::{self, ZclDataType, ZclValue};
 use zigbee_zcl::foundation::read_attributes::ReadAttributesResponse;
 use zigbee_zcl::foundation::reporting::{
-    ReadReportingConfigResponse, ReportDirection, ReportingConfig,
+    AttributeReport, ReadReportingConfigResponse, ReportDirection, ReportingConfig,
 };
 
 /// Exact ZCL wire length of `value` (as written by [`ZclValue::serialize`]).
@@ -243,6 +243,44 @@ pub(crate) fn count_configure_reporting_records(payload: &[u8]) -> Option<usize>
     Some(records)
 }
 
+/// Pack whole Report Attributes records, starting at `records[start]`, into
+/// `buf`.
+///
+/// Returns `(bytes_written, next_record)`. Records are never split: packing
+/// stops before the first record that does not fit. When `records[start]`
+/// alone cannot fit an empty `buf` it is unsendable in a single frame; the
+/// result is then `(0, start + 1)` so the caller can skip it explicitly.
+pub(crate) fn pack_report_records(
+    records: &[AttributeReport],
+    start: usize,
+    buf: &mut [u8],
+) -> (usize, usize) {
+    let mut pos = 0usize;
+    let mut next = start;
+    while let Some(record) = records.get(next) {
+        let end = pos
+            .checked_add(3)
+            .and_then(|p| p.checked_add(zcl_value_wire_len(&record.value)));
+        let Some(end) = end.filter(|&end| end <= buf.len()) else {
+            if pos == 0 {
+                return (0, next + 1);
+            }
+            break;
+        };
+        buf[pos..pos + 2].copy_from_slice(&record.id.0.to_le_bytes());
+        buf[pos + 2] = record.data_type as u8;
+        // `end` already bounds the whole record, so this cannot fail; the
+        // header bytes written above are not committed unless it succeeds.
+        let Some(written_end) = put_value(buf, pos + 3, &record.value) else {
+            break;
+        };
+        debug_assert_eq!(written_end, end);
+        pos = written_end;
+        next += 1;
+    }
+    (pos, next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +293,33 @@ mod tests {
             v.push(b'a' + (n % 26) as u8).unwrap();
         }
         ZclValue::CharString(v)
+    }
+
+    fn report(id: u16, value: ZclValue) -> AttributeReport {
+        AttributeReport {
+            id: AttributeId(id),
+            data_type: ZclDataType::CharString,
+            value,
+        }
+    }
+
+    #[test]
+    fn report_packing_keeps_whole_records_and_skips_unsendable_ones() {
+        // 3 + 11 = 14 bytes, 3 + 31 = 34 bytes (never fits 30), 14 bytes.
+        let records = [
+            report(1, string(10)),
+            report(2, string(30)),
+            report(3, string(10)),
+            report(4, string(10)),
+        ];
+        let mut buf = [0u8; 30];
+        assert_eq!(pack_report_records(&records, 0, &mut buf), (14, 1));
+        assert_eq!(&buf[..3], &[0x01, 0x00, ZclDataType::CharString as u8]);
+        assert_eq!(buf[3], 10);
+        // The oversized record is reported as unsendable, not truncated.
+        assert_eq!(pack_report_records(&records, 1, &mut buf), (0, 2));
+        assert_eq!(pack_report_records(&records, 2, &mut buf), (28, 4));
+        assert_eq!(pack_report_records(&records, 4, &mut buf), (0, 4));
     }
 
     #[test]

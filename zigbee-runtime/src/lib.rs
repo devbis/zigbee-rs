@@ -3836,6 +3836,121 @@ mod resume_tests {
             .flatten()
     }
 
+    const REPORT_TEST_CLUSTER: u16 = 0xFC10;
+
+    /// Four 30-character string attributes, each configured to report on
+    /// change: 34 bytes per record, so at most two fit one APS payload.
+    fn wide_report_store(
+        device: &mut ZigbeeDevice<MockMac>,
+    ) -> zigbee_zcl::attribute::AttributeStore<4> {
+        use zigbee_zcl::attribute::{AttributeAccess, AttributeDefinition, AttributeStore};
+        use zigbee_zcl::data_types::{ZclDataType, ZclValue};
+        use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
+
+        let mut store = AttributeStore::new();
+        for id in 0..4u16 {
+            let mut text = heapless::Vec::new();
+            for n in 0..30u8 {
+                text.push(b'a' + (n + id as u8) % 26).unwrap();
+            }
+            store
+                .register(
+                    AttributeDefinition {
+                        id: zigbee_zcl::AttributeId(id),
+                        data_type: ZclDataType::CharString,
+                        access: AttributeAccess::ReadOnly,
+                        name: "wide",
+                    },
+                    ZclValue::CharString(text),
+                )
+                .unwrap();
+            device
+                .reporting
+                .configure_for_cluster(
+                    1,
+                    REPORT_TEST_CLUSTER,
+                    ReportingConfig {
+                        direction: ReportDirection::Send,
+                        attribute_id: zigbee_zcl::AttributeId(id),
+                        data_type: ZclDataType::CharString,
+                        min_interval: 0,
+                        max_interval: 0,
+                        reportable_change: None,
+                    },
+                )
+                .unwrap();
+        }
+        store
+    }
+
+    /// Due reports larger than one frame are split into several whole-record
+    /// Report Attributes frames instead of being truncated or dropped.
+    #[test]
+    fn wide_reports_split_across_frames() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let store = wide_report_store(&mut device);
+
+        assert!(block_on(device.check_and_send_cluster_reports(
+            1,
+            REPORT_TEST_CLUSTER,
+            &store
+        )));
+        let history = device.mac().tx_history();
+        assert_eq!(history.len(), 2, "four 34-byte records need two frames");
+        assert!(history.iter().all(|tx| tx.payload_len <= 127));
+
+        // Everything was sent, so nothing is due until a value changes.
+        device.mac_mut().clear_tx_history();
+        assert!(!block_on(device.check_and_send_cluster_reports(
+            1,
+            REPORT_TEST_CLUSTER,
+            &store
+        )));
+        assert!(device.mac().tx_history().is_empty());
+    }
+
+    /// A report that APS never accepted stays pending instead of being marked
+    /// as reported and lost until the value changes again.
+    #[test]
+    fn failed_report_send_keeps_records_pending() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let store = wide_report_store(&mut device);
+
+        device.mac_mut().set_tx_failures(u32::MAX);
+        assert!(!block_on(device.check_and_send_cluster_reports(
+            1,
+            REPORT_TEST_CLUSTER,
+            &store
+        )));
+
+        device.mac_mut().set_tx_failures(0);
+        device.mac_mut().clear_tx_history();
+        assert!(block_on(device.check_and_send_cluster_reports(
+            1,
+            REPORT_TEST_CLUSTER,
+            &store
+        )));
+        assert_eq!(device.mac().tx_history().len(), 2);
+    }
+
+    /// Not being joined must not consume due reports.
+    #[test]
+    fn reports_are_not_consumed_while_not_joined() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        let store = wide_report_store(&mut device);
+        assert!(!block_on(device.check_and_send_cluster_reports(
+            1,
+            REPORT_TEST_CLUSTER,
+            &store
+        )));
+        assert!(device.mac().tx_history().is_empty());
+        let mut due = heapless::Vec::new();
+        device
+            .reporting
+            .check_and_collect_dyn(1, REPORT_TEST_CLUSTER, &store, &mut due);
+        assert_eq!(due.len(), 4, "every record must still be due");
+    }
+
     /// A group-addressed frame is delivered to every local endpoint that is a
     /// member of the group — and only those — and, being groupcast, elicits
     /// no Default Response.
@@ -12817,7 +12932,11 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// The reporting engine checks configured min/max intervals and value changes,
     /// then sends a ZCL Report Attributes (0x0A) frame if needed.
     ///
-    /// Returns `true` if a report was sent.
+    /// Due records are split across as many whole-record Report Attributes
+    /// frames as needed. Records that could not be handed to APS stay pending
+    /// and are reported again once their minimum interval has elapsed.
+    ///
+    /// Returns `true` if at least one report frame was sent.
     ///
     /// # Example
     /// ```rust,no_run,ignore
@@ -12834,11 +12953,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         cluster_id: u16,
         store: &dyn zigbee_zcl::clusters::AttributeStoreAccess,
     ) -> bool {
-        // We need to work through the reporting engine, which requires AttributeStore<N>.
-        // Since we have a trait object, we build reports manually by checking each config.
-        use zigbee_zcl::foundation::reporting::{
-            AttributeReport, MAX_REPORT_CONFIGS, ReportAttributes,
-        };
+        use zigbee_zcl::foundation::reporting::{AttributeReport, MAX_REPORT_CONFIGS};
+
+        // Collecting a report marks it as reported in the engine, so never
+        // collect while the send is certain to fail.
+        if !self.is_joined() {
+            return false;
+        }
 
         let mut reports: heapless::Vec<AttributeReport, MAX_REPORT_CONFIGS> = heapless::Vec::new();
         self.reporting
@@ -12848,10 +12969,42 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             return false;
         }
 
-        let report = ReportAttributes { reports };
-        self.send_report(endpoint, cluster_id, &report)
-            .await
-            .is_ok()
+        let outcome = self
+            .send_report_records(endpoint, cluster_id, &reports)
+            .await;
+        if let Some((first_unsent, _)) = outcome.failure {
+            self.rearm_unsent_reports(endpoint, cluster_id, &reports[first_unsent..]);
+        }
+        outcome.frames_sent > 0
+    }
+
+    /// Keep reports that were collected but never handed to APS pending.
+    ///
+    /// The reporting engine marks a record as reported while collecting it.
+    /// Re-applying the unchanged configuration clears its last reported value,
+    /// so the record becomes due again once its minimum interval has elapsed
+    /// instead of being silently lost until the next value change or maximum
+    /// interval.
+    #[inline(never)]
+    fn rearm_unsent_reports(
+        &mut self,
+        endpoint: u8,
+        cluster_id: u16,
+        unsent: &[zigbee_zcl::foundation::reporting::AttributeReport],
+    ) {
+        use zigbee_zcl::foundation::reporting::ReportDirection;
+        for record in unsent {
+            let Some(config) = self
+                .reporting
+                .get_config(endpoint, cluster_id, ReportDirection::Send, record.id)
+                .cloned()
+            else {
+                continue;
+            };
+            let _ = self
+                .reporting
+                .configure_for_cluster(endpoint, cluster_id, config);
+        }
     }
 
     // ── ZCL global command response helpers ──────────────────
