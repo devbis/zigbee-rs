@@ -125,9 +125,13 @@ impl Diagnostics for RecordingDiagnostics<'_> {
     }
 }
 
-struct RecordingWake<'a> {
+/// Recording wake controller whose millisecond marks wrap at `MODULUS`, so
+/// tests can model a narrow platform counter.
+struct RecordingWake<'a, const MODULUS: u64 = { 1 << 32 }> {
     now: u32,
     activity_once: bool,
+    /// Wait index → non-timer wake reason returned without elapsed time.
+    reasons: Vec<(usize, WakeReason)>,
     batches: Vec<Vec<MacFrame>>,
     next_batch: usize,
     waits: &'a RefCell<Vec<WaitRequest>>,
@@ -135,7 +139,7 @@ struct RecordingWake<'a> {
     delay_calls: &'a Cell<u32>,
 }
 
-impl<'a> RecordingWake<'a> {
+impl<'a, const MODULUS: u64> RecordingWake<'a, MODULUS> {
     fn new(
         now: u32,
         batches: Vec<Vec<MacFrame>>,
@@ -144,8 +148,9 @@ impl<'a> RecordingWake<'a> {
         delay_calls: &'a Cell<u32>,
     ) -> Self {
         Self {
-            now,
+            now: (u64::from(now) % MODULUS) as u32,
             activity_once: false,
+            reasons: Vec::new(),
             batches,
             next_batch: 0,
             waits,
@@ -155,7 +160,7 @@ impl<'a> RecordingWake<'a> {
     }
 }
 
-impl WakeController<MockMac> for RecordingWake<'_> {
+impl<const MODULUS: u64> WakeController<MockMac> for RecordingWake<'_, MODULUS> {
     type Mark = u32;
     type Error = ();
 
@@ -164,11 +169,11 @@ impl WakeController<MockMac> for RecordingWake<'_> {
     }
 
     fn add_ms(mark: Self::Mark, duration_ms: u32) -> Self::Mark {
-        mark.wrapping_add(duration_ms)
+        ((u64::from(mark) + u64::from(duration_ms)) % MODULUS) as u32
     }
 
     fn elapsed_ms(later: Self::Mark, earlier: Self::Mark) -> u32 {
-        later.wrapping_sub(earlier)
+        ((u64::from(later) + MODULUS - u64::from(earlier)) % MODULUS) as u32
     }
 
     async fn wait(
@@ -176,8 +181,14 @@ impl WakeController<MockMac> for RecordingWake<'_> {
         mac: &mut MockMac,
         request: WaitRequest,
     ) -> Result<WakeReason, Self::Error> {
+        let index = self.waits.borrow().len();
         self.waits.borrow_mut().push(request);
         self.poll_counts_at_wait.borrow_mut().push(mac.poll_count());
+        let scripted = self
+            .reasons
+            .iter()
+            .find(|(at, _)| *at == index)
+            .map(|(_, reason)| *reason);
         if self.next_batch < self.batches.len() {
             let batch = core::mem::take(&mut self.batches[self.next_batch]);
             for frame in batch {
@@ -186,14 +197,19 @@ impl WakeController<MockMac> for RecordingWake<'_> {
         }
         self.next_batch = self.next_batch.saturating_add(1);
         let activity = core::mem::take(&mut self.activity_once);
-        let elapsed = if activity { 0 } else { request.timeout_ms };
+        let reason = match scripted {
+            Some(reason) => reason,
+            None if activity => WakeReason::Activity,
+            None => WakeReason::Timer,
+        };
+        let elapsed = if reason == WakeReason::Timer {
+            request.timeout_ms
+        } else {
+            0
+        };
         self.now = Self::add_ms(self.now, elapsed);
         mac.delay_micros(elapsed.saturating_mul(1_000)).await;
-        Ok(if activity {
-            WakeReason::Activity
-        } else {
-            WakeReason::Timer
-        })
+        Ok(reason)
     }
 
     async fn button_held_for(&mut self, _duration_ms: u32) -> bool {
@@ -938,6 +954,38 @@ fn parts<'a, O, St>(
     RecordingSupervisor<'a>,
     RecordingDiagnostics<'a>,
 > {
+    parts_with(
+        wake,
+        status,
+        ota,
+        NoUserAction,
+        environment_samples,
+        battery_samples,
+        heartbeats,
+        diagnostics,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parts_with<'a, O, St, A, const MODULUS: u64>(
+    wake: RecordingWake<'a, MODULUS>,
+    status: St,
+    ota: O,
+    actions: A,
+    environment_samples: &'a Cell<u32>,
+    battery_samples: &'a Cell<u32>,
+    heartbeats: &'a Cell<u32>,
+    diagnostics: &'a RefCell<Vec<DiagnosticEvent>>,
+) -> SensorSedParts<
+    RecordingWake<'a, MODULUS>,
+    St,
+    CountingEnvironment<'a>,
+    CountingBattery<'a>,
+    O,
+    A,
+    RecordingSupervisor<'a>,
+    RecordingDiagnostics<'a>,
+> {
     SensorSedParts {
         wake,
         status,
@@ -948,7 +996,7 @@ fn parts<'a, O, St>(
             samples: battery_samples,
         },
         ota,
-        actions: NoUserAction,
+        actions,
         supervisor: RecordingSupervisor { heartbeats },
         diagnostics: RecordingDiagnostics {
             events: diagnostics,
@@ -1366,6 +1414,13 @@ fn parent_leave_clears_joined_state_and_durable_commissioning() {
     }
 
     assert!(
+        !diagnostics
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::JoinRetry { .. })),
+        "a leave without rejoin must not start a new search in the same step"
+    );
+    assert!(
         !device.is_joined(),
         "diagnostics={:?}, polls={}, security={:?}",
         diagnostics.borrow().as_slice(),
@@ -1777,8 +1832,9 @@ fn no_status_omits_blink_deadlines_and_delays_across_rollover() {
         waits.borrow().as_slice(),
         &[WaitRequest {
             timeout_ms: 100,
-            sleep_depth: SleepDepth::Active,
-        }]
+            sleep_depth: SleepDepth::Retention,
+        }],
+        "an unjoined sensor sleeps at the steady-state depth between attempts"
     );
     assert_eq!(delay_calls.get(), 0);
     assert_eq!(
@@ -1789,5 +1845,361 @@ fn no_status_omits_blink_deadlines_and_delays_across_rollover() {
             .count(),
         2,
         "the retry deadline must still expire correctly across u32 rollover"
+    );
+}
+
+/// Everything a scripted unjoined/leave scenario recorded.
+struct Scenario {
+    waits: Vec<WaitRequest>,
+    poll_counts: Vec<u32>,
+    delay_calls: u32,
+    diagnostics: Vec<DiagnosticEvent>,
+    status: Vec<SensorStatus>,
+    joined: bool,
+    commissioned: Option<bool>,
+}
+
+impl Scenario {
+    fn count(&self, predicate: impl Fn(&DiagnosticEvent) -> bool) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|event| predicate(event))
+            .count()
+    }
+
+    fn backoffs(&self) -> Vec<u32> {
+        self.diagnostics
+            .iter()
+            .filter_map(|event| match event {
+                DiagnosticEvent::JoinBackoff { delay_ms } => Some(*delay_ms),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn attempts(&self) -> usize {
+        self.count(|event| matches!(event, DiagnosticEvent::JoinRetry { .. }))
+    }
+}
+
+/// Script for [`run_scenario`].
+struct Script {
+    policy: &'static SensorPolicy,
+    stored: Option<PersistentSecurityState>,
+    start_ms: u32,
+    batches: Vec<Vec<MacFrame>>,
+    reasons: Vec<(usize, WakeReason)>,
+    /// Offer a permit-join beacon and successful association response, so
+    /// any network search the app starts would succeed.
+    beacon: bool,
+    steps: usize,
+}
+
+impl Script {
+    fn new(policy: &'static SensorPolicy, steps: usize) -> Self {
+        Self {
+            policy,
+            stored: None,
+            start_ms: 0,
+            batches: Vec::new(),
+            reasons: Vec::new(),
+            beacon: false,
+            steps,
+        }
+    }
+}
+
+fn run_scenario<A: sensor_sed_app::UserActionPolicy, const MODULUS: u64>(
+    script: Script,
+    actions: A,
+) -> Scenario {
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = match script.stored {
+        Some(state) => CountingStore::with_state(state, &store_calls),
+        None => CountingStore::empty(&store_calls),
+    };
+    let mut profile = test_profile();
+    let mut device = test_device(&profile, script.policy);
+    if script.beacon {
+        let mac = device.bdb_mut().zdo_mut().aps_mut().nwk_mut().mac_mut();
+        mac.add_beacon(join_beacon(true));
+        mac.set_associate_response(MlmeAssociateConfirm {
+            short_address: OLD_SHORT,
+            status: AssociationStatus::Success,
+        });
+    }
+
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let mut wake: RecordingWake<'_, MODULUS> = RecordingWake::new(
+            script.start_ms,
+            script.batches,
+            &waits,
+            &poll_counts,
+            &delay_calls,
+        );
+        wake.reasons = script.reasons;
+        let mut app = SensorApp::new(
+            node,
+            script.policy,
+            parts_with(
+                wake,
+                RecordingStatus { events: &status },
+                NoOta,
+                actions,
+                &environment_samples,
+                &battery_samples,
+                &heartbeats,
+                &diagnostics,
+            ),
+        )
+        .expect("valid scenario policy");
+        block_on(app.initialize()).unwrap();
+        for _ in 0..script.steps {
+            block_on(app.step()).unwrap();
+        }
+    }
+
+    let joined = device.is_joined();
+    Scenario {
+        waits: waits.into_inner(),
+        poll_counts: poll_counts.into_inner(),
+        delay_calls: delay_calls.get(),
+        diagnostics: diagnostics.into_inner(),
+        status: status.into_inner(),
+        joined,
+        commissioned: store.load().unwrap().map(|state| state.commissioned),
+    }
+}
+
+const ONE_MINUTE: WaitRequest = WaitRequest {
+    timeout_ms: 60_000,
+    sleep_depth: SleepDepth::Retention,
+};
+
+#[test]
+fn leave_without_rejoin_waits_for_the_button_then_the_button_commissions() {
+    let mut script = Script::new(&BASE_POLICY, 5);
+    script.stored = Some(commissioned_state(0x02));
+    script.beacon = true;
+    // Wait 0 delivers the leave; waits 1-2 sleep; wait 3 is a button press
+    // and queues the Transport-Key for the button-started join.
+    script.batches = vec![
+        vec![leave_request(false, 1)],
+        Vec::new(),
+        Vec::new(),
+        vec![transport_key_frame()],
+    ];
+    script.reasons = vec![(3, WakeReason::Button)];
+
+    let before_button = run_scenario::<_, { 1 << 32 }>(
+        Script {
+            steps: 3,
+            batches: vec![vec![leave_request(false, 1)]],
+            reasons: Vec::new(),
+            stored: Some(commissioned_state(0x02)),
+            ..Script::new(&BASE_POLICY, 3)
+        }
+        .with_beacon(),
+        sensor_sed_app::JoinOnlyAction,
+    );
+    assert!(!before_button.joined);
+    assert_eq!(before_button.commissioned, Some(false));
+    assert!(
+        before_button
+            .diagnostics
+            .contains(&DiagnosticEvent::WaitingForButton)
+    );
+    assert_eq!(
+        before_button.attempts(),
+        0,
+        "a joinable network is in range, but an explicit leave must not search: {:?}",
+        before_button.diagnostics
+    );
+    assert!(before_button.backoffs().is_empty());
+    assert_eq!(&before_button.waits[1..], &[ONE_MINUTE, ONE_MINUTE]);
+
+    let pressed = run_scenario::<_, { 1 << 32 }>(script, sensor_sed_app::JoinOnlyAction);
+    assert!(pressed.joined, "diagnostics={:?}", pressed.diagnostics);
+    assert_eq!(
+        pressed.count(|event| *event == DiagnosticEvent::ButtonJoin),
+        1
+    );
+    assert_eq!(pressed.attempts(), 0, "the press joins directly");
+}
+
+impl Script {
+    fn with_beacon(mut self) -> Self {
+        self.beacon = true;
+        self
+    }
+}
+
+#[test]
+fn leave_without_a_button_action_falls_back_to_the_bounded_backoff() {
+    let mut script = Script::new(&BASE_POLICY, 1).with_beacon();
+    script.stored = Some(commissioned_state(0x02));
+    script.batches = vec![vec![leave_request(false, 1)]];
+    let left = run_scenario::<_, { 1 << 32 }>(script, NoUserAction);
+    assert!(!left.joined);
+    assert!(
+        !left
+            .diagnostics
+            .contains(&DiagnosticEvent::WaitingForButton)
+    );
+    assert_eq!(left.backoffs(), vec![100]);
+    assert_eq!(left.attempts(), 0, "no immediate rejoin after the leave");
+}
+
+#[test]
+fn unjoined_backoff_doubles_sleeps_and_blinks_only_during_attempts() {
+    let unjoined = run_scenario::<_, { 1 << 32 }>(Script::new(&BASE_POLICY, 5), NoUserAction);
+    assert!(!unjoined.joined);
+    assert_eq!(unjoined.backoffs(), vec![100, 200, 400, 800, 1_600, 3_200]);
+    assert_eq!(
+        unjoined.waits,
+        [100, 200, 400, 800, 1_600]
+            .map(|timeout_ms| WaitRequest {
+                timeout_ms,
+                sleep_depth: SleepDepth::Retention,
+            })
+            .to_vec(),
+        "no Active waits and no idle wakeups between attempts"
+    );
+    // Cold start plus one attempt per expired backoff, each with exactly
+    // one double blink (on, gap, on delays).
+    assert_eq!(unjoined.attempts(), 5);
+    let blinks = unjoined
+        .status
+        .iter()
+        .filter(|status| **status == SensorStatus::Joining { on: true })
+        .count();
+    assert_eq!(blinks, 2 * 6);
+    assert_eq!(unjoined.delay_calls, 3 * 6);
+}
+
+#[test]
+fn unjoined_backoff_caps_at_thirty_minutes_in_bounded_sleeps_across_rollover() {
+    const POLICY: SensorPolicy = SensorPolicy {
+        join_retry_ms: 15_000,
+        ..BASE_POLICY
+    };
+    // An 18-bit millisecond counter (262 s) wraps many times over the
+    // backoff, like the TLSR8258 24 MHz Timer0 (179 s).
+    let unjoined = run_scenario::<_, { 1 << 18 }>(Script::new(&POLICY, 100), NoUserAction);
+    assert!(
+        unjoined
+            .waits
+            .iter()
+            .all(|wait| wait.timeout_ms <= 60_000 && wait.sleep_depth == SleepDepth::Retention)
+    );
+    assert_eq!(
+        unjoined.backoffs(),
+        vec![
+            15_000, 30_000, 60_000, 120_000, 240_000, 480_000, 960_000, 1_800_000, 1_800_000,
+            1_800_000
+        ]
+    );
+    // 93 one-minute-or-shorter sleeps cover the first nine delays exactly;
+    // the remaining seven are part of the tenth.
+    assert_eq!(unjoined.attempts(), 9);
+    let slept: u64 = unjoined
+        .waits
+        .iter()
+        .map(|wait| u64::from(wait.timeout_ms))
+        .sum();
+    let scheduled: u64 = unjoined.backoffs()[..9]
+        .iter()
+        .map(|delay| u64::from(*delay))
+        .sum();
+    assert_eq!(slept - scheduled, 7 * 60_000);
+}
+
+#[test]
+fn button_press_resets_the_backoff_and_tries_immediately() {
+    let mut script = Script::new(&BASE_POLICY, 5);
+    // Waits 0..2 consume 100, 200, 400 ms backoffs; wait 3 (800 ms) is
+    // interrupted by the button.
+    script.reasons = vec![(3, WakeReason::Button)];
+    let pressed = run_scenario::<_, { 1 << 32 }>(script, sensor_sed_app::JoinOnlyAction);
+    assert!(!pressed.joined);
+    assert_eq!(
+        pressed.count(|event| *event == DiagnosticEvent::ButtonJoin),
+        1
+    );
+    assert_eq!(pressed.backoffs(), vec![100, 200, 400, 800, 100, 200]);
+    assert_eq!(pressed.waits[4].timeout_ms, 100);
+}
+
+#[test]
+fn toggle_join_leave_stays_factory_new_until_the_next_press() {
+    let mut script = Script::new(&BASE_POLICY, 6).with_beacon();
+    script.stored = Some(commissioned_state(0x02));
+    script.reasons = vec![(1, WakeReason::Button)];
+    let left = run_scenario::<_, { 1 << 32 }>(script, sensor_sed_app::ToggleJoinAction);
+    assert!(!left.joined, "diagnostics={:?}", left.diagnostics);
+    assert_eq!(left.commissioned, Some(false));
+    assert!(left.diagnostics.contains(&DiagnosticEvent::ButtonLeave));
+    assert!(
+        left.diagnostics
+            .contains(&DiagnosticEvent::WaitingForButton)
+    );
+    assert_eq!(left.attempts(), 0, "{:?}", left.diagnostics);
+    assert!(left.waits[2..].iter().all(|wait| *wait == ONE_MINUTE));
+}
+
+#[test]
+fn timed_fast_poll_window_does_not_recur_after_counter_rollover() {
+    let mut script = Script::new(&BASE_POLICY, 200);
+    script.stored = Some(commissioned_state(0x01));
+    // Marks wrap every 99.95 s. The slow polls land on whole seconds after
+    // the 60 s sample, so at t = 100 s the counter reads 50 ms after the
+    // restored fast-poll start; a window that is never cleared reopens there.
+    let resumed = run_scenario::<_, 99_950>(script, NoUserAction);
+    assert!(resumed.joined);
+    let first_slow = resumed
+        .waits
+        .iter()
+        .position(|wait| wait.timeout_ms == BASE_POLICY.slow_poll_ms)
+        .expect("restored fast poll ends");
+    assert!(
+        resumed.waits[first_slow..]
+            .iter()
+            .all(|wait| wait.timeout_ms > BASE_POLICY.fast_poll_ms
+                && wait.sleep_depth == SleepDepth::Retention),
+        "fast poll restarted after rollover: {:?}",
+        &resumed.waits[first_slow..]
+    );
+    assert_eq!(
+        resumed.count(|event| matches!(event, DiagnosticEvent::FastPollStopped { .. })),
+        1
+    );
+}
+
+#[test]
+fn activity_wake_polls_the_parent_only_when_the_poll_is_due() {
+    const AT: usize = 40;
+    let mut script = Script::new(&BASE_POLICY, AT + 3);
+    script.stored = Some(commissioned_state(0x01));
+    script.reasons = vec![(AT, WakeReason::Activity)];
+    let resumed = run_scenario::<_, { 1 << 32 }>(script, NoUserAction);
+    assert!(resumed.joined);
+    assert_eq!(resumed.waits[AT].timeout_ms, BASE_POLICY.slow_poll_ms);
+    assert_eq!(
+        resumed.poll_counts[AT + 1],
+        resumed.poll_counts[AT],
+        "a skipped sleep must not send an extra Data Request"
+    );
+    assert!(
+        resumed.poll_counts[AT + 2] > resumed.poll_counts[AT + 1],
+        "the following timer wake polls normally"
     );
 }

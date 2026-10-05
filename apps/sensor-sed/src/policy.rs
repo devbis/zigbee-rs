@@ -63,6 +63,11 @@ pub struct ButtonPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatusPolicy {
+    /// Retained for source compatibility; no longer scheduled.
+    ///
+    /// An unjoined sensor sleeps between commissioning attempts and shows
+    /// the double blink only when an attempt actually starts, so there is no
+    /// periodic idle blink to configure.
     pub unjoined_blink_period_ms: u32,
     pub blink_on_ms: u32,
     pub blink_gap_ms: u32,
@@ -83,6 +88,11 @@ pub struct SensorPolicy {
     pub fresh_join_fast_ms: u32,
     pub restored_fast_ms: u32,
     pub wake_duration_ms: u32,
+    /// First delay of the unjoined commissioning backoff.
+    ///
+    /// Each failed join, resume, or secure-rejoin attempt doubles the next
+    /// delay up to [`JOIN_RETRY_MAX_MS`]; a successful join or a user
+    /// button press restores this initial delay.
     pub join_retry_ms: u32,
     pub announce_retry_ms: u32,
     pub announce_retries: u8,
@@ -92,7 +102,9 @@ pub struct SensorPolicy {
     pub status: StatusPolicy,
     /// Wait depth while joined and the fast-poll window is active.
     pub fast_sleep_depth: SleepDepth,
-    /// Wait depth while joined in the steady-state slow-poll period.
+    /// Wait depth while joined in the steady-state slow-poll period, and
+    /// while unjoined between commissioning attempts or while waiting for
+    /// the user button after an explicit leave.
     pub slow_sleep_depth: SleepDepth,
 }
 
@@ -109,8 +121,10 @@ impl SensorPolicy {
         self.sample_interval_ms != 0
             && self.fast_poll_ms != 0
             && self.slow_poll_ms != 0
+            && (self.slow_poll_ms <= MAX_WAIT_MS || self.sample_interval_ms <= MAX_WAIT_MS)
             && self.wake_duration_ms != 0
             && self.join_retry_ms != 0
+            && self.join_retry_ms <= JOIN_RETRY_MAX_MS
             && self.announce_retry_ms != 0
             && self.secure_rejoin_failure_limit != 0
             && self.interview_complete_grace_ms != 0
@@ -120,8 +134,7 @@ impl SensorPolicy {
                 None => true,
             }
             && (!status_present
-                || (self.status.unjoined_blink_period_ms != 0
-                    && self.status.blink_on_ms != 0
+                || (self.status.blink_on_ms != 0
                     && self.status.blink_gap_ms != 0
                     && self.status.reset_phase_ms != 0))
     }
@@ -131,6 +144,35 @@ impl SensorPolicy {
             poll_interval_ms: self.slow_poll_ms,
             wake_duration_ms: self.wake_duration_ms,
         }
+    }
+}
+
+/// Upper bound of the unjoined commissioning backoff (30 minutes).
+pub const JOIN_RETRY_MAX_MS: u32 = 30 * 60 * 1_000;
+
+/// Longest single platform wait.
+///
+/// Unjoined idle periods (backoff or waiting for the user button) are split
+/// into chunks of at most this length and the measured time of each chunk is
+/// accumulated. Joined waits are bounded by `min(slow_poll_ms,
+/// sample_interval_ms)`, which [`SensorPolicy::is_valid`] limits to this
+/// value. Together this keeps every wait and elapsed-time comparison inside
+/// the narrowest supported platform counter (TLSR8258 Timer0 at 24 MHz wraps
+/// after about 179 seconds). The supervisor may bound each wait further.
+pub const MAX_WAIT_MS: u32 = 60_000;
+
+/// Delay to apply after the next failed attempt, given the delay just used.
+pub const fn next_join_retry_ms(current_ms: u32, initial_ms: u32) -> u32 {
+    let doubled = current_ms.saturating_mul(2);
+    let capped = if doubled > JOIN_RETRY_MAX_MS {
+        JOIN_RETRY_MAX_MS
+    } else {
+        doubled
+    };
+    if capped < initial_ms {
+        initial_ms
+    } else {
+        capped
     }
 }
 
@@ -205,6 +247,72 @@ mod tests {
         assert_eq!(remaining_ms(1_000, 1_000), 0);
         assert_eq!(remaining_ms(1_500, 1_000), 0);
     }
+
+    #[test]
+    fn join_backoff_doubles_from_the_initial_delay_to_the_thirty_minute_cap() {
+        let mut delay_ms = 15_000;
+        let mut seen = [0u32; 10];
+        for slot in &mut seen {
+            *slot = delay_ms;
+            delay_ms = next_join_retry_ms(delay_ms, 15_000);
+        }
+        assert_eq!(
+            seen,
+            [
+                15_000, 30_000, 60_000, 120_000, 240_000, 480_000, 960_000, 1_800_000, 1_800_000,
+                1_800_000
+            ]
+        );
+        assert_eq!(next_join_retry_ms(u32::MAX, 15_000), JOIN_RETRY_MAX_MS);
+        assert_eq!(next_join_retry_ms(0, 15_000), 15_000);
+    }
+
+    #[test]
+    fn join_retry_beyond_the_backoff_cap_is_rejected() {
+        let mut policy = VALID;
+        assert!(policy.is_valid());
+        policy.join_retry_ms = JOIN_RETRY_MAX_MS + 1;
+        assert!(!policy.is_valid());
+    }
+
+    #[test]
+    fn joined_wait_bound_must_fit_one_platform_wait() {
+        let mut policy = VALID;
+        policy.slow_poll_ms = MAX_WAIT_MS + 1;
+        policy.sample_interval_ms = MAX_WAIT_MS;
+        assert!(policy.is_valid(), "the sample interval bounds the wait");
+        policy.sample_interval_ms = MAX_WAIT_MS + 1;
+        assert!(!policy.is_valid());
+        policy.slow_poll_ms = MAX_WAIT_MS;
+        assert!(policy.is_valid(), "the slow poll bounds the wait");
+    }
+
+    const VALID: SensorPolicy = SensorPolicy {
+        sample_interval_ms: 1,
+        fast_poll_ms: 1,
+        slow_poll_ms: 1,
+        fresh_join_fast_ms: 1,
+        restored_fast_ms: 1,
+        wake_duration_ms: 1,
+        join_retry_ms: 15_000,
+        announce_retry_ms: 1,
+        announce_retries: 0,
+        secure_rejoin_failure_limit: 1,
+        interview_complete_grace_ms: 1,
+        button: ButtonPolicy {
+            long_press_ms: None,
+            debounce_ms: 1,
+        },
+        status: StatusPolicy {
+            unjoined_blink_period_ms: 0,
+            blink_on_ms: 1,
+            blink_gap_ms: 1,
+            reset_blinks: 0,
+            reset_phase_ms: 1,
+        },
+        fast_sleep_depth: SleepDepth::Active,
+        slow_sleep_depth: SleepDepth::Active,
+    };
 
     #[test]
     fn configure_reporting_after_completion_keeps_the_short_grace() {

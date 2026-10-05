@@ -206,6 +206,12 @@ impl Diagnostics for NrfDiagnostics {
             DiagnosticEvent::JoinRetry { attempt } => {
                 defmt::info!("Not joined — retrying (attempt {})…", attempt)
             }
+            DiagnosticEvent::JoinBackoff { delay_ms } => {
+                defmt::info!("Not joined — next attempt in {} ms", delay_ms)
+            }
+            DiagnosticEvent::WaitingForButton => {
+                defmt::info!("Left network — press the button to join")
+            }
             DiagnosticEvent::FactoryResetRequested => defmt::info!("FACTORY RESET"),
             DiagnosticEvent::SecurityResetRebooting => {
                 defmt::info!("Security state reset — rebooting")
