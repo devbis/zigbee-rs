@@ -475,6 +475,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         if elapsed_secs != 0 {
             let action = self.table.tick(elapsed_secs);
             self.execute_action(device, action).await?;
+            self.discard_abandoned_link_keys()?;
             self.checkpoint_table(device)?;
         }
         Ok(())
@@ -1567,6 +1568,41 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 .retain(|(peer, _)| peer != address);
         }
         self.install_live_key(device, *address)
+    }
+
+    /// `TrustCenterTable::tick` abandons an unfinished voluntary re-key of an
+    /// already verified device without removing the device. Drop the
+    /// persisted replacement as well so it is not resurrected on restore.
+    fn discard_abandoned_link_keys(&mut self) -> Result<(), TrustCenterRuntimeError> {
+        let Some(mut state) = self.state.clone() else {
+            return Ok(());
+        };
+        let mut changed = false;
+        for table_device in self.table.devices() {
+            if table_device.key_attributes
+                != zigbee_bdb::trust_center::TrustCenterKeyAttributes::Verified
+                || self
+                    .table
+                    .has_pending_link_key_for(&table_device.ieee_address)
+            {
+                continue;
+            }
+            if let Some(stored) = state.device_mut(&table_device.ieee_address)
+                && stored.confirm_key_pending.is_none()
+                && stored.pending_link_key.is_some_and(|pending| {
+                    pending.transported && pending.key != table_device.link_key
+                })
+            {
+                stored.pending_link_key = None;
+                stored.device = *table_device;
+                changed = true;
+            }
+        }
+        if changed {
+            self.store.store(&state)?;
+            self.state = Some(state);
+        }
+        Ok(())
     }
 
     fn checkpoint_table<M: MacDriver>(

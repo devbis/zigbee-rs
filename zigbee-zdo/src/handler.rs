@@ -38,6 +38,10 @@ pub struct PreparedBindingResponse {
 #[cfg(any(not(feature = "end-device"), feature = "router"))]
 const ZDP_STATUS_NOT_AUTHORIZED: u8 = 0x8D;
 
+/// `Status | TotalEntries | StartIndex | ListCount` prefix of the Mgmt
+/// LQI/Rtg/Bind responses.
+const MGMT_LIST_HEADER_LEN: usize = 4;
+
 /// Whether `addr` is one of the four NWK broadcast destinations.
 ///
 /// Zigbee PRO R22 3.6.5 defines exactly `0xFFFF` (all devices), `0xFFFD`
@@ -278,7 +282,11 @@ impl<M: MacDriver> ZdoLayer<M> {
         }
 
         // --- Check if this is a response to a pending client request ---
-        if self.deliver_response(cluster, tsn, payload) {
+        let response_source = match ind.src_address {
+            ApsAddress::Short(source) => Some(source),
+            _ => None,
+        };
+        if self.deliver_response_from(response_source, cluster, tsn, payload) {
             log::info!("[ZDO] Consumed as client response: cluster=0x{cluster:04X} tsn={tsn}");
             return Ok(());
         }
@@ -305,21 +313,21 @@ impl<M: MacDriver> ZdoLayer<M> {
 
         let (rsp_cluster, result) = match cluster {
             // ── Discovery ───────────────────────────────────────
-            crate::NWK_ADDR_REQ => {
-                let result = self.handle_nwk_addr_req(payload, &mut rsp_buf[1..]);
-                if !unicast && result.is_ok() && rsp_buf[1] != ZdpStatus::Success as u8 {
+            crate::NWK_ADDR_REQ | crate::IEEE_ADDR_REQ => {
+                let capacity = self.zdp_response_capacity();
+                let result = self.handle_addr_req(
+                    cluster == crate::IEEE_ADDR_REQ,
+                    unicast,
+                    payload,
+                    &mut rsp_buf[1..1 + capacity],
+                );
+                // Only the device that owns (or parents) the address of
+                // interest answers a broadcast (R22 2.4.3.1.1/2).
+                if !unicast && result.is_ok() && rsp_buf[1] == ZdpStatus::DeviceNotFound as u8 {
                     log_zdp_exception(cluster, "broadcast address miss — silent");
                     return Ok(());
                 }
-                (crate::NWK_ADDR_RSP, result)
-            }
-            crate::IEEE_ADDR_REQ => {
-                let result = self.handle_ieee_addr_req(payload, &mut rsp_buf[1..]);
-                if !unicast && result.is_ok() && rsp_buf[1] != ZdpStatus::Success as u8 {
-                    log_zdp_exception(cluster, "broadcast address miss — silent");
-                    return Ok(());
-                }
-                (crate::IEEE_ADDR_RSP, result)
+                (cluster | ZDP_RESPONSE_BIT, result)
             }
             crate::NODE_DESC_REQ => (
                 crate::NODE_DESC_RSP,
@@ -362,19 +370,28 @@ impl<M: MacDriver> ZdoLayer<M> {
 
             // ── Network management ──────────────────────────────
             #[cfg(any(not(feature = "end-device"), feature = "router"))]
-            crate::MGMT_LQI_REQ => (
-                crate::MGMT_LQI_RSP,
-                self.handle_mgmt_lqi_req(payload, &mut rsp_buf[1..]),
-            ),
+            crate::MGMT_LQI_REQ => {
+                let capacity = self.zdp_response_capacity();
+                (
+                    crate::MGMT_LQI_RSP,
+                    self.handle_mgmt_lqi_req(payload, &mut rsp_buf[1..1 + capacity]),
+                )
+            }
             #[cfg(any(not(feature = "end-device"), feature = "router"))]
-            crate::MGMT_RTG_REQ => (
-                crate::MGMT_RTG_RSP,
-                self.handle_mgmt_rtg_req(payload, &mut rsp_buf[1..]),
-            ),
-            crate::MGMT_BIND_REQ => (
-                crate::MGMT_BIND_RSP,
-                self.handle_mgmt_bind_req(payload, &mut rsp_buf[1..]),
-            ),
+            crate::MGMT_RTG_REQ => {
+                let capacity = self.zdp_response_capacity();
+                (
+                    crate::MGMT_RTG_RSP,
+                    self.handle_mgmt_rtg_req(payload, &mut rsp_buf[1..1 + capacity]),
+                )
+            }
+            crate::MGMT_BIND_REQ => {
+                let capacity = self.zdp_response_capacity();
+                (
+                    crate::MGMT_BIND_RSP,
+                    self.handle_mgmt_bind_req(payload, &mut rsp_buf[1..1 + capacity]),
+                )
+            }
             crate::MGMT_LEAVE_REQ => (
                 crate::MGMT_LEAVE_RSP,
                 self.handle_mgmt_leave_req(src_short, payload, &mut rsp_buf[1..]),
@@ -529,6 +546,20 @@ impl<M: MacDriver> ZdoLayer<M> {
         }
     }
 
+    /// Bytes available for a ZDP response after the echoed TSN.
+    ///
+    /// R22 2.4.4.3.2-4: list responses carry "as many entries as fit" in one
+    /// frame; the budget is [`crate::ZDP_MAX_PAYLOAD`] minus the source-route
+    /// subframe a concentrator may add to the unicast response.
+    fn zdp_response_capacity(&self) -> usize {
+        let reserve = if self.nwk().is_concentrator() {
+            crate::ZDP_SOURCE_ROUTE_RESERVE
+        } else {
+            0
+        };
+        crate::ZDP_MAX_PAYLOAD - reserve - 1
+    }
+
     /// Whether `ind` was delivered to this node individually.
     ///
     /// Decided from the indication's own destination address mode and address
@@ -564,60 +595,144 @@ impl<M: MacDriver> ZdoLayer<M> {
 impl<M: MacDriver> ZdoLayer<M> {
     // ── Discovery ───────────────────────────────────────────────
 
-    fn handle_nwk_addr_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
-        let req = NwkAddrReq::parse(payload)?;
-        let rsp_data = if req.ieee_addr == self.local_ieee_addr() {
-            NwkAddrRsp {
-                status: ZdpStatus::Success,
-                ieee_addr: self.local_ieee_addr(),
-                nwk_addr: self.local_nwk_addr(),
-                num_assoc_dev: 0,
-                start_index: 0,
-                assoc_dev_list: heapless::Vec::new(),
-            }
+    /// NWK_addr_req / IEEE_addr_req (R22 2.4.3.1.1-2, 2.4.4.2.1-2).
+    ///
+    /// The node answers for itself and, on a router, for its end-device
+    /// children. An unknown `RequestType` is answered with `INV_REQUESTTYPE`
+    /// when the request was unicast or names an address this node answers
+    /// for; an Extended request appends the associated-device list (children
+    /// of this router) starting at `StartIndex`, as many as fit the frame.
+    fn handle_addr_req(
+        &self,
+        by_nwk_addr: bool,
+        unicast: bool,
+        payload: &[u8],
+        rsp: &mut [u8],
+    ) -> Result<usize, ZdoError> {
+        // IEEE_addr_req: NWKAddrOfInterest(2) | RequestType(1) | StartIndex(1)
+        // NWK_addr_req:  IEEEAddr(8)          | RequestType(1) | StartIndex(1)
+        let key_len = if by_nwk_addr { 2 } else { 8 };
+        if payload.len() < key_len + 2 {
+            return Err(ZdoError::InvalidLength);
+        }
+        if rsp.len() < NwkAddrRsp::MIN_SIZE + 2 {
+            return Err(ZdoError::BufferTooSmall);
+        }
+        let request_type = payload[key_len];
+        let start_index = payload[key_len + 1];
+        let local_short = self.local_short_address();
+        let local_ieee = self.local_ieee_addr();
+        let (requested_ieee, requested_short) = if by_nwk_addr {
+            (
+                [0u8; 8],
+                ShortAddress(u16::from_le_bytes([payload[0], payload[1]])),
+            )
         } else {
-            NwkAddrRsp {
-                status: ZdpStatus::DeviceNotFound,
-                ieee_addr: req.ieee_addr,
-                nwk_addr: ShortAddress(0x0000),
-                num_assoc_dev: 0,
-                start_index: 0,
-                assoc_dev_list: heapless::Vec::new(),
-            }
+            let mut ieee = [0u8; 8];
+            ieee.copy_from_slice(&payload[..8]);
+            (ieee, ShortAddress(0x0000))
         };
-        rsp_data.serialize(rsp)
+        let local_match = if by_nwk_addr {
+            requested_short == local_short
+        } else {
+            requested_ieee == local_ieee
+        };
+        let matched = if local_match {
+            Some((local_ieee, local_short))
+        } else {
+            self.end_device_child_address(by_nwk_addr, requested_ieee, requested_short)
+        };
+
+        let (status, ieee, short) = match matched {
+            Some((ieee, short)) if request_type <= RequestType::Extended as u8 => {
+                (ZdpStatus::Success, ieee, short)
+            }
+            Some((ieee, short)) => (ZdpStatus::InvRequestType, ieee, short),
+            None if request_type > RequestType::Extended as u8 && unicast => {
+                (ZdpStatus::InvRequestType, requested_ieee, requested_short)
+            }
+            None => (ZdpStatus::DeviceNotFound, requested_ieee, requested_short),
+        };
+        rsp[0] = status as u8;
+        rsp[1..9].copy_from_slice(&ieee);
+        rsp[9..11].copy_from_slice(&short.0.to_le_bytes());
+        if status != ZdpStatus::Success || request_type != RequestType::Extended as u8 {
+            return Ok(NwkAddrRsp::MIN_SIZE);
+        }
+
+        // Extended response. Only a router/coordinator answering for itself
+        // has associated devices; an end device, or a parent answering for
+        // a child, reports NumAssocDev = 0 without StartIndex or list.
+        #[cfg(feature = "router")]
+        if local_match {
+            return Ok(self.write_associated_devices(start_index, rsp));
+        }
+        let _ = start_index;
+        rsp[NwkAddrRsp::MIN_SIZE] = 0;
+        Ok(NwkAddrRsp::MIN_SIZE + 1)
     }
 
-    fn handle_ieee_addr_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
-        let req = IeeeAddrReq::parse(payload)?;
-        let rsp_data = if req.nwk_addr_of_interest == self.local_nwk_addr() {
-            NwkAddrRsp {
-                status: ZdpStatus::Success,
-                ieee_addr: self.local_ieee_addr(),
-                nwk_addr: self.local_nwk_addr(),
-                num_assoc_dev: 0,
-                start_index: 0,
-                assoc_dev_list: heapless::Vec::new(),
+    /// Append `NumAssocDev | StartIndex | NWKAddrAssocDevList` (children of
+    /// this router, as many as fit `rsp`) to an Extended address response.
+    #[cfg(feature = "router")]
+    fn write_associated_devices(&self, start_index: u8, rsp: &mut [u8]) -> usize {
+        let mut off = NwkAddrRsp::MIN_SIZE + 2;
+        let mut total = 0u8;
+        for child in self
+            .nwk()
+            .neighbor_table()
+            .iter()
+            .filter(|entry| entry.relationship == zigbee_nwk::neighbor::Relationship::Child)
+        {
+            if total >= start_index && rsp.len() - off >= 2 {
+                rsp[off..off + 2].copy_from_slice(&child.network_address.0.to_le_bytes());
+                off += 2;
             }
+            total = total.saturating_add(1);
+        }
+        rsp[NwkAddrRsp::MIN_SIZE] = total;
+        if total == 0 {
+            return NwkAddrRsp::MIN_SIZE + 1;
+        }
+        rsp[NwkAddrRsp::MIN_SIZE + 1] = start_index;
+        off
+    }
+
+    /// Address pair of an end-device child this router answers for.
+    #[cfg(feature = "router")]
+    fn end_device_child_address(
+        &self,
+        by_nwk_addr: bool,
+        ieee: zigbee_types::IeeeAddress,
+        short: ShortAddress,
+    ) -> Option<(zigbee_types::IeeeAddress, ShortAddress)> {
+        let table = self.nwk().neighbor_table();
+        let entry = if by_nwk_addr {
+            table.find_by_short(short)
         } else {
-            NwkAddrRsp {
-                status: ZdpStatus::DeviceNotFound,
-                ieee_addr: [0u8; 8],
-                nwk_addr: req.nwk_addr_of_interest,
-                num_assoc_dev: 0,
-                start_index: 0,
-                assoc_dev_list: heapless::Vec::new(),
-            }
-        };
-        rsp_data.serialize(rsp)
+            table.find_by_ieee(&ieee)
+        }?;
+        (entry.relationship == zigbee_nwk::neighbor::Relationship::Child
+            && entry.device_type == zigbee_nwk::neighbor::NeighborDeviceType::EndDevice)
+            .then_some((entry.ieee_address, entry.network_address))
+    }
+
+    #[cfg(not(feature = "router"))]
+    fn end_device_child_address(
+        &self,
+        _by_nwk_addr: bool,
+        _ieee: zigbee_types::IeeeAddress,
+        _short: ShortAddress,
+    ) -> Option<(zigbee_types::IeeeAddress, ShortAddress)> {
+        None
     }
 
     fn handle_node_desc_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = NodeDescReq::parse(payload)?;
-        let rsp_data = if req.nwk_addr_of_interest == self.local_nwk_addr() {
+        let rsp_data = if req.nwk_addr_of_interest == self.local_short_address() {
             NodeDescRsp {
                 status: ZdpStatus::Success,
-                nwk_addr_of_interest: self.local_nwk_addr(),
+                nwk_addr_of_interest: self.local_short_address(),
                 node_descriptor: Some(*self.node_descriptor()),
             }
         } else {
@@ -632,10 +747,10 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     fn handle_power_desc_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = NodeDescReq::parse(payload)?; // same layout as PowerDescReq
-        let rsp_data = if req.nwk_addr_of_interest == self.local_nwk_addr() {
+        let rsp_data = if req.nwk_addr_of_interest == self.local_short_address() {
             PowerDescRsp {
                 status: ZdpStatus::Success,
-                nwk_addr_of_interest: self.local_nwk_addr(),
+                nwk_addr_of_interest: self.local_short_address(),
                 power_descriptor: Some(*self.power_descriptor()),
             }
         } else {
@@ -650,7 +765,7 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     fn handle_simple_desc_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = SimpleDescReq::parse(payload)?;
-        if req.nwk_addr_of_interest != self.local_nwk_addr() {
+        if req.nwk_addr_of_interest != self.local_short_address() {
             let rsp_data = SimpleDescRsp {
                 status: ZdpStatus::DeviceNotFound,
                 nwk_addr_of_interest: req.nwk_addr_of_interest,
@@ -662,7 +777,7 @@ impl<M: MacDriver> ZdoLayer<M> {
             Some(sd) => {
                 let rsp_data = SimpleDescRsp {
                     status: ZdpStatus::Success,
-                    nwk_addr_of_interest: self.local_nwk_addr(),
+                    nwk_addr_of_interest: self.local_short_address(),
                     simple_descriptor: Some(sd.clone()),
                 };
                 rsp_data.serialize(rsp)
@@ -675,7 +790,7 @@ impl<M: MacDriver> ZdoLayer<M> {
                 };
                 let rsp_data = SimpleDescRsp {
                     status,
-                    nwk_addr_of_interest: self.local_nwk_addr(),
+                    nwk_addr_of_interest: self.local_short_address(),
                     simple_descriptor: None,
                 };
                 rsp_data.serialize(rsp)
@@ -685,7 +800,7 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     fn handle_active_ep_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = NodeDescReq::parse(payload)?; // same layout
-        if req.nwk_addr_of_interest != self.local_nwk_addr() {
+        if req.nwk_addr_of_interest != self.local_short_address() {
             let rsp_data = ActiveEpRsp {
                 status: ZdpStatus::DeviceNotFound,
                 nwk_addr_of_interest: req.nwk_addr_of_interest,
@@ -699,7 +814,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         }
         let rsp_data = ActiveEpRsp {
             status: ZdpStatus::Success,
-            nwk_addr_of_interest: self.local_nwk_addr(),
+            nwk_addr_of_interest: self.local_short_address(),
             active_ep_list: ep_list,
         };
         rsp_data.serialize(rsp)
@@ -778,12 +893,49 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     // ── Binding management ──────────────────────────────────────
 
-    fn handle_bind_req(&mut self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
+    /// Validate a Bind_req/Unbind_req (R22 2.4.3.2.2-3).
+    ///
+    /// `Ok(Err(status))` is a well-formed request this node refuses with the
+    /// given Bind_rsp/Unbind_rsp status:
+    ///
+    /// * a reserved `DstAddrMode` (only 0x01 group and 0x03 extended are
+    ///   defined) — `NOT_SUPPORTED`;
+    /// * a `SrcAddress` other than this node — this node only holds source
+    ///   bindings for itself (no primary binding cache) — `NOT_SUPPORTED`;
+    /// * a source or destination endpoint outside 0x01..=0xFE — `INVALID_EP`.
+    fn parse_binding_request(
+        &self,
+        payload: &[u8],
+    ) -> Result<Result<BindReq, ZdpStatus>, ZdoError> {
+        if payload.len() >= 12 && !matches!(payload[11], 0x01 | 0x03) {
+            return Ok(Err(ZdpStatus::NotSupported));
+        }
         let req = BindReq::parse(payload)?;
-        let entry = bind_req_to_entry(&req);
-        let status = match self.aps_mut().binding_table_mut().add(entry) {
-            Ok(()) => ZdpStatus::Success,
-            Err(_) => ZdpStatus::TableFull,
+        if req.src_addr != self.local_ieee_addr() {
+            return Ok(Err(ZdpStatus::NotSupported));
+        }
+        let valid_ep = |endpoint: u8| (0x01..=0xFE).contains(&endpoint);
+        let dst_ep_valid = match req.dst {
+            BindTarget::Group(_) => true,
+            BindTarget::Unicast { dst_endpoint, .. } => valid_ep(dst_endpoint),
+        };
+        if !valid_ep(req.src_endpoint) || !dst_ep_valid {
+            return Ok(Err(ZdpStatus::InvalidEp));
+        }
+        Ok(Ok(req))
+    }
+
+    fn handle_bind_req(&mut self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
+        let status = match self.parse_binding_request(payload)? {
+            Ok(req) => match self
+                .aps_mut()
+                .binding_table_mut()
+                .add(bind_req_to_entry(&req))
+            {
+                Ok(()) => ZdpStatus::Success,
+                Err(_) => ZdpStatus::TableFull,
+            },
+            Err(status) => status,
         };
         if rsp.is_empty() {
             return Err(ZdoError::BufferTooSmall);
@@ -793,18 +945,21 @@ impl<M: MacDriver> ZdoLayer<M> {
     }
 
     fn handle_unbind_req(&mut self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
-        let req = BindReq::parse(payload)?;
-        let dst = bind_target_to_dst(&req.dst);
-        let removed = self.aps_mut().binding_table_mut().remove(
-            &req.src_addr,
-            req.src_endpoint,
-            req.cluster_id,
-            &dst,
-        );
-        let status = if removed {
-            ZdpStatus::Success
-        } else {
-            ZdpStatus::NoEntry
+        let status = match self.parse_binding_request(payload)? {
+            Ok(req) => {
+                let dst = bind_target_to_dst(&req.dst);
+                if self.aps_mut().binding_table_mut().remove(
+                    &req.src_addr,
+                    req.src_endpoint,
+                    req.cluster_id,
+                    &dst,
+                ) {
+                    ZdpStatus::Success
+                } else {
+                    ZdpStatus::NoEntry
+                }
+            }
+            Err(status) => status,
         };
         if rsp.is_empty() {
             return Err(ZdoError::BufferTooSmall);
@@ -815,15 +970,27 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     // ── Network management ──────────────────────────────────────
 
+    /// Write the common `Status | TotalEntries | StartIndex | ListCount`
+    /// header of a Mgmt list response (R22 2.4.4.3.2-4).
+    fn write_mgmt_list_header(rsp: &mut [u8], total: usize, start: u8, count: u8) {
+        rsp[0] = ZdpStatus::Success as u8;
+        rsp[1] = total.min(u8::MAX as usize) as u8;
+        rsp[2] = start;
+        rsp[3] = count;
+    }
+
+    /// Mgmt_Lqi_req: as many 22-byte neighbor records as fit `rsp`.
     #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn handle_mgmt_lqi_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = MgmtLqiReq::parse(payload)?;
+        if rsp.len() < MGMT_LIST_HEADER_LEN {
+            return Err(ZdoError::BufferTooSmall);
+        }
         let neighbor_table = self.nwk().neighbor_table();
-        let total = neighbor_table.len() as u8;
-        let start = req.start_index as usize;
-        let mut list: heapless::Vec<NeighborTableRecord, 16> = heapless::Vec::new();
-        for entry in neighbor_table.iter().skip(start) {
-            if list.is_full() {
+        let mut off = MGMT_LIST_HEADER_LEN;
+        let mut count = 0u8;
+        for entry in neighbor_table.iter().skip(req.start_index as usize) {
+            if rsp.len() - off < NeighborTableRecord::WIRE_SIZE {
                 break;
             }
             use zigbee_nwk::neighbor::{NeighborDeviceType, Relationship};
@@ -833,7 +1000,6 @@ impl<M: MacDriver> ZdoLayer<M> {
                 NeighborDeviceType::EndDevice => 2,
                 NeighborDeviceType::Unknown => 3,
             };
-            let rx_on = u8::from(entry.rx_on_when_idle);
             let relationship = match entry.relationship {
                 Relationship::Parent => 0,
                 Relationship::Child => 1,
@@ -841,37 +1007,36 @@ impl<M: MacDriver> ZdoLayer<M> {
                 Relationship::PreviousChild => 4,
                 Relationship::UnauthenticatedChild => 3,
             };
-            let permit = if entry.permit_joining { 1 } else { 0 };
-            let _ = list.push(NeighborTableRecord {
+            off += NeighborTableRecord {
                 extended_pan_id: entry.extended_pan_id,
                 extended_addr: entry.ieee_address,
                 network_addr: entry.network_address,
                 device_type,
-                rx_on_when_idle: rx_on,
+                rx_on_when_idle: u8::from(entry.rx_on_when_idle),
                 relationship,
-                permit_joining: permit,
+                permit_joining: u8::from(entry.permit_joining),
                 depth: entry.depth,
                 lqi: entry.lqi,
-            });
+            }
+            .serialize(&mut rsp[off..])?;
+            count += 1;
         }
-        let rsp_data = MgmtLqiRsp {
-            status: ZdpStatus::Success,
-            neighbor_table_entries: total,
-            start_index: req.start_index,
-            neighbor_table_list: list,
-        };
-        rsp_data.serialize(rsp)
+        Self::write_mgmt_list_header(rsp, neighbor_table.len(), req.start_index, count);
+        Ok(off)
     }
 
+    /// Mgmt_Rtg_req: as many 5-byte routing records as fit `rsp`.
     #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn handle_mgmt_rtg_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = MgmtRtgReq::parse(payload)?;
+        if rsp.len() < MGMT_LIST_HEADER_LEN {
+            return Err(ZdoError::BufferTooSmall);
+        }
         let routing_table = self.nwk().routing_table();
-        let total = routing_table.len() as u8;
-        let start = req.start_index as usize;
-        let mut list: heapless::Vec<RoutingTableRecord, 16> = heapless::Vec::new();
-        for entry in routing_table.iter().skip(start) {
-            if list.is_full() {
+        let mut off = MGMT_LIST_HEADER_LEN;
+        let mut count = 0u8;
+        for entry in routing_table.iter().skip(req.start_index as usize) {
+            if rsp.len() - off < RoutingTableRecord::WIRE_SIZE {
                 break;
             }
             use zigbee_nwk::routing::RouteStatus;
@@ -882,43 +1047,44 @@ impl<M: MacDriver> ZdoLayer<M> {
                 RouteStatus::Inactive => 3,
                 RouteStatus::ValidationUnderway => 4,
             };
-            let _ = list.push(RoutingTableRecord {
+            off += RoutingTableRecord {
                 dst_addr: entry.destination,
                 status,
                 memory_constrained: false,
                 many_to_one: entry.many_to_one,
                 route_record_required: entry.route_record_required,
                 next_hop: entry.next_hop,
-            });
+            }
+            .serialize(&mut rsp[off..])?;
+            count += 1;
         }
-        let rsp_data = MgmtRtgRsp {
-            status: ZdpStatus::Success,
-            routing_table_entries: total,
-            start_index: req.start_index,
-            routing_table_list: list,
-        };
-        rsp_data.serialize(rsp)
+        Self::write_mgmt_list_header(rsp, routing_table.len(), req.start_index, count);
+        Ok(off)
     }
 
+    /// Mgmt_Bind_req: as many 14/21-byte binding records as fit `rsp`.
+    ///
+    /// Records are emitted contiguously from `StartIndex`; the first record
+    /// that does not fit ends the list so the requester can continue from
+    /// `StartIndex + ListCount`.
     fn handle_mgmt_bind_req(&self, payload: &[u8], rsp: &mut [u8]) -> Result<usize, ZdoError> {
         let req = MgmtBindReq::parse(payload)?;
+        if rsp.len() < MGMT_LIST_HEADER_LEN {
+            return Err(ZdoError::BufferTooSmall);
+        }
         let entries = self.aps().binding_table().entries();
-        let total = entries.len() as u8;
-        let start = req.start_index as usize;
-        let mut list: heapless::Vec<BindingTableRecord, 16> = heapless::Vec::new();
-        for entry in entries.iter().skip(start) {
-            if list.is_full() {
+        let mut off = MGMT_LIST_HEADER_LEN;
+        let mut count = 0u8;
+        for entry in entries.iter().skip(req.start_index as usize) {
+            let record = aps_binding_to_record(entry);
+            if rsp.len() - off < record.wire_size() {
                 break;
             }
-            let _ = list.push(aps_binding_to_record(entry));
+            off += record.serialize(&mut rsp[off..])?;
+            count += 1;
         }
-        let rsp_data = MgmtBindRsp {
-            status: ZdpStatus::Success,
-            binding_table_entries: total,
-            start_index: req.start_index,
-            binding_table_list: list,
-        };
-        rsp_data.serialize(rsp)
+        Self::write_mgmt_list_header(rsp, entries.len(), req.start_index, count);
+        Ok(off)
     }
 
     fn handle_mgmt_leave_req(
@@ -1406,7 +1572,7 @@ mod tests {
     }
 
     /// Decode the ZDP cluster and payload of the last frame the MAC sent.
-    fn last_zdp_tx(zdo: &ZdoLayer<MockMac>) -> Option<(u16, heapless::Vec<u8, 64>)> {
+    fn last_zdp_tx(zdo: &ZdoLayer<MockMac>) -> Option<(u16, heapless::Vec<u8, 128>)> {
         let record = zdo.nwk().mac().tx_history().last()?;
         let frame = record.payload.as_slice();
         let (_nwk, nwk_len) = zigbee_nwk::frames::NwkHeader::parse(frame)?;
@@ -2429,5 +2595,378 @@ mod tests {
         assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
         assert_eq!(zdo.nwk().nib().nwk_manager_addr, NEW_MANAGER);
         assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(0xC0));
+    }
+
+    // ── Frame-size budget for Mgmt list responses (R22 2.4.4.3.2-4) ──
+
+    fn neighbor_ieee(index: u8) -> [u8; 8] {
+        [0xC0, index, 0, 0, 0, 0, 0, 0x01]
+    }
+
+    #[test]
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
+    fn mgmt_lqi_response_carries_only_the_records_that_fit_one_frame() {
+        let mut zdo = test_zdo_for(DeviceType::Router);
+        let neighbors = zigbee_nwk::neighbor::MAX_NEIGHBORS.min(16) as u8;
+        for index in 0..neighbors {
+            zdo.nwk_mut()
+                .update_neighbor_address(ShortAddress(0x2000 + index as u16), neighbor_ieee(index));
+        }
+        let total = zdo.nwk().neighbor_table().len() as u8;
+        assert!(total >= 4, "need more neighbors than one frame holds");
+        let per_frame = (crate::ZDP_MAX_PAYLOAD - 1 - 4) / NeighborTableRecord::WIRE_SIZE;
+        assert_eq!(per_frame, 3);
+
+        for start in [0u8, 3] {
+            zdo.nwk_mut().mac_mut().clear_tx_history();
+            block_on(zdo.handle_indication(&unicast(crate::MGMT_LQI_REQ, &[0x70, start]))).unwrap();
+            let (cluster, body) = last_zdp_tx(&zdo).expect("Mgmt_Lqi_rsp");
+            assert_eq!(cluster, crate::MGMT_LQI_RSP);
+            assert!(body.len() <= crate::ZDP_MAX_PAYLOAD);
+            assert_eq!(&body[..4], &[0x70, ZdpStatus::Success as u8, total, start]);
+            assert_eq!(body[4] as usize, per_frame);
+            assert_eq!(body.len(), 5 + per_frame * NeighborTableRecord::WIRE_SIZE);
+            let first = NeighborTableRecord::parse(&body[5..]).unwrap();
+            let expected = zdo
+                .nwk()
+                .neighbor_table()
+                .iter()
+                .nth(start as usize)
+                .unwrap()
+                .network_address;
+            assert_eq!(first.network_addr, expected);
+        }
+
+        // A start index past the end is an empty, well-formed list.
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_LQI_REQ, &[0x71, 0xF0]))).unwrap();
+        let (_, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(
+            body.as_slice(),
+            &[0x71, ZdpStatus::Success as u8, total, 0xF0, 0]
+        );
+    }
+
+    #[test]
+    fn mgmt_bind_response_carries_only_the_records_that_fit_one_frame() {
+        let mut zdo = test_zdo();
+        for index in 0..6u8 {
+            zdo.aps_mut()
+                .binding_table_mut()
+                .add(BindingEntry::unicast(
+                    LOCAL_IEEE,
+                    1,
+                    0x0006,
+                    neighbor_ieee(index),
+                    1,
+                ))
+                .unwrap();
+        }
+        // Two short group records after the unicast ones.
+        for group in [0x0101u16, 0x0102] {
+            zdo.aps_mut()
+                .binding_table_mut()
+                .add(BindingEntry::group(LOCAL_IEEE, 1, 0x0006, group))
+                .unwrap();
+        }
+
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_BIND_REQ, &[0x72, 0]))).unwrap();
+        let (cluster, body) = last_zdp_tx(&zdo).expect("Mgmt_Bind_rsp");
+        assert_eq!(cluster, crate::MGMT_BIND_RSP);
+        assert!(body.len() <= crate::ZDP_MAX_PAYLOAD);
+        // 4 header bytes + 3 × 21-byte unicast records; a 4th would overflow.
+        assert_eq!(&body[..5], &[0x72, ZdpStatus::Success as u8, 8, 0, 3]);
+        assert_eq!(body.len(), 5 + 3 * 21);
+
+        // Paging continues contiguously: three unicast records plus one
+        // 14-byte group record exactly fill the 82-byte budget.
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_BIND_REQ, &[0x73, 3]))).unwrap();
+        let (_, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(&body[..5], &[0x73, ZdpStatus::Success as u8, 8, 3, 4]);
+        assert_eq!(body.len(), crate::ZDP_MAX_PAYLOAD);
+        let rsp = MgmtBindRsp::parse(&body[1..]).unwrap();
+        assert_eq!(rsp.binding_table_list.len(), 4);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_BIND_REQ, &[0x74, 6]))).unwrap();
+        let (_, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(&body[..5], &[0x74, ZdpStatus::Success as u8, 8, 6, 2]);
+        assert_eq!(body.len(), 5 + 2 * 14);
+    }
+
+    // ── Address requests (R22 2.4.3.1.1-2 / 2.4.4.2.1-2) ──────────
+
+    #[test]
+    fn unicast_address_request_with_reserved_request_type_answers_inv_requesttype() {
+        let mut zdo = test_zdo();
+        let mut nwk_req = [0u8; 11];
+        nwk_req[0] = 0x75;
+        nwk_req[1..9].copy_from_slice(&LOCAL_IEEE);
+        nwk_req[9] = 0x02;
+        block_on(zdo.handle_indication(&unicast(crate::NWK_ADDR_REQ, &nwk_req))).unwrap();
+        let (cluster, body) = last_zdp_tx(&zdo).expect("NWK_addr_rsp");
+        assert_eq!(cluster, crate::NWK_ADDR_RSP);
+        assert_eq!(body[1], ZdpStatus::InvRequestType as u8);
+        assert_eq!(body.len(), 1 + NwkAddrRsp::MIN_SIZE);
+
+        let short = LOCAL_SHORT.0.to_le_bytes();
+        let ieee_req = [0x76, short[0], short[1], 0x7F, 0];
+        block_on(zdo.handle_indication(&unicast(crate::IEEE_ADDR_REQ, &ieee_req))).unwrap();
+        let (cluster, body) = last_zdp_tx(&zdo).expect("IEEE_addr_rsp");
+        assert_eq!(cluster, crate::IEEE_ADDR_RSP);
+        assert_eq!(body[1], ZdpStatus::InvRequestType as u8);
+        assert_eq!(&body[2..10], &LOCAL_IEEE);
+
+        // Reserved type for an address this node does not own: a broadcast
+        // stays silent, a unicast still gets INV_REQUESTTYPE.
+        zdo.nwk_mut().mac_mut().clear_tx_history();
+        let other = [0x77, 0x21, 0x43, 0x02, 0];
+        block_on(zdo.handle_indication(&broadcast(crate::IEEE_ADDR_REQ, &other))).unwrap();
+        assert_eq!(tx_count(&zdo), 0);
+        block_on(zdo.handle_indication(&unicast(crate::IEEE_ADDR_REQ, &other))).unwrap();
+        assert_eq!(
+            last_zdp_tx(&zdo).unwrap().1[1],
+            ZdpStatus::InvRequestType as u8
+        );
+    }
+
+    #[test]
+    fn extended_address_request_on_an_end_device_reports_zero_associated_devices() {
+        let mut zdo = test_zdo();
+        let short = LOCAL_SHORT.0.to_le_bytes();
+        let req = [0x78, short[0], short[1], 0x01, 0];
+        block_on(zdo.handle_indication(&unicast(crate::IEEE_ADDR_REQ, &req))).unwrap();
+        let (_, body) = last_zdp_tx(&zdo).unwrap();
+        // NumAssocDev = 0 present; StartIndex and list omitted.
+        assert_eq!(body.len(), 1 + NwkAddrRsp::MIN_SIZE + 1);
+        assert_eq!(body[1], ZdpStatus::Success as u8);
+        assert_eq!(body[12], 0);
+    }
+
+    #[test]
+    fn descriptor_requests_follow_the_live_nib_address() {
+        let mut zdo = test_zdo();
+        // Address-conflict resolution changed the NIB address; the cached
+        // ZDO copy is stale.
+        zdo.nwk_mut().nib_mut().network_address = ShortAddress(0x2468);
+        block_on(zdo.handle_indication(&unicast(crate::NODE_DESC_REQ, &[0x79, 0x68, 0x24])))
+            .unwrap();
+        let (_, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(&body[..4], &[0x79, ZdpStatus::Success as u8, 0x68, 0x24]);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn router_answers_address_requests_for_its_end_device_children() {
+        let mut zdo = test_zdo_for(DeviceType::Router);
+        add_confirmed_child(&mut zdo, CHILD_SHORT, CHILD_IEEE);
+        add_confirmed_child(&mut zdo, CHILD_2_SHORT, CHILD_2_IEEE);
+
+        let mut req = [0u8; 11];
+        req[0] = 0x7A;
+        req[1..9].copy_from_slice(&CHILD_IEEE);
+        block_on(zdo.handle_indication(&broadcast(crate::NWK_ADDR_REQ, &req))).unwrap();
+        let (cluster, body) = last_zdp_tx(&zdo).expect("answered for the child");
+        assert_eq!(cluster, crate::NWK_ADDR_RSP);
+        assert_eq!(body[1], ZdpStatus::Success as u8);
+        assert_eq!(&body[2..10], &CHILD_IEEE);
+        assert_eq!(&body[10..12], &CHILD_SHORT.0.to_le_bytes());
+
+        // Extended request for the router itself lists its children.
+        let short = LOCAL_SHORT.0.to_le_bytes();
+        let req = [0x7B, short[0], short[1], 0x01, 1];
+        block_on(zdo.handle_indication(&unicast(crate::IEEE_ADDR_REQ, &req))).unwrap();
+        let (_, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(body[1], ZdpStatus::Success as u8);
+        assert_eq!(body[12], 2, "NumAssocDev");
+        assert_eq!(body[13], 1, "StartIndex");
+        assert_eq!(body.len(), 1 + NwkAddrRsp::MIN_SIZE + 2 + 2);
+    }
+
+    // ── Bind/Unbind validation (R22 2.4.3.2.2-3) ──────────────────
+
+    fn bind_status(zdo: &mut ZdoLayer<MockMac>, cluster: u16, payload: &[u8]) -> u8 {
+        block_on(zdo.handle_indication(&unicast(cluster, payload))).unwrap();
+        let (rsp_cluster, body) = last_zdp_tx(zdo).expect("binding response");
+        assert_eq!(rsp_cluster, cluster | ZDP_RESPONSE_BIT);
+        assert_eq!(body.len(), 2);
+        body[1]
+    }
+
+    fn bind_payload(src: [u8; 8], src_ep: u8, dst: BindTarget) -> heapless::Vec<u8, 22> {
+        let mut buf = [0u8; 22];
+        buf[0] = 0x7C;
+        let len = BindReq {
+            src_addr: src,
+            src_endpoint: src_ep,
+            cluster_id: 0x0006,
+            dst,
+        }
+        .serialize(&mut buf[1..])
+        .unwrap();
+        heapless::Vec::from_slice(&buf[..1 + len]).unwrap()
+    }
+
+    #[test]
+    fn bind_and_unbind_with_a_reserved_dst_addr_mode_answer_not_supported() {
+        let mut zdo = test_zdo();
+        let mut payload = [0u8; 22];
+        payload[0] = 0x7D;
+        payload[1..9].copy_from_slice(&LOCAL_IEEE);
+        payload[9] = 1;
+        payload[12] = 0x02; // reserved DstAddrMode
+        for cluster in [crate::BIND_REQ, crate::UNBIND_REQ] {
+            assert_eq!(
+                bind_status(&mut zdo, cluster, &payload),
+                ZdpStatus::NotSupported as u8
+            );
+        }
+        assert!(zdo.aps().binding_table().is_empty());
+    }
+
+    #[test]
+    fn bind_rejects_foreign_source_and_invalid_endpoints() {
+        let mut zdo = test_zdo();
+        let unicast_dst = |dst_endpoint| BindTarget::Unicast {
+            dst_addr: [0x42; 8],
+            dst_endpoint,
+        };
+        for cluster in [crate::BIND_REQ, crate::UNBIND_REQ] {
+            let foreign = bind_payload([0x99; 8], 1, unicast_dst(1));
+            assert_eq!(
+                bind_status(&mut zdo, cluster, &foreign),
+                ZdpStatus::NotSupported as u8
+            );
+            for (src_ep, dst) in [
+                (0x00, unicast_dst(1)),
+                (0xFF, BindTarget::Group(0x0001)),
+                (1, unicast_dst(0x00)),
+                (1, unicast_dst(0xFF)),
+            ] {
+                let payload = bind_payload(LOCAL_IEEE, src_ep, dst);
+                assert_eq!(
+                    bind_status(&mut zdo, cluster, &payload),
+                    ZdpStatus::InvalidEp as u8
+                );
+            }
+        }
+        assert!(zdo.aps().binding_table().is_empty());
+    }
+
+    #[test]
+    fn bind_table_full_uses_the_r22_table_full_status() {
+        assert_eq!(ZdpStatus::TableFull as u8, 0x8C);
+        assert_eq!(ZdpStatus::from_u8(0x8C), Some(ZdpStatus::TableFull));
+        assert_eq!(ZdpStatus::from_u8(0x87), None);
+        let mut zdo = test_zdo();
+        let mut group = 0u16;
+        while zdo
+            .aps_mut()
+            .binding_table_mut()
+            .add(BindingEntry::group(LOCAL_IEEE, 1, 0x0006, group))
+            .is_ok()
+        {
+            group += 1;
+        }
+        let payload = bind_payload(LOCAL_IEEE, 1, BindTarget::Group(0xFFF0));
+        assert_eq!(
+            bind_status(&mut zdo, crate::BIND_REQ, &payload),
+            ZdpStatus::TableFull as u8
+        );
+    }
+
+    // ── Client request slots (finding: legacy requests leaked slots) ──
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_client_requests_never_leak_pending_slots() {
+        let mut zdo = test_zdo();
+        let entry = BindingEntry::unicast(LOCAL_IEEE, 1, 0x0006, [0x42; 8], 2);
+        for _ in 0..(crate::MAX_PENDING_ZDP * 2) {
+            block_on(zdo.bind_req(PARENT, &entry)).unwrap();
+            block_on(zdo.unbind_req(PARENT, &entry)).unwrap();
+            assert_eq!(block_on(zdo.active_ep_req(PARENT)), Err(ZdpStatus::Timeout));
+            assert_eq!(
+                block_on(zdo.match_desc_req(PARENT, 0x0104, &[0x0006], &[])),
+                Err(ZdpStatus::Timeout)
+            );
+        }
+        assert_eq!(zdo.pending_count(), 0);
+
+        // A send failure also releases the slot.
+        zdo.nwk_mut().mac_mut().set_tx_failures(100);
+        assert!(block_on(zdo.start_active_ep_req(PARENT)).is_err());
+        zdo.nwk_mut().mac_mut().set_tx_failures(0);
+        assert_eq!(zdo.pending_count(), 0);
+    }
+
+    #[test]
+    fn bind_req_sends_the_complete_r22_payload() {
+        let mut zdo = test_zdo();
+        let entry = BindingEntry::unicast(LOCAL_IEEE, 1, 0x0006, [0x42; 8], 2);
+        block_on(zdo.bind_req(PARENT, &entry)).unwrap();
+        let (cluster, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(cluster, crate::BIND_REQ);
+        assert_eq!(body.len(), 1 + 21);
+        let parsed = BindReq::parse(&body[1..]).unwrap();
+        assert_eq!(parsed.src_addr, LOCAL_IEEE);
+        assert_eq!(
+            parsed.dst,
+            BindTarget::Unicast {
+                dst_addr: [0x42; 8],
+                dst_endpoint: 2
+            }
+        );
+
+        let (slot, tsn) = block_on(zdo.start_unbind_req(PARENT, &parsed)).unwrap();
+        let (cluster, body) = last_zdp_tx(&zdo).unwrap();
+        assert_eq!(cluster, crate::UNBIND_REQ);
+        assert_eq!(body[0], tsn);
+        block_on(zdo.handle_indication(&unicast(
+            crate::UNBIND_RSP,
+            &[tsn, ZdpStatus::NoEntry as u8],
+        )))
+        .unwrap();
+        assert_eq!(
+            zdo.take_response(slot).unwrap().as_slice(),
+            &[ZdpStatus::NoEntry as u8]
+        );
+        assert_eq!(zdo.pending_count(), 0);
+    }
+
+    #[test]
+    fn unicast_request_only_accepts_a_response_from_its_destination() {
+        let mut zdo = test_zdo();
+        let slot = block_on(zdo.start_node_desc_req(PARENT)).unwrap();
+        let tsn = zdo.pending_tsn(slot).unwrap();
+        let payload = [tsn, 0x81, 0, 0];
+        let mut spoofed = unicast(crate::NODE_DESC_RSP, &payload);
+        spoofed.src_address = ApsAddress::Short(ShortAddress(0x5555));
+        block_on(zdo.handle_indication(&spoofed)).unwrap();
+        assert!(zdo.take_response(slot).is_none());
+        assert!(!zdo.deliver_client_response(&spoofed));
+
+        let genuine = unicast(crate::NODE_DESC_RSP, &payload);
+        assert!(zdo.deliver_client_response(&genuine));
+        assert!(zdo.take_response(slot).is_some());
+
+        // Broadcast discovery accepts any responder; resets drop everything.
+        let (slot, _) = block_on(zdo.start_ieee_addr_req(ShortAddress::BROADCAST)).unwrap();
+        assert_eq!(zdo.pending_count(), 1);
+        zdo.cancel_all_pending();
+        assert_eq!(zdo.pending_count(), 0);
+        assert_eq!(zdo.pending_tsn(slot), None);
+    }
+
+    #[test]
+    fn initial_transaction_sequence_number_is_seeded_per_device() {
+        let seq_for = |ieee: [u8; 8]| {
+            let nwk = NwkLayer::new(MockMac::new(ieee), DeviceType::EndDevice);
+            let mut zdo = ZdoLayer::new(ApsLayer::new(nwk));
+            zdo.nwk_mut().nib_mut().ieee_address = ieee;
+            zdo.next_seq()
+        };
+        let seeds: heapless::Vec<u8, 4> = [[1u8; 8], [2; 8], [3; 8], [4; 8]]
+            .into_iter()
+            .map(seq_for)
+            .collect();
+        assert!(seeds.iter().any(|&seq| seq != seeds[0]));
     }
 }

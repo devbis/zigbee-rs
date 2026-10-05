@@ -37,7 +37,9 @@ finding-binding-target = []
 float32 = ["zigbee-zcl/float32"]
 float64 = ["zigbee-zcl/float64"]
 router = ["centralized-tclk", "distributed-security", "formation"]
-trust-center = ["router", "dep:zigbee-crypto", "zigbee-aps/trust-center"]
+# Joiner-side install-code provisioning (`BdbLayer::set_install_code`).
+install-code = ["centralized-tclk", "dep:zigbee-crypto"]
+trust-center = ["router", "install-code", "zigbee-aps/trust-center"]
 trace = ["zigbee-aps/trace", "zigbee-nwk/trace"]
 touchlink = []
 

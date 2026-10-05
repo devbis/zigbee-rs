@@ -144,7 +144,7 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     fn register_pending_parent_annce(&mut self, tsn: u8) -> Result<usize, ZdoError> {
         let slot = self
-            .register_pending(tsn, PARENT_ANNCE_RSP)
+            .register_pending(tsn, PARENT_ANNCE_RSP, zigbee_types::ShortAddress::BROADCAST)
             .ok_or(ZdoError::TableFull)?;
         self.pending_responses[slot].remaining_secs = PARENT_ANNCE_RESPONSE_WINDOW_SECS;
         Ok(slot)

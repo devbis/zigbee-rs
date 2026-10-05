@@ -96,7 +96,14 @@ impl TrustCenterPolicy {
         Self {
             allow_joins: attributes.trust_center_allow_joins,
             use_whitelist: attributes.trust_center_use_whitelist,
-            install_codes: attributes.trust_center_install_code_policy,
+            // bdbJoinUsesInstallCodeKey (BDB v3.0.1 Table 5) is Trust Center
+            // admission policy: when set, only install-code provisioned
+            // nodes may join, regardless of the coarser policy attribute.
+            install_codes: if attributes.join_uses_install_code_key {
+                TrustCenterInstallCodePolicy::Required
+            } else {
+                attributes.trust_center_install_code_policy
+            },
             require_link_key_update: attributes.trust_center_require_key_exchange,
             allow_rejoins: attributes.trust_center_allow_rejoins,
             link_key_requests: attributes.trust_center_link_key_request_policy,
@@ -282,11 +289,30 @@ impl TrustCenterTable {
                         device_short_address: indication.device_short_address,
                     });
                 }
+                let previously_admitted = self
+                    .device(&indication.device_address)
+                    .is_some_and(TrustCenterDevice::has_completed_admission);
                 let index = self.ensure_default_device_index(indication.device_address)?;
                 let device = self.devices[index]
                     .as_mut()
                     .ok_or(TrustCenterError::DeviceNotFound)?;
-                update_location(device, indication, 0);
+                // A secured rejoin only changes the device's location. It must
+                // neither cut short an initial key exchange that is still
+                // running (bdbTrustCenterNodeJoinTimeout) nor admit a device
+                // the Trust Center does not know — e.g. one recreated under
+                // `allow_rejoins` with the default global key — without the
+                // required link-key update.
+                let timeout = if device.join_timeout_remaining_secs != 0 {
+                    device.join_timeout_remaining_secs
+                } else if !previously_admitted
+                    && policy.require_link_key_update
+                    && !device.has_verified_replacement_key()
+                {
+                    policy.join_timeout_secs.max(1)
+                } else {
+                    0
+                };
+                update_location(device, indication, timeout);
                 Ok(TrustCenterAction::None)
             }
             ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin => {
@@ -463,6 +489,14 @@ impl TrustCenterTable {
                 .join_timeout_remaining_secs
                 .saturating_sub(elapsed_secs);
             if device.join_timeout_remaining_secs == 0 {
+                if device.has_verified_replacement_key() {
+                    // A voluntary re-key of an already verified device that
+                    // did not finish only abandons the replacement: the
+                    // committed, verified key and the admission stay valid.
+                    self.pending_link_keys[index] = [0u8; 16];
+                    self.pending_link_key_mask &= !(1u32 << index);
+                    continue;
+                }
                 let action = TrustCenterAction::RemoveDevice {
                     parent_address: device.parent_address,
                     device_address: device.ieee_address,
@@ -475,6 +509,14 @@ impl TrustCenterTable {
             }
         }
         TrustCenterAction::None
+    }
+
+    /// Whether a generated replacement link key for `address` is still
+    /// awaiting Verify-Key. Runtimes that mirror pending keys into the APS key
+    /// table can use this after [`Self::tick`] to discard an abandoned one.
+    pub fn has_pending_link_key_for(&self, address: &IeeeAddress) -> bool {
+        self.device_index(address)
+            .is_some_and(|index| self.has_pending_link_key(index))
     }
 
     pub fn revoke(&mut self, address: &IeeeAddress) -> bool {
@@ -1024,6 +1066,199 @@ mod tests {
                 TC,
             ),
             Err(TrustCenterError::RequestNotPermitted)
+        );
+    }
+
+    fn join_with_default_key(table: &mut TrustCenterTable, policy: TrustCenterPolicy) {
+        assert!(matches!(
+            table
+                .handle_update_device(
+                    policy,
+                    update(ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin)
+                )
+                .unwrap(),
+            TrustCenterAction::TransportNetworkKey {
+                require_link_key_update: true,
+                ..
+            }
+        ));
+    }
+
+    fn verify_replacement(table: &mut TrustCenterTable, key: AesKey) {
+        table
+            .install_generated_trust_center_link_key(DEVICE, key, 15)
+            .unwrap();
+        assert_eq!(
+            table
+                .handle_verify_key(ApsmeVerifyKeyIndication {
+                    source_address: DEVICE,
+                    key_type: 0x04,
+                    hash: derive_verify_key_hash(&key),
+                })
+                .unwrap(),
+            TrustCenterAction::ConfirmKey {
+                device_address: DEVICE,
+                status: 0x00
+            }
+        );
+    }
+
+    #[test]
+    fn secured_rejoin_does_not_cut_short_the_initial_key_exchange() {
+        let mut table = TrustCenterTable::new();
+        let mut policy = policy();
+        policy.allow_rejoins = true;
+        join_with_default_key(&mut table, policy);
+        table
+            .install_generated_trust_center_link_key(DEVICE, [0xA5; 16], 15)
+            .unwrap();
+        assert_eq!(table.tick(5), TrustCenterAction::None);
+
+        assert_eq!(
+            table
+                .handle_update_device(
+                    policy,
+                    update(ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin)
+                )
+                .unwrap(),
+            TrustCenterAction::None
+        );
+        let device = table.device(&DEVICE).unwrap();
+        assert_eq!(device.join_timeout_remaining_secs, 10);
+        // The committed admission key stays separate from the pending one.
+        assert_eq!(device.link_key, DEFAULT_TC_LINK_KEY);
+        assert!(table.has_pending_link_key_for(&DEVICE));
+
+        // The exchange still has to finish within bdbTrustCenterNodeJoinTimeout.
+        assert!(matches!(
+            table.tick(10),
+            TrustCenterAction::RemoveDevice {
+                device_address: DEVICE,
+                ..
+            }
+        ));
+        assert!(table.device(&DEVICE).is_none());
+    }
+
+    #[test]
+    fn unknown_secured_rejoin_must_still_complete_the_required_key_update() {
+        let mut table = TrustCenterTable::new();
+        let mut policy = policy();
+        policy.allow_rejoins = true;
+
+        assert_eq!(
+            table
+                .handle_update_device(
+                    policy,
+                    update(ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin)
+                )
+                .unwrap(),
+            TrustCenterAction::None
+        );
+        let device = *table.device(&DEVICE).unwrap();
+        assert_eq!(device.join_timeout_remaining_secs, policy.join_timeout_secs);
+        assert!(!device.has_completed_admission());
+        assert!(matches!(
+            table.tick(policy.join_timeout_secs),
+            TrustCenterAction::RemoveDevice {
+                device_address: DEVICE,
+                ..
+            }
+        ));
+
+        // Without a required key update the rejoin is a plain location update.
+        let mut relaxed = policy;
+        relaxed.require_link_key_update = false;
+        table
+            .handle_update_device(
+                relaxed,
+                update(ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin),
+            )
+            .unwrap();
+        assert_eq!(
+            table.device(&DEVICE).unwrap().join_timeout_remaining_secs,
+            0
+        );
+    }
+
+    #[test]
+    fn verified_device_secured_rejoin_stays_admitted() {
+        let mut table = TrustCenterTable::new();
+        join_with_default_key(&mut table, policy());
+        verify_replacement(&mut table, [0xA5; 16]);
+
+        assert_eq!(
+            table
+                .handle_update_device(
+                    policy(),
+                    update(ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin)
+                )
+                .unwrap(),
+            TrustCenterAction::None
+        );
+        assert_eq!(
+            table.device(&DEVICE).unwrap().join_timeout_remaining_secs,
+            0
+        );
+        assert_eq!(table.tick(u8::MAX), TrustCenterAction::None);
+    }
+
+    #[test]
+    fn abandoned_voluntary_rekey_keeps_the_verified_device() {
+        let mut table = TrustCenterTable::new();
+        join_with_default_key(&mut table, policy());
+        let verified = [0xA5; 16];
+        verify_replacement(&mut table, verified);
+
+        let mut any = policy();
+        any.link_key_requests = TrustCenterLinkKeyRequestPolicy::AnyDevice;
+        assert!(matches!(
+            table.handle_request_key(
+                any,
+                ApsmeRequestKeyIndication {
+                    source_address: DEVICE,
+                    key_type: ApsRequestKeyType::TrustCenterLink,
+                    partner_address: None,
+                },
+                TC,
+            ),
+            Ok(TrustCenterAction::GenerateTrustCenterLinkKey { .. })
+        ));
+        table
+            .install_generated_trust_center_link_key(DEVICE, [0xB6; 16], 15)
+            .unwrap();
+        assert!(table.has_pending_link_key_for(&DEVICE));
+
+        assert_eq!(table.tick(15), TrustCenterAction::None);
+        let device = table.device(&DEVICE).unwrap();
+        assert_eq!(device.link_key, verified);
+        assert_eq!(device.key_attributes, TrustCenterKeyAttributes::Verified);
+        assert_eq!(device.join_timeout_remaining_secs, 0);
+        assert!(!table.has_pending_link_key_for(&DEVICE));
+    }
+
+    #[test]
+    fn join_uses_install_code_key_is_trust_center_admission_policy() {
+        let mut attributes = BdbAttributes::default();
+        assert_eq!(
+            TrustCenterPolicy::from_attributes(&attributes).install_codes,
+            TrustCenterInstallCodePolicy::Supported
+        );
+        attributes.join_uses_install_code_key = true;
+        let policy = TrustCenterPolicy::from_attributes(&attributes);
+        assert_eq!(policy.install_codes, TrustCenterInstallCodePolicy::Required);
+
+        let mut table = TrustCenterTable::new();
+        assert_eq!(
+            table
+                .handle_update_device(
+                    policy,
+                    update(ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin)
+                )
+                .unwrap(),
+            TrustCenterAction::RejectedWithoutCommand {
+                device_address: DEVICE
+            }
         );
     }
 }
