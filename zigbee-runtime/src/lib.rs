@@ -5944,6 +5944,34 @@ mod resume_tests {
     }
 
     #[test]
+    fn failed_sleepy_polls_are_paced_independently_of_the_tick_rate() {
+        // A silent parent used to leave `last_poll_ms` untouched, so every
+        // tick re-polled immediately — and with a secure rejoin pending the
+        // failure counter stops, so nothing else bounded the retry rate.
+        let (mut device, _store) =
+            resumed_sleepy_end_device(negotiated_state(0x01, true, 14), 10_000);
+        let _ = device.take_forced_poll();
+        device.schedule_secure_rejoin_retry();
+        device.mac_mut().set_poll_failures(u32::MAX);
+
+        let now_ms = device.advance_power_clock(10);
+        let polls_before = device.mac().poll_count();
+        for _ in 0..20 {
+            let _ = block_on(device.run_sleepy_poll(now_ms, &mut []));
+        }
+        assert_eq!(device.mac().poll_count(), polls_before + 1);
+
+        // The first retry follows after the 1 s back-off, not the full
+        // 10 s interval, and again only once however fast the caller ticks.
+        let now_ms = device.advance_power_clock(1);
+        for _ in 0..20 {
+            let _ = block_on(device.run_sleepy_poll(now_ms, &mut []));
+        }
+        assert_eq!(device.mac().poll_count(), polls_before + 2);
+        assert_eq!(device.power.failed_polls(), 2);
+    }
+
+    #[test]
     fn a_pending_rejoin_suppresses_further_failure_accounting() {
         // Once a secure rejoin is scheduled, a persistently silent parent —
         // which under an OTA fast-poll cadence can fail many times per second —
@@ -11990,6 +12018,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 // secure-rejoin recovery regardless of what issued the poll. The
                 // hook is inert on non-end-device roles.
                 log::debug!("[Runtime] Poll to parent failed: {:?}", error);
+                // Pace the retry with a bounded back-off. Without this a
+                // failed poll left `last_poll_ms` untouched, so every tick
+                // re-polled immediately and the retry rate (and battery drain)
+                // depended on the caller's tick rate — notably while a secure
+                // rejoin is pending, when the failure counter stops advancing.
+                self.power.record_failed_poll(self.power_now_ms);
                 R::ed_note_forced_poll_result(self, false);
                 return Err(error);
             }
