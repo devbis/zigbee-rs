@@ -129,6 +129,13 @@ pub(crate) struct LocalZclCtx<'a, 'c, const N: usize> {
     /// Response to unicast commands, and the Groups cluster (§3.6.2.3)
     /// suppresses its responses to groupcast/broadcast requests.
     unicast: bool,
+    /// IEEE address of the sender when known: a Zone Enroll Response is only
+    /// accepted from the zone's CIE (ZCL r8 §8.2.2.3.1).
+    src_ieee: Option<u64>,
+    /// APS group table: the group membership Scenes commands are checked
+    /// against (ZCL r8 §3.7.2.4).
+    #[cfg(any(feature = "groups", test))]
+    group_table: Option<&'a zigbee_aps::group::GroupTable>,
     #[cfg(any(feature = "groups", test))]
     group_action: Option<GroupTableAction>,
     #[cfg(any(feature = "finding-binding", test))]
@@ -157,6 +164,9 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             clusters,
             zcl_scratch,
             unicast: true,
+            src_ieee: None,
+            #[cfg(any(feature = "groups", test))]
+            group_table: None,
             #[cfg(any(feature = "groups", test))]
             group_action: None,
             #[cfg(any(feature = "finding-binding", test))]
@@ -164,11 +174,67 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         }
     }
 
+    /// The sender's IEEE address, when the caller could resolve it.
+    pub(crate) fn with_source_ieee(mut self, src_ieee: Option<u64>) -> Self {
+        self.src_ieee = src_ieee;
+        self
+    }
+
     /// Mark the frame as groupcast/broadcast (`unicast == false`) so no
     /// Default Response and no Groups cluster response is generated for it.
     pub(crate) fn with_unicast(mut self, unicast: bool) -> Self {
         self.unicast = unicast;
         self
+    }
+
+    /// Check Scenes group arguments against the APS group table.
+    #[cfg(any(feature = "groups", test))]
+    pub(crate) fn with_group_table(mut self, table: &'a zigbee_aps::group::GroupTable) -> Self {
+        self.group_table = Some(table);
+        self
+    }
+
+    /// Run a Scenes command against the endpoint's scene table with the
+    /// endpoint's scene-capable clusters and group membership, so Store
+    /// Scene captures and Recall Scene restores their state (ZCL r8 §3.7).
+    ///
+    /// `None` when the endpoint has no Scenes server.
+    #[cfg(any(feature = "groups", test))]
+    fn handle_scenes_command(
+        &mut self,
+        endpoint: u8,
+        cmd_id: CommandId,
+        payload: &[u8],
+    ) -> Option<Result<heapless::Vec<u8, 64>, ZclStatus>> {
+        use zigbee_zcl::clusters::ClusterRole;
+        use zigbee_zcl::clusters::scenes::SceneCapable;
+
+        if !self.endpoint_has_server_cluster(endpoint, ClusterId::SCENES) {
+            return None;
+        }
+        let mut table = None;
+        // OnOff, Level Control and Color Control.
+        let mut state = heapless::Vec::<&mut dyn SceneCapable, 4>::new();
+        for cluster in self.clusters.iter_mut() {
+            if cluster.endpoint != endpoint {
+                continue;
+            }
+            match cluster.cluster.cluster_role() {
+                ClusterRole::SceneTable(scenes) => table = Some(scenes),
+                ClusterRole::SceneState(capable) => {
+                    if state.push(capable).is_err() {
+                        log::warn!(
+                            "[Runtime] Scenes: extra scene cluster on ep {} ignored",
+                            endpoint
+                        );
+                    }
+                }
+                ClusterRole::None => {}
+            }
+        }
+        let groups = self.group_table;
+        let is_member = |group: u16| groups.is_some_and(|table| table.is_member(group, endpoint));
+        Some(table?.handle_endpoint_command(cmd_id, payload, &mut state, &is_member))
     }
 
     /// Queue a Default Response for the received command when ZCL r8
@@ -188,15 +254,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         cluster_id: u16,
         status: ZclStatus,
     ) {
-        if !self.unicast {
-            return;
-        }
-        if header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && header.command_id.0 == 0x0B
-        {
-            return;
-        }
-        if status == ZclStatus::Success && header.disable_default_response() {
+        if !self.unicast || !header.default_response_required(status) {
             return;
         }
         queue_default_response(
@@ -527,13 +585,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         // dedicated UNSUP_MANUF_* status — always, since it is an error — and
         // change no state. No event is raised: the frame carries no standard
         // meaning an application could act on.
-        if zcl_frame.header.is_manufacturer_specific() {
-            let status = match zcl_frame.header.frame_type() {
-                zigbee_zcl::frame::ZclFrameType::Global => {
-                    ZclStatus::UnsupManufacturerGeneralCommand
-                }
-                _ => ZclStatus::UnsupManufacturerClusterCommand,
-            };
+        if let Some(status) = zcl_frame.header.manufacturer_specific_unsupported_status() {
             rt_trace!(
                 "[RT] zcl_manuf_unsupported ep={} cluster=0x{:04X} cmd=0x{:02X}",
                 dst_ep,
@@ -1186,8 +1238,23 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                 None;
             let mut cluster_found = false;
 
-            if let Some(result) = self.with_cluster_mut(dst_ep, ClusterId(cluster_id), |cluster| {
-                cluster.handle_command(CommandId(cmd_id), zcl_frame.payload.as_slice())
+            #[cfg(any(feature = "groups", test))]
+            let result = if cluster_id == ClusterId::SCENES.0 {
+                self.handle_scenes_command(dst_ep, CommandId(cmd_id), zcl_frame.payload.as_slice())
+            } else {
+                None
+            };
+            #[cfg(not(any(feature = "groups", test)))]
+            let result = None;
+            let src_ieee = self.src_ieee;
+            if let Some(result) = result.or_else(|| {
+                self.with_cluster_mut(dst_ep, ClusterId(cluster_id), |cluster| {
+                    cluster.handle_command_from(
+                        src_ieee,
+                        CommandId(cmd_id),
+                        zcl_frame.payload.as_slice(),
+                    )
+                })
             }) {
                 cluster_found = true;
                 // Status carried by a Groups Add/Remove response (byte 0).
@@ -1442,8 +1509,10 @@ fn is_foundation_response(cmd_id: u8) -> bool {
 /// Local endpoints an application APS indication is delivered to
 /// (R22 §2.2.4.1.1).
 ///
-/// * Group addressing: every configured endpoint that is a member of `group`
-///   in the APS group table (possibly none — the frame is then dropped).
+/// * Group addressing (`group_members` is `Some`): the APS group table's
+///   member endpoints for the group ([`zigbee_aps::ApsLayer::group_member_endpoints`],
+///   the single source of group membership), restricted to configured
+///   endpoints (possibly none — the frame is then dropped).
 /// * Broadcast endpoint `0xFF`: every configured application endpoint.
 /// * Otherwise: the addressed endpoint, unchanged (an unknown endpoint is
 ///   still handed to the dispatcher, which reports it as before).
@@ -1451,15 +1520,17 @@ fn is_foundation_response(cmd_id: u8) -> bool {
 pub(crate) fn delivery_endpoints(
     endpoints: &[EndpointConfig],
     dst_ep: u8,
-    group: Option<u16>,
-    group_table: &zigbee_aps::group::GroupTable,
+    group_members: Option<&[u8]>,
 ) -> heapless::Vec<u8, { crate::MAX_ENDPOINTS }> {
     let mut targets = heapless::Vec::new();
-    match group {
-        Some(group) => {
-            for configured in endpoints {
-                if group_table.is_member(group, configured.endpoint) {
-                    let _ = targets.push(configured.endpoint);
+    match group_members {
+        Some(members) => {
+            for &member in members {
+                if endpoints
+                    .iter()
+                    .any(|configured| configured.endpoint == member)
+                {
+                    let _ = targets.push(member);
                 }
             }
         }
@@ -3144,6 +3215,18 @@ mod tests {
         );
     }
 
+    /// A reserved ZCL frame type (0b10/0b11) is not a frame this device can
+    /// interpret: it is dropped without a response and without an event.
+    #[test]
+    fn reserved_frame_type_is_dropped_without_a_response() {
+        let mut fx = Fixture::new(&[ClusterId::IDENTIFY]);
+        for frame_type in [0x02, 0x03] {
+            let outcome = fx.dispatch(&mut [], ClusterId::IDENTIFY.0, &[frame_type, 0x01, 0x00]);
+            assert!(outcome.event.is_none());
+        }
+        assert!(fx.pending.is_empty());
+    }
+
     /// The Disable Default Response bit only suppresses a *successful*
     /// Default Response; errors are always reported (ZCL r8 §2.5.12.2).
     #[test]
@@ -3236,16 +3319,14 @@ mod tests {
     #[test]
     fn delivery_endpoints_follow_group_membership_and_broadcast_endpoint() {
         let fx = Fixture::with_second_endpoint(&[ClusterId::IDENTIFY]);
-        let mut table = zigbee_aps::group::GroupTable::new();
-        assert!(table.add_group(0x0042, EP2));
-
-        let members = super::delivery_endpoints(&fx.endpoints, 0xFF, Some(0x0042), &table);
+        // 0x63 is an APS group member that is not a configured endpoint.
+        let members = super::delivery_endpoints(&fx.endpoints, 0xFF, Some(&[EP2, 0x63]));
         assert_eq!(members.as_slice(), &[EP2]);
-        let none = super::delivery_endpoints(&fx.endpoints, 0xFF, Some(0x0043), &table);
+        let none = super::delivery_endpoints(&fx.endpoints, 0xFF, Some(&[]));
         assert!(none.is_empty());
-        let all = super::delivery_endpoints(&fx.endpoints, 0xFF, None, &table);
+        let all = super::delivery_endpoints(&fx.endpoints, 0xFF, None);
         assert_eq!(all.as_slice(), &[EP, EP2]);
-        let one = super::delivery_endpoints(&fx.endpoints, EP2, None, &table);
+        let one = super::delivery_endpoints(&fx.endpoints, EP2, None);
         assert_eq!(one.as_slice(), &[EP2]);
     }
 

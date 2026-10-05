@@ -259,6 +259,57 @@ fn header_total_size_mismatch_is_rejected() {
     assert_failed_with_invalid_image(&mut mgr);
 }
 
+/// `ota_file` with a hardware-version range in the header (field control
+/// bit 2, ZCL r8 §11.4.2): the header grows to 60 bytes.
+fn ota_file_with_hardware_range(version: u32, min: u16, max: u16, body: &[u8]) -> Vec<u8> {
+    let mut f = ota_file(version, &[(0x0000, body)]);
+    let total = f.len() as u32 + 4;
+    f[6..8].copy_from_slice(&60u16.to_le_bytes());
+    f[8..10].copy_from_slice(&0x0004u16.to_le_bytes());
+    f[52..56].copy_from_slice(&total.to_le_bytes());
+    let mut range = Vec::new();
+    range.extend_from_slice(&min.to_le_bytes());
+    range.extend_from_slice(&max.to_le_bytes());
+    f.splice(56..56, range);
+    f
+}
+
+fn manager_with_hardware_version(hardware_version: u16) -> OtaManager<MockFirmwareWriter> {
+    OtaManager::new(
+        MockFirmwareWriter::new(4096),
+        OtaConfig {
+            manufacturer_code: MFG,
+            image_type: IMG,
+            current_version: CUR,
+            endpoint: 1,
+            block_size: 48,
+            auto_accept: true,
+            hardware_version: Some(hardware_version),
+        },
+    )
+}
+
+#[test]
+fn header_hardware_range_excluding_this_device_is_rejected() {
+    let mut mgr = manager_with_hardware_version(5);
+    let file = ota_file_with_hardware_range(NEW, 1, 3, &[0x55; 40]);
+    start_auto(&mut mgr, NEW, file.len() as u32);
+    assert!(matches!(
+        feed(&mut mgr, NEW, &file),
+        Some(StackEvent::OtaFailed)
+    ));
+    assert_failed_with_invalid_image(&mut mgr);
+}
+
+#[test]
+fn header_hardware_range_including_this_device_is_accepted() {
+    let mut mgr = manager_with_hardware_version(5);
+    let file = ota_file_with_hardware_range(NEW, 1, 9, &[0x66; 40]);
+    start_auto(&mut mgr, NEW, file.len() as u32);
+    feed(&mut mgr, NEW, &file);
+    assert_eq!(mgr.state(), OtaState::WaitingActivate);
+}
+
 #[test]
 fn image_without_upgrade_image_tag_fails_verification() {
     let mut mgr = manager(true);

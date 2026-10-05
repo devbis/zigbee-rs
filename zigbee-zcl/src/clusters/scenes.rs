@@ -115,6 +115,41 @@ impl SceneCapable for super::color_control::ColorControlCluster {
     }
 }
 
+/// A scene table driven with endpoint context (implemented by
+/// [`ScenesCluster`]), reachable through [`super::ClusterRole::SceneTable`].
+pub trait SceneTable {
+    /// Handle a Scenes command for an endpoint whose scene-capable clusters
+    /// are `clusters` and whose group membership is `is_member`, so Store
+    /// Scene captures and Recall Scene restores their state; see
+    /// [`ScenesCluster::handle_command_with`].
+    fn handle_endpoint_command(
+        &mut self,
+        cmd_id: CommandId,
+        payload: &[u8],
+        clusters: &mut [&mut dyn SceneCapable],
+        is_member: &dyn Fn(u16) -> bool,
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus>;
+}
+
+impl SceneTable for ScenesCluster {
+    fn handle_endpoint_command(
+        &mut self,
+        cmd_id: CommandId,
+        payload: &[u8],
+        clusters: &mut [&mut dyn SceneCapable],
+        is_member: &dyn Fn(u16) -> bool,
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+        self.handle_command_with(
+            cmd_id,
+            payload,
+            &mut SceneEndpoint {
+                clusters,
+                is_member,
+            },
+        )
+    }
+}
+
 /// [`SceneContext`] over a set of scene-capable clusters on one endpoint.
 pub struct SceneEndpoint<'a, 'b> {
     pub clusters: &'a mut [&'b mut dyn SceneCapable],
@@ -509,6 +544,10 @@ impl ScenesCluster {
 }
 
 impl Cluster for ScenesCluster {
+    fn cluster_role(&mut self) -> super::ClusterRole<'_> {
+        super::ClusterRole::SceneTable(self)
+    }
+
     fn cluster_id(&self) -> ClusterId {
         ClusterId::SCENES
     }

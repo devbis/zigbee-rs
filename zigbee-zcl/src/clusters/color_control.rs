@@ -298,6 +298,10 @@ impl ColorControlCluster {
 }
 
 impl Cluster for ColorControlCluster {
+    fn cluster_role(&mut self) -> super::ClusterRole<'_> {
+        super::ClusterRole::SceneState(self)
+    }
+
     fn cluster_id(&self) -> ClusterId {
         ClusterId::COLOR_CONTROL
     }

@@ -151,6 +151,16 @@ impl OtaSession {
             Some(_) => {}
         }
 
+        if *command_id == CMD_IMAGE_NOTIFY.0 {
+            // QueryJitter (ZCL r8 §11.13.3.4): respond only when a random
+            // value in 1..=100 does not exceed the notify's jitter. Without
+            // entropy the notify is answered, as if selected.
+            let mut random = [0u8; 1];
+            if device.mac_mut().fill_random(&mut random).is_ok() {
+                let random = (u16::from(random[0]) * 100 / 256) as u8 + 1;
+                manager.cluster_mut().set_notify_random(random);
+            }
+        }
         let status = manager.handle_incoming_with_sequence(
             *command_id,
             payload.as_slice(),
@@ -484,6 +494,47 @@ mod tests {
             sent_before + 1,
             "the query request must have been sent over the air"
         );
+    }
+
+    /// A broadcast Image Notify with QueryJitter 1 is answered by about one
+    /// client in a hundred (ZCL r8 §11.13.3.4): the session draws the
+    /// client's random value from the platform RNG.
+    #[test]
+    fn image_notify_query_jitter_uses_the_platform_rng() {
+        let mut session = OtaSession::new();
+        let mut device = joined_device();
+        let mut mgr = manager(ENDPOINT);
+        // Payload type 0 with QueryJitter 1.
+        let notify = command_event(
+            SERVER_A,
+            ENDPOINT,
+            ClusterId::OTA_UPGRADE.0,
+            CMD_IMAGE_NOTIFY.0,
+            &[0x00, 0x01],
+        );
+        let mut answered = 0;
+        for _ in 0..20 {
+            block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &notify));
+            if mgr.state() == OtaState::QuerySent {
+                answered += 1;
+                mgr.abort();
+            }
+        }
+        assert!(
+            answered <= 1,
+            "QueryJitter 1 answered {answered} of 20 notifies"
+        );
+
+        // QueryJitter 100 selects every client.
+        let notify = command_event(
+            SERVER_A,
+            ENDPOINT,
+            ClusterId::OTA_UPGRADE.0,
+            CMD_IMAGE_NOTIFY.0,
+            &[0x00, 100],
+        );
+        block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &notify));
+        assert_eq!(mgr.state(), OtaState::QuerySent);
     }
 
     #[test]

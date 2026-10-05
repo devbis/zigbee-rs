@@ -52,6 +52,8 @@ macro_rules! zigbee_device_fields {
             pending_action: None,
             #[cfg(feature = "router")]
             pending_security_indication: None,
+            #[cfg(feature = "router")]
+            fragmented_send_confirm: None,
             defer_aps_ack: false,
             trust_center_removal_pending: false,
             deferred_mgmt_leave: None,
@@ -896,7 +898,23 @@ impl EndpointBuilder {
     ///
     /// Basic and Identify use the runtime-owned instances configured by
     /// `DeviceBuilder`; other clusters must also be supplied as `ClusterRef`s.
+    ///
+    /// Without the `groups` feature the runtime has no Groups cluster → APS
+    /// group table bridge, so APS would drop every group-addressed frame
+    /// while the Groups cluster acknowledged Add Group. A Groups server is
+    /// therefore refused (not advertised, commands answer
+    /// UNSUPPORTED_CLUSTER) instead of silently never receiving groupcasts.
+    /// So is a Scenes server, which depends on the endpoint's group
+    /// membership (ZCL r8 §3.7.1) and is only given its endpoint's clusters
+    /// to store and recall with the `groups` feature.
     pub fn cluster_server(mut self, cluster_id: ClusterId) -> Self {
+        #[cfg(not(feature = "groups"))]
+        if matches!(cluster_id, ClusterId::GROUPS | ClusterId::SCENES) {
+            log::warn!(
+                "EndpointBuilder: Groups/Scenes server needs the `groups` feature; not added"
+            );
+            return self;
+        }
         if self.server_clusters.push(cluster_id).is_err() {
             log::warn!(
                 "EndpointBuilder: server cluster table full, dropping cluster 0x{:04X}",
