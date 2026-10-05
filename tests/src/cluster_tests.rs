@@ -183,9 +183,9 @@ mod groups {
             c.handle_command(CMD_ADD_GROUP, &gid_payload(i + 1))
                 .unwrap();
         }
-        // Table is full
+        // Table is full (0xFFF7 is the highest valid group ID)
         let resp = c
-            .handle_command(CMD_ADD_GROUP, &gid_payload(0xFFFF))
+            .handle_command(CMD_ADD_GROUP, &gid_payload(0xFFF7))
             .unwrap();
         assert_eq!(resp[0], ZclStatus::InsufficientSpace as u8);
     }
