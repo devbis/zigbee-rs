@@ -220,7 +220,7 @@ pub enum ReplayCounterTombstone {
 }
 
 /// Complete crash-safe state needed for secured rejoin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Eq)]
 pub struct PersistentSecurityState {
     pub commissioned: bool,
     pub extended_pan_id: IeeeAddress,
@@ -327,6 +327,23 @@ pub struct PersistentSecurityState {
     pub parent_link_provisional: bool,
 }
 
+/// Field-wise equality through the canonical record encoding.
+///
+/// [`PersistentSecurityState::encode`] stores every field in its own bytes
+/// (the only `Option`, `pending_pan_id`, as a presence flag plus a value that
+/// is zero when absent), so two states are equal exactly when their encodings
+/// are. Comparing the shared encoder output avoids a separate field-by-field
+/// comparison routine in size-constrained firmware.
+impl PartialEq for PersistentSecurityState {
+    fn eq(&self, other: &Self) -> bool {
+        let mut lhs = [0u8; ENCODED_SECURITY_STATE_LEN];
+        let mut rhs = [0u8; ENCODED_SECURITY_STATE_LEN];
+        self.encode(&mut lhs);
+        other.encode(&mut rhs);
+        lhs == rhs
+    }
+}
+
 impl PersistentSecurityState {
     pub const fn empty() -> Self {
         Self {
@@ -388,6 +405,7 @@ impl PersistentSecurityState {
         self.is_formed_network() && self.node_join_link_key_type.is_distributed()
     }
 
+    #[inline(never)]
     pub fn encode(&self, output: &mut [u8; ENCODED_SECURITY_STATE_LEN]) {
         output.fill(0);
         output[0] = (if self.commissioned {
