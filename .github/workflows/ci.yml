@@ -257,6 +257,14 @@ jobs:
           cargo fmt --manifest-path examples/phy6222-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg1-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg21-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path efr32mg1-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path efr32mg21-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path phy6222-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/efr32mg1-tradfri/Cargo.toml -- --check
+          cargo fmt --manifest-path products/efr32mg1-tradfri/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/esp32-zigbee-devkit/Cargo.toml -- --check
+          cargo fmt --manifest-path products/esp32-zigbee-devkit/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/phy62x2-evk/Cargo.toml -- --check
 
   doc:
     name: Doc

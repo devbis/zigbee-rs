@@ -284,3 +284,7 @@ jobs:
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path boards/tlsr8258-tb04/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-router/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-radio/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path tlsr8258-rt/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path products/tlsr8258-tb04/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-sensor/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path tools/telink-tlsr8258-lab/Cargo.toml -- --check
