@@ -16,6 +16,7 @@
 
 pub mod driver;
 
+use crate::frames;
 use crate::pib::{PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
@@ -27,6 +28,12 @@ use embassy_time::{Instant, Timer};
 
 /// Maximum MAC payload size (127 - MAC overhead).
 const MAX_MAC_PAYLOAD: usize = 102;
+
+/// Frames received while waiting for an ACK, held for normal RX processing.
+const PENDING_RX_CAPACITY: usize = 2;
+
+/// macAckWaitDuration upper bound used by this backend (µs).
+const ACK_WAIT_US: u64 = 1500;
 
 /// EFR32MG21 IEEE 802.15.4 MAC driver.
 ///
@@ -52,6 +59,13 @@ pub struct Efr32s2Mac {
     /// Buffer for frames received during association (e.g. Transport-Key).
     /// Returned by the next mlme_poll() call.
     pending_assoc_frame: Option<([u8; 128], usize)>,
+    /// Frames accepted by the destination filter while an ACK wait was in
+    /// progress. Drained by `mcps_data_indication_timeout` and `mlme_poll`.
+    pending_rx: heapless::Deque<driver::RxFrame, PENDING_RX_CAPACITY>,
+    /// CSMA-CA backoff PRNG state (xorshift32). Zero means "not yet seeded";
+    /// it is seeded lazily from the EUI-64 and the monotonic clock once the
+    /// time driver is running.
+    rng_state: u32,
 }
 
 impl Efr32s2Mac {
@@ -88,6 +102,8 @@ impl Efr32s2Mac {
             max_frame_retries: 3,
             promiscuous: false,
             pending_assoc_frame: None,
+            pending_rx: heapless::Deque::new(),
+            rng_state: 0,
         }
     }
 
@@ -156,20 +172,34 @@ impl Efr32s2Mac {
         }
     }
 
-    /// Simple PRNG: deterministic hash from seed byte.
-    fn prng(seed: u8) -> u32 {
-        (seed as u32).wrapping_mul(1103515245).wrapping_add(12345)
+    /// Draw a CSMA-CA backoff count in `0..2^be`.
+    ///
+    /// The xorshift32 state is device-unique (seeded from the EUI-64) and
+    /// is re-mixed with the monotonic clock on every draw, so that radio
+    /// timing jitter decorrelates nodes that would otherwise collide in
+    /// lockstep.
+    fn random_backoff(&mut self, be: u8) -> u32 {
+        let now = Instant::now().as_ticks();
+        if self.rng_state == 0 {
+            self.rng_state = csma_seed(&self.extended_address);
+        }
+        self.rng_state = xorshift32(self.rng_state ^ (now as u32) ^ ((now >> 32) as u32));
+        backoff_slots(self.rng_state, be)
     }
 
     /// Unslotted CSMA-CA + TX + ACK wait + retries.
     ///
     /// Implements IEEE 802.15.4-2011 §5.1.1.4 (unslotted CSMA-CA) with
     /// optional ACK reception and retry loop per `macMaxFrameRetries`.
+    /// Returns the ACK Frame Pending bit when an ACK was requested.
     async fn csma_ca_transmit(
         &mut self,
         frame: &[u8],
         ack_requested: bool,
-    ) -> Result<(), MacError> {
+    ) -> Result<bool, MacError> {
+        if frame.len() < 3 {
+            return Err(MacError::InvalidParameter);
+        }
         let max_retries = if ack_requested {
             self.max_frame_retries
         } else {
@@ -181,13 +211,10 @@ impl Efr32s2Mac {
         for attempt in 0..=max_retries {
             // ── Unslotted CSMA-CA ──
             let mut nb: u8 = 0;
-            let mut be = self.min_be;
+            let mut be = self.min_be.min(self.max_be);
 
             let channel_clear = loop {
-                let max_val = (1u32 << be) - 1;
-                let seed = self.dsn.wrapping_add(nb).wrapping_add(attempt);
-                let random = Self::prng(seed);
-                let backoff = (random % (max_val + 1)) as u64;
+                let backoff = self.random_backoff(be) as u64;
                 let delay_us = backoff * UNIT_BACKOFF_SYMBOLS * SYMBOL_PERIOD_US;
                 if delay_us > 0 {
                     Timer::after_micros(delay_us).await;
@@ -203,8 +230,8 @@ impl Efr32s2Mac {
                     break true;
                 }
 
-                nb += 1;
-                be = core::cmp::min(be + 1, self.max_be);
+                nb = nb.saturating_add(1);
+                be = core::cmp::min(be.saturating_add(1), self.max_be);
                 if nb > self.max_csma_backoffs {
                     break false;
                 }
@@ -224,22 +251,16 @@ impl Efr32s2Mac {
                 .map_err(Self::map_radio_err)?;
 
             if !ack_requested {
-                return Ok(());
+                return Ok(false);
             }
 
             // ── ACK wait ──
+            // Keep listening until the deadline: a foreign ACK or an
+            // unrelated frame must not end the wait. Frames addressed to us
+            // are acknowledged and queued for normal RX processing.
             let seq = frame[2];
-            let ack_result = select::select(self.driver.receive(), Timer::after_micros(1500)).await;
-
-            if let select::Either::First(Ok(rx)) = ack_result {
-                if rx.len >= 3 {
-                    let fc = u16::from_le_bytes([rx.data[0], rx.data[1]]);
-                    let frame_type = fc & 0x07;
-                    let ack_seq = rx.data[2];
-                    if frame_type == 0x02 && ack_seq == seq {
-                        return Ok(());
-                    }
-                }
+            if let Some(frame_pending) = self.wait_for_ack(seq).await {
+                return Ok(frame_pending);
             }
 
             if attempt == max_retries {
@@ -254,6 +275,81 @@ impl Efr32s2Mac {
         }
 
         Err(MacError::NoAck)
+    }
+
+    /// Wait up to `ACK_WAIT_US` for the ACK matching `seq`.
+    ///
+    /// Returns the ACK frame-pending bit on a match. Non-ACK frames that pass
+    /// the destination filter are acknowledged (when requested) and queued.
+    async fn wait_for_ack(&mut self, seq: u8) -> Option<bool> {
+        let deadline = Instant::now() + embassy_time::Duration::from_micros(ACK_WAIT_US);
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let rx = match select::select(self.driver.receive(), Timer::after(deadline - now)).await
+            {
+                select::Either::First(Ok(rx)) => rx,
+                select::Either::First(Err(_)) => continue,
+                select::Either::Second(_) => return None,
+            };
+            let data = &rx.data[..rx.len];
+            if frames::ack_info(data).is_some() {
+                if let Some(frame_pending) = matching_ack(data, seq) {
+                    return Some(frame_pending);
+                }
+                continue;
+            }
+            let disposition = self.classify(data);
+            if disposition.ack {
+                self.send_ack(data[2]).await;
+            }
+            if disposition.accept {
+                if self.pending_rx.is_full() {
+                    let _ = self.pending_rx.pop_front();
+                }
+                let _ = self.pending_rx.push_back(rx);
+            }
+        }
+    }
+
+    /// Receive the next frame, draining frames queued during ACK waits first.
+    ///
+    /// Queued frames were already acknowledged when they were captured.
+    async fn next_rx(&mut self, remaining: embassy_time::Duration) -> NextRx {
+        if let Some(rx) = self.pending_rx.pop_front() {
+            return NextRx::Frame(rx, true);
+        }
+        match select::select(self.driver.receive(), Timer::after(remaining)).await {
+            select::Either::First(Ok(rx)) => NextRx::Frame(rx, false),
+            select::Either::First(Err(_)) => NextRx::Error,
+            select::Either::Second(_) => NextRx::Timeout,
+        }
+    }
+
+    /// Hold a data frame received around association (e.g. Transport-Key)
+    /// for the next `mlme_poll()`. Returns `true` when a payload was saved.
+    fn save_assoc_frame(&mut self, data: &[u8]) -> bool {
+        let Some((_, _, frame, _)) = data_payload(data) else {
+            return false;
+        };
+        let payload = frame.as_slice();
+        let mut buf = [0u8; 128];
+        buf[..payload.len()].copy_from_slice(payload);
+        self.pending_assoc_frame = Some((buf, payload.len()));
+        log::info!("efr32s2: saved post-assoc frame ({} bytes)", payload.len());
+        true
+    }
+
+    fn classify(&self, data: &[u8]) -> RxDisposition {
+        classify_rx(
+            data,
+            self.promiscuous,
+            self.pan_id,
+            self.short_address,
+            &self.extended_address,
+        )
     }
 
     /// Send a 3-byte IEEE 802.15.4 ACK frame for the given sequence number.
@@ -288,7 +384,7 @@ impl MacDriver for Efr32s2Mac {
                 }
                 ScanType::Active => {
                     let seq = self.next_bsn();
-                    let beacon_req = build_beacon_request(seq);
+                    let beacon_req = frames::build_beacon_request(seq);
                     let _ = self.driver.transmit(&beacon_req).await;
 
                     let deadline = embassy_time::Instant::now()
@@ -303,7 +399,9 @@ impl MacDriver for Efr32s2Mac {
                             select::select(self.driver.receive(), Timer::after(remaining)).await;
 
                         if let select::Either::First(Ok(frame)) = result {
-                            if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
+                            if let Some(pd) =
+                                frames::parse_beacon(ch, &frame.data[..frame.len], frame.lqi)
+                            {
                                 let _ = pan_descriptors.push(pd);
                             }
                         } else {
@@ -324,7 +422,9 @@ impl MacDriver for Efr32s2Mac {
                             select::select(self.driver.receive(), Timer::after(remaining)).await;
 
                         if let select::Either::First(Ok(frame)) = result {
-                            if let Some(pd) = parse_beacon_frame(&frame.data[..frame.len], ch) {
+                            if let Some(pd) =
+                                frames::parse_beacon(ch, &frame.data[..frame.len], frame.lqi)
+                            {
                                 let _ = pan_descriptors.push(pd);
                             }
                         } else {
@@ -352,12 +452,9 @@ impl MacDriver for Efr32s2Mac {
         self.channel = req.channel;
         self.driver.update_config(|c| c.channel = req.channel);
 
-        let coord_pan = req.coord_address.pan_id();
-
         let seq = self.next_dsn();
-        let frame = build_association_request(
+        let frame = frames::build_association_request(
             seq,
-            coord_pan,
             &req.coord_address,
             &self.extended_address,
             &req.capability_info,
@@ -374,7 +471,7 @@ impl MacDriver for Efr32s2Mac {
                 Timer::after(embassy_time::Duration::from_millis(500)).await;
             }
 
-            let data_req = build_data_request_ieee(
+            let data_req = frames::build_data_request(
                 self.next_dsn(),
                 &req.coord_address,
                 &self.extended_address,
@@ -388,60 +485,44 @@ impl MacDriver for Efr32s2Mac {
                 if now >= deadline {
                     break;
                 }
-                let remaining = deadline - now;
+                let (rx, acked) = match self.next_rx(deadline - now).await {
+                    NextRx::Timeout => break,
+                    NextRx::Error => continue,
+                    NextRx::Frame(rx, acked) => (rx, acked),
+                };
+                let data = &rx.data[..rx.len];
+                let disposition = self.classify(data);
+                if !disposition.accept {
+                    continue;
+                }
+                if disposition.ack && !acked {
+                    self.send_ack(data[2]).await;
+                }
 
-                let result = select::select(self.driver.receive(), Timer::after(remaining)).await;
-
-                match result {
-                    select::Either::Second(_) => break,
-                    select::Either::First(Err(_)) => continue,
-                    select::Either::First(Ok(rx)) => {
-                        let data = &rx.data[..rx.len];
-                        if data.len() < 3 {
-                            continue;
-                        }
-                        let fc = u16::from_le_bytes([data[0], data[1]]);
-                        let frame_type = fc & 0x07;
-
-                        if frame_type == 0x02 {
-                            continue;
-                        }
-
-                        if (fc >> 5) & 1 != 0 {
-                            self.send_ack(data[2]).await;
-                        }
-
-                        if frame_type == 0x03 {
-                            if let Some((addr, status_byte)) = parse_association_response(data) {
-                                let status = match status_byte {
-                                    0x00 => AssociationStatus::Success,
-                                    0x01 => AssociationStatus::PanAtCapacity,
-                                    _ => AssociationStatus::PanAccessDenied,
-                                };
-                                if status_byte == 0 {
-                                    self.short_address = addr;
-                                    self.driver.update_config(|c| c.short_address = addr.0);
-                                }
-                                confirm = Some(MlmeAssociateConfirm {
-                                    short_address: addr,
-                                    status,
-                                });
-                                break;
+                match data[0] & 0x07 {
+                    0x03 => {
+                        if let Some((addr, status_byte)) = frames::parse_association_response(data)
+                        {
+                            let status = match status_byte {
+                                0x00 => AssociationStatus::Success,
+                                0x01 => AssociationStatus::PanAtCapacity,
+                                _ => AssociationStatus::PanAccessDenied,
+                            };
+                            if status_byte == 0 {
+                                self.short_address = addr;
+                                self.driver.update_config(|c| c.short_address = addr.0);
                             }
-                        }
-
-                        if frame_type == 0x01 && self.pending_assoc_frame.is_none() {
-                            let (_, _, payload_offset, _) = parse_mac_addresses(data);
-                            if data.len() > payload_offset {
-                                let payload = &data[payload_offset..];
-                                let mut buf = [0u8; 128];
-                                let copy_len = payload.len().min(128);
-                                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                                self.pending_assoc_frame = Some((buf, copy_len));
-                                log::info!("efr32s2: saved post-assoc frame ({} bytes)", copy_len);
-                            }
+                            confirm = Some(MlmeAssociateConfirm {
+                                short_address: addr,
+                                status,
+                            });
+                            break;
                         }
                     }
+                    0x01 if self.pending_assoc_frame.is_none() => {
+                        self.save_assoc_frame(data);
+                    }
+                    _ => {}
                 }
             }
 
@@ -458,30 +539,20 @@ impl MacDriver for Efr32s2Mac {
                 if now >= deadline {
                     break;
                 }
-                let remaining = deadline - now;
-                let result = select::select(self.driver.receive(), Timer::after(remaining)).await;
-                if let select::Either::First(Ok(rx)) = result {
-                    let data = &rx.data[..rx.len];
-                    if data.len() >= 3 {
-                        let fc = u16::from_le_bytes([data[0], data[1]]);
-                        if (fc >> 5) & 1 != 0 {
-                            self.send_ack(data[2]).await;
-                        }
-                        let frame_type = fc & 0x07;
-                        if frame_type == 0x01 {
-                            let (_, _, payload_offset, _) = parse_mac_addresses(data);
-                            if data.len() > payload_offset {
-                                let payload = &data[payload_offset..];
-                                let mut buf = [0u8; 128];
-                                let copy_len = payload.len().min(128);
-                                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                                self.pending_assoc_frame = Some((buf, copy_len));
-                                log::info!("efr32s2: saved post-assoc frame ({} bytes)", copy_len);
-                                break;
-                            }
-                        }
-                    }
-                } else {
+                let (rx, acked) = match self.next_rx(deadline - now).await {
+                    NextRx::Timeout => break,
+                    NextRx::Error => continue,
+                    NextRx::Frame(rx, acked) => (rx, acked),
+                };
+                let data = &rx.data[..rx.len];
+                let disposition = self.classify(data);
+                if !disposition.accept {
+                    continue;
+                }
+                if disposition.ack && !acked {
+                    self.send_ack(data[2]).await;
+                }
+                if data[0] & 0x07 == 0x01 && self.save_assoc_frame(data) {
                     break;
                 }
             }
@@ -630,103 +701,78 @@ impl MacDriver for Efr32s2Mac {
             return Ok(MacFrame::from_slice(&buf[..len]));
         }
 
+        // Frames captured during earlier ACK waits are delivered first.
+        while let Some(rx) = self.pending_rx.pop_front() {
+            if let Some((_, _, frame, _)) = data_payload(&rx.data[..rx.len]) {
+                return Ok(Some(frame));
+            }
+        }
+
         let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
         let has_short = self.short_address.0 != 0xFFFF && self.short_address.0 != 0xFFFE;
 
         let passes: u8 = if has_short { 2 } else { 1 };
 
+        // An ACKed-but-empty poll is `Ok(None)`; a poll whose Data Requests
+        // all went unacknowledged surfaces the last error so the runtime can
+        // drive parent-loss recovery.
+        let mut any_ack = false;
+        let mut last_err: Option<MacError> = None;
+
         for pass in 0..passes {
             let data_req = if pass == 0 && has_short {
-                build_data_request(self.next_dsn(), self.pan_id, self.coord_short_address)
-                    .as_slice()
-                    .iter()
-                    .copied()
-                    .collect::<heapless::Vec<u8, 24>>()
+                frames::build_data_request_short(self.next_dsn(), &parent, self.short_address)
             } else {
-                build_data_request_ieee(self.next_dsn(), &parent, &self.extended_address)
+                frames::build_data_request(self.next_dsn(), &parent, &self.extended_address)
             };
 
-            if self.csma_ca_transmit(&data_req, true).await.is_err() {
-                continue;
+            // csma_ca_transmit only accepts the ACK whose sequence number
+            // matches this Data Request and reports its frame-pending bit.
+            let frame_pending = match self.csma_ca_transmit(&data_req, true).await {
+                Ok(frame_pending) => {
+                    any_ack = true;
+                    frame_pending
+                }
+                Err(error) => {
+                    last_err = Some(error);
+                    continue;
+                }
+            };
+            if !frame_pending {
+                return Ok(None);
             }
 
             let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(1500);
 
-            let mut got_none = false;
             for _rx_attempt in 0..40u8 {
                 let now = embassy_time::Instant::now();
                 if now >= deadline {
                     break;
                 }
-                let remaining = deadline - now;
-
-                let rx_result =
-                    select::select(self.driver.receive(), Timer::after(remaining)).await;
-
-                match rx_result {
-                    select::Either::Second(_) => break,
-                    select::Either::First(Err(_)) => continue,
-                    select::Either::First(Ok(rx)) => {
-                        let data = &rx.data[..rx.len];
-                        if data.len() < 3 {
-                            continue;
-                        }
-                        let fc = u16::from_le_bytes([data[0], data[1]]);
-                        let frame_type = fc & 0x07;
-
-                        if frame_type == 0x02 {
-                            let frame_pending = (data[0] >> 4) & 1 != 0;
-                            if !frame_pending {
-                                got_none = true;
-                                break;
-                            }
-                            continue;
-                        }
-
-                        if frame_type != 0x01 {
-                            continue;
-                        }
-
-                        let (_src, dst, payload_offset, _security_use) = parse_mac_addresses(data);
-                        match &dst {
-                            MacAddress::Short(_, d) => {
-                                let for_us = d.0 == self.short_address.0
-                                    || d.0 == 0xFFFF
-                                    || d.0 == 0xFFFD
-                                    || d.0 == 0xFFFC;
-                                if !for_us {
-                                    continue;
-                                }
-                            }
-                            MacAddress::Extended(_, e) => {
-                                if *e != self.extended_address {
-                                    continue;
-                                }
-                            }
-                        }
-
-                        if (fc >> 5) & 1 != 0 {
-                            self.send_ack(data[2]).await;
-                        }
-
-                        if data.len() <= payload_offset {
-                            continue;
-                        }
-
-                        let mac_frame = MacFrame::from_slice(&data[payload_offset..])
-                            .unwrap_or_else(MacFrame::new);
-
-                        return Ok(Some(mac_frame));
-                    }
+                let (rx, acked) = match self.next_rx(deadline - now).await {
+                    NextRx::Timeout => break,
+                    NextRx::Error => continue,
+                    NextRx::Frame(rx, acked) => (rx, acked),
+                };
+                let data = &rx.data[..rx.len];
+                let disposition = self.classify(data);
+                if !disposition.accept {
+                    continue;
                 }
-            }
-
-            if got_none {
-                return Ok(None);
+                if disposition.ack && !acked {
+                    self.send_ack(data[2]).await;
+                }
+                if let Some((_, _, frame, _)) = data_payload(data) {
+                    return Ok(Some(frame));
+                }
             }
         }
 
-        Ok(None)
+        if any_ack {
+            Ok(None)
+        } else {
+            Err(last_err.unwrap_or(MacError::NoAck))
+        }
     }
 
     async fn mcps_data(&mut self, req: McpsDataRequest<'_>) -> Result<McpsDataConfirm, MacError> {
@@ -738,15 +784,17 @@ impl MacDriver for Efr32s2Mac {
         let ack_requested = req.tx_options.ack_tx;
 
         let seq = self.next_dsn();
-        let mac_frame = build_data_frame(
+        let mac_frame = frames::build_data_frame(
             seq,
-            self.pan_id,
-            &req.dst_address,
+            req.src_addr_mode,
             self.short_address,
+            &self.extended_address,
+            &req.dst_address,
             req.payload,
             ack_requested,
             req.tx_options.frame_pending,
-        );
+        )
+        .map_err(|_| MacError::FrameTooLong)?;
 
         self.csma_ca_transmit(&mac_frame, ack_requested).await?;
 
@@ -769,87 +817,37 @@ impl MacDriver for Efr32s2Mac {
 
         loop {
             let now = embassy_time::Instant::now();
-            if now >= deadline {
+            if now >= deadline && self.pending_rx.is_empty() {
                 return Err(MacError::NoData);
             }
-            let remaining = deadline - now;
-
-            let rx_result = select::select(self.driver.receive(), Timer::after(remaining)).await;
-
-            match rx_result {
-                select::Either::Second(_) => {
-                    return Err(MacError::NoData);
-                }
-                select::Either::First(Err(_)) => {
-                    continue;
-                }
-                select::Either::First(Ok(rx)) => {
-                    let data = &rx.data[..rx.len];
-
-                    if data.len() < 5 {
-                        continue;
-                    }
-
-                    let fc = u16::from_le_bytes([data[0], data[1]]);
-                    let frame_type = fc & 0x07;
-
-                    if frame_type != 1 {
-                        continue;
-                    }
-
-                    if (fc >> 5) & 1 != 0 {
-                        self.send_ack(data[2]).await;
-                    }
-
-                    let (src_address, dst_address, payload_offset, security_use) =
-                        parse_mac_addresses(data);
-
-                    if !self.promiscuous {
-                        match &dst_address {
-                            MacAddress::Short(pan, addr) => {
-                                let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
-                                let addr_ok = addr.0 == self.short_address.0
-                                    || addr.0 == 0xFFFF
-                                    || addr.0 == 0xFFFD
-                                    || addr.0 == 0xFFFC;
-                                if !pan_ok || !addr_ok {
-                                    log::trace!(
-                                        "efr32s2: filtered short dst pan=0x{:04X} addr=0x{:04X}",
-                                        pan.0,
-                                        addr.0
-                                    );
-                                    continue;
-                                }
-                            }
-                            MacAddress::Extended(pan, addr) => {
-                                let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
-                                let addr_ok = *addr == self.extended_address;
-                                if !pan_ok || !addr_ok {
-                                    log::trace!("efr32s2: filtered ext dst pan=0x{:04X}", pan.0,);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-
-                    if data.len() <= payload_offset {
-                        continue;
-                    }
-
-                    let mac_frame =
-                        MacFrame::from_slice(&data[payload_offset..]).unwrap_or_else(MacFrame::new);
-
-                    log::trace!("efr32s2: rx {} bytes lqi={}", rx.len, rx.lqi);
-
-                    return Ok(McpsDataIndication {
-                        src_address,
-                        dst_address,
-                        lqi: rx.lqi,
-                        payload: mac_frame,
-                        security_use,
-                    });
-                }
+            let (rx, acked) = match self.next_rx(deadline.saturating_duration_since(now)).await {
+                NextRx::Timeout => return Err(MacError::NoData),
+                NextRx::Error => continue,
+                NextRx::Frame(rx, acked) => (rx, acked),
+            };
+            let data = &rx.data[..rx.len];
+            let disposition = self.classify(data);
+            if !disposition.accept {
+                continue;
             }
+            // Acknowledge only after the destination filter accepted the
+            // frame; broadcasts and frames for other nodes are never ACKed.
+            if disposition.ack && !acked {
+                self.send_ack(data[2]).await;
+            }
+            let Some((src_address, dst_address, payload, security_use)) = data_payload(data) else {
+                continue;
+            };
+
+            log::trace!("efr32s2: rx {} bytes lqi={}", rx.len, rx.lqi);
+
+            return Ok(McpsDataIndication {
+                src_address,
+                dst_address,
+                lqi: rx.lqi,
+                payload,
+                security_use,
+            });
         }
     }
 
@@ -873,312 +871,322 @@ impl PlatformServices for Efr32s2Mac {
     }
 }
 
-// ── Frame builders ──────────────────────────────────────────────
+// ── RX helpers ──────────────────────────────────────────────────
 
-fn build_beacon_request(seq: u8) -> [u8; 8] {
-    let fc: u16 = 0x0803;
-    [fc as u8, (fc >> 8) as u8, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07]
+/// Result of [`Efr32s2Mac::next_rx`].
+enum NextRx {
+    /// A frame and whether it was already acknowledged when it was queued.
+    Frame(driver::RxFrame, bool),
+    /// The radio reported a receive error (e.g. CRC failure).
+    Error,
+    /// The receive window expired.
+    Timeout,
 }
 
-fn build_association_request(
-    seq: u8,
-    coord_pan: PanId,
-    coord_addr: &MacAddress,
-    ext_addr: &IeeeAddress,
-    cap: &CapabilityInfo,
-) -> heapless::Vec<u8, 32> {
-    let mut frame = heapless::Vec::new();
-
-    let fc: u16 = 0xC823;
-    let _ = frame.push(fc as u8);
-    let _ = frame.push((fc >> 8) as u8);
-    let _ = frame.push(seq);
-
-    let _ = frame.push(coord_pan.0 as u8);
-    let _ = frame.push((coord_pan.0 >> 8) as u8);
-    match coord_addr {
-        MacAddress::Short(_, a) => {
-            let _ = frame.push(a.0 as u8);
-            let _ = frame.push((a.0 >> 8) as u8);
-        }
-        MacAddress::Extended(_, ext) => {
-            for b in ext {
-                let _ = frame.push(*b);
-            }
-        }
-    }
-
-    for b in ext_addr {
-        let _ = frame.push(*b);
-    }
-
-    let _ = frame.push(0x01); // Association Request command ID
-    let _ = frame.push(cap.to_byte());
-
-    frame
-}
-
-fn build_data_request(seq: u8, pan_id: PanId, coord: ShortAddress) -> [u8; 10] {
-    let fc: u16 = 0x8863;
-    [
-        fc as u8,
-        (fc >> 8) as u8,
-        seq,
-        pan_id.0 as u8,
-        (pan_id.0 >> 8) as u8,
-        coord.0 as u8,
-        (coord.0 >> 8) as u8,
-        0xFF,
-        0xFF,
-        0x04,
-    ]
-}
-
-fn build_data_request_ieee(
-    seq: u8,
-    coord: &MacAddress,
-    own_ieee: &IeeeAddress,
-) -> heapless::Vec<u8, 24> {
-    let mut frame: heapless::Vec<u8, 24> = heapless::Vec::new();
-    let fc: u16 = 0xCC63;
-    let _ = frame.push(fc as u8);
-    let _ = frame.push((fc >> 8) as u8);
-    let _ = frame.push(seq);
-    match coord {
-        MacAddress::Short(pan, addr) => {
-            let _ = frame.push(pan.0 as u8);
-            let _ = frame.push((pan.0 >> 8) as u8);
-            let _ = frame.push(addr.0 as u8);
-            let _ = frame.push((addr.0 >> 8) as u8);
-        }
-        MacAddress::Extended(pan, ext) => {
-            let _ = frame.push(pan.0 as u8);
-            let _ = frame.push((pan.0 >> 8) as u8);
-            for b in ext {
-                let _ = frame.push(*b);
-            }
-        }
-    }
-    for b in own_ieee {
-        let _ = frame.push(*b);
-    }
-    let _ = frame.push(0x04);
-    frame
-}
-
-fn build_data_frame(
-    seq: u8,
-    pan_id: PanId,
-    dst: &MacAddress,
-    src_short: ShortAddress,
-    payload: &[u8],
+/// Destination-filter decision for a received frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RxDisposition {
+    /// Hand the frame to the MAC/NWK receive path.
+    accept: bool,
+    /// Transmit a software ACK. Only set for unicast frames addressed to this
+    /// node with the ACK Request bit, so the MAC never acknowledges frames
+    /// meant for other nodes or broadcasts.
     ack: bool,
-    frame_pending: bool,
-) -> heapless::Vec<u8, 127> {
-    let mut frame: heapless::Vec<u8, 127> = heapless::Vec::new();
-
-    let mut fc: u16 = 0x8861; // data + dst short + src short + PAN compress
-    if frame_pending {
-        fc |= 0x0010;
-    }
-    if ack {
-        fc |= 0x0020;
-    }
-    let _ = frame.push(fc as u8);
-    let _ = frame.push((fc >> 8) as u8);
-    let _ = frame.push(seq);
-
-    let _ = frame.push(pan_id.0 as u8);
-    let _ = frame.push((pan_id.0 >> 8) as u8);
-    match dst {
-        MacAddress::Short(_, a) => {
-            let _ = frame.push(a.0 as u8);
-            let _ = frame.push((a.0 >> 8) as u8);
-        }
-        MacAddress::Extended(_, ext) => {
-            for b in ext {
-                let _ = frame.push(*b);
-            }
-        }
-    }
-
-    let _ = frame.push(src_short.0 as u8);
-    let _ = frame.push((src_short.0 >> 8) as u8);
-
-    for &b in payload {
-        let _ = frame.push(b);
-    }
-
-    frame
 }
 
-fn parse_beacon_frame(data: &[u8], channel: u8) -> Option<PanDescriptor> {
-    if data.len() < 9 {
-        return None;
-    }
-    let fc = u16::from_le_bytes([data[0], data[1]]);
-    if fc & 0x07 != 0x00 {
-        return None;
-    }
-
-    let src_pan = u16::from_le_bytes([data[3], data[4]]);
-    let coord_addr = u16::from_le_bytes([data[5], data[6]]);
-
-    let superframe_raw = if data.len() > 8 {
-        u16::from_le_bytes([data[7], data[8]])
-    } else {
-        0
+/// Third-level IEEE 802.15.4 filtering for a received (non-ACK) frame.
+///
+/// Frames shorter than their addressing fields, ACK frames, and frames
+/// without a destination address (only meaningful to a PAN coordinator,
+/// which this backend never is) are rejected unless promiscuous.
+fn classify_rx(
+    data: &[u8],
+    promiscuous: bool,
+    our_pan: PanId,
+    our_short: ShortAddress,
+    our_extended: &IeeeAddress,
+) -> RxDisposition {
+    const REJECT: RxDisposition = RxDisposition {
+        accept: false,
+        ack: false,
     };
-
-    let zigbee_beacon = if data.len() >= 22 {
-        let offset = 9;
-        ZigbeeBeaconPayload {
-            protocol_id: data[offset],
-            stack_profile: data[offset + 1] & 0x0F,
-            protocol_version: (data[offset + 1] >> 4) & 0x0F,
-            router_capacity: data[offset + 2] & 0x04 != 0,
-            device_depth: (data[offset + 2] >> 3) & 0x0F,
-            end_device_capacity: data[offset + 2] & 0x80 != 0,
-            extended_pan_id: {
-                let mut epid = [0u8; 8];
-                epid.copy_from_slice(&data[offset + 3..offset + 11]);
-                epid
-            },
-            tx_offset: [data[offset + 11], data[offset + 12], data[offset + 13]],
-            update_id: if data.len() > offset + 14 {
-                data[offset + 14]
-            } else {
-                0
-            },
-        }
-    } else {
-        ZigbeeBeaconPayload {
-            protocol_id: 0,
-            stack_profile: 2,
-            protocol_version: 2,
-            router_capacity: true,
-            device_depth: 0,
-            end_device_capacity: true,
-            extended_pan_id: [0u8; 8],
-            tx_offset: [0xFF, 0xFF, 0xFF],
-            update_id: 0,
-        }
-    };
-
-    Some(PanDescriptor {
-        coord_address: MacAddress::Short(PanId(src_pan), ShortAddress(coord_addr)),
-        channel,
-        superframe_spec: SuperframeSpec::from_raw(superframe_raw),
-        lqi: 0xFF,
-        security_use: false,
-        zigbee_beacon,
-    })
-}
-
-fn parse_mac_addresses(data: &[u8]) -> (MacAddress, MacAddress, usize, bool) {
-    let default_addr = MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF));
     if data.len() < 3 {
-        return (default_addr, default_addr, 0, false);
+        return REJECT;
     }
-
     let fc = u16::from_le_bytes([data[0], data[1]]);
-    let security = (fc >> 3) & 1 != 0;
-    let pan_compress = (fc >> 6) & 1 != 0;
-    let dst_mode = (fc >> 10) & 0x03;
-    let src_mode = (fc >> 14) & 0x03;
-
-    let mut offset = 3;
-
-    let dst_pan = if dst_mode > 0 && offset + 2 <= data.len() {
-        let p = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        offset += 2;
-        PanId(p)
-    } else {
-        PanId(0xFFFF)
-    };
-
-    let dst_address = match dst_mode {
-        2 if offset + 2 <= data.len() => {
-            let a = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            offset += 2;
-            MacAddress::Short(dst_pan, ShortAddress(a))
+    if fc & 0x07 == 0x02 || data.len() < 3 + frames::addressing_size(fc) {
+        return REJECT;
+    }
+    let dst = match (fc >> 10) & 0x03 {
+        0x02 | 0x03 => frames::parse_mac_addresses(data).1,
+        _ => {
+            return RxDisposition {
+                accept: promiscuous,
+                ack: false,
+            };
         }
-        3 if offset + 8 <= data.len() => {
-            let mut ext = [0u8; 8];
-            ext.copy_from_slice(&data[offset..offset + 8]);
-            offset += 8;
-            MacAddress::Extended(dst_pan, ext)
-        }
-        _ => default_addr,
     };
-
-    let src_pan = if src_mode > 0 && !pan_compress && offset + 2 <= data.len() {
-        let p = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        offset += 2;
-        PanId(p)
-    } else {
-        dst_pan
-    };
-
-    let src_address = match src_mode {
-        2 if offset + 2 <= data.len() => {
-            let a = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            offset += 2;
-            MacAddress::Short(src_pan, ShortAddress(a))
-        }
-        3 if offset + 8 <= data.len() => {
-            let mut ext = [0u8; 8];
-            ext.copy_from_slice(&data[offset..offset + 8]);
-            offset += 8;
-            MacAddress::Extended(src_pan, ext)
-        }
-        _ => MacAddress::Short(src_pan, ShortAddress(0xFFFF)),
-    };
-
-    (src_address, dst_address, offset, security)
+    let for_us = frames::frame_is_for_us(&dst, our_pan, our_short, our_extended);
+    let unicast = !matches!(dst, MacAddress::Short(_, ShortAddress(0xFFFF)));
+    RxDisposition {
+        accept: promiscuous || for_us,
+        ack: for_us && unicast && fc & (1 << 5) != 0,
+    }
 }
 
-fn parse_association_response(data: &[u8]) -> Option<(ShortAddress, u8)> {
-    if data.len() < 5 {
+/// Frame-pending bit of an ACK whose sequence number matches `seq`.
+///
+/// ACKs carry no addresses; the sequence number is the only way to tell our
+/// acknowledgement from one exchanged by other nodes on the channel.
+fn matching_ack(data: &[u8], seq: u8) -> Option<bool> {
+    frames::ack_info(data)
+        .filter(|(ack_seq, _)| *ack_seq == seq)
+        .map(|(_, frame_pending)| frame_pending)
+}
+
+/// Extract addresses and payload from a MAC data frame.
+fn data_payload(data: &[u8]) -> Option<(MacAddress, MacAddress, MacFrame, bool)> {
+    if data.len() < 3 || data[0] & 0x07 != 0x01 {
         return None;
     }
-    let fc = u16::from_le_bytes([data[0], data[1]]);
-    if fc & 0x07 != 0x03 {
-        return None;
+    let (src, dst, payload_offset, security_use) = frames::parse_mac_addresses(data);
+    let payload = data.get(payload_offset..).filter(|p| !p.is_empty())?;
+    Some((src, dst, MacFrame::from_slice(payload)?, security_use))
+}
+
+// ── CSMA-CA randomness ──────────────────────────────────────────
+
+/// Device-unique non-zero xorshift32 seed derived from the EUI-64.
+fn csma_seed(eui64: &IeeeAddress) -> u32 {
+    let seed = u32::from_le_bytes([eui64[0], eui64[1], eui64[2], eui64[3]])
+        ^ u32::from_le_bytes([eui64[4], eui64[5], eui64[6], eui64[7]]).rotate_left(16)
+        ^ 0x9E37_79B9;
+    seed.max(1)
+}
+
+fn xorshift32(mut value: u32) -> u32 {
+    if value == 0 {
+        value = 0x9E37_79B9;
+    }
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    value
+}
+
+/// Map a random word onto `0..2^be` backoff periods (macMaxBE ≤ 8).
+fn backoff_slots(random: u32, be: u8) -> u32 {
+    random & ((1u32 << be.min(8)) - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OUR_PAN: PanId = PanId(0x1A62);
+    const OUR_SHORT: ShortAddress = ShortAddress(0x3344);
+    const OUR_EXT: IeeeAddress = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    const OTHER_EXT: IeeeAddress = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
+
+    fn data_frame(dst: MacAddress, ack: bool) -> heapless::Vec<u8, 125> {
+        frames::build_data_frame(
+            7,
+            AddressMode::Short,
+            ShortAddress(0x0000),
+            &OTHER_EXT,
+            &dst,
+            &[0xAA, 0xBB],
+            ack,
+            false,
+        )
+        .unwrap()
     }
 
-    let dst_mode = (fc >> 10) & 0x03;
-    let src_mode = (fc >> 14) & 0x03;
-    let pan_compress = (fc >> 6) & 0x01;
-
-    let mut offset = 3;
-    if dst_mode > 0 {
-        offset += 2;
-    }
-    match dst_mode {
-        2 => offset += 2,
-        3 => offset += 8,
-        _ => {}
-    }
-    if src_mode > 0 && pan_compress == 0 {
-        offset += 2;
-    }
-    match src_mode {
-        2 => offset += 2,
-        3 => offset += 8,
-        _ => {}
+    fn classify(data: &[u8]) -> RxDisposition {
+        classify_rx(data, false, OUR_PAN, OUR_SHORT, &OUR_EXT)
     }
 
-    if offset + 3 > data.len() {
-        return None;
+    #[test]
+    fn acks_only_unicast_frames_addressed_to_us() {
+        let ours = data_frame(MacAddress::Short(OUR_PAN, OUR_SHORT), true);
+        assert_eq!(
+            classify(&ours),
+            RxDisposition {
+                accept: true,
+                ack: true
+            }
+        );
+
+        let ours_no_ar = data_frame(MacAddress::Short(OUR_PAN, OUR_SHORT), false);
+        assert_eq!(
+            classify(&ours_no_ar),
+            RxDisposition {
+                accept: true,
+                ack: false
+            }
+        );
+
+        let other_node = data_frame(MacAddress::Short(OUR_PAN, ShortAddress(0x0001)), true);
+        assert_eq!(
+            classify(&other_node),
+            RxDisposition {
+                accept: false,
+                ack: false
+            }
+        );
+
+        let other_pan = data_frame(MacAddress::Short(PanId(0x2222), OUR_SHORT), true);
+        assert!(!classify(&other_pan).accept);
+        assert!(!classify(&other_pan).ack);
+
+        let other_ext = data_frame(MacAddress::Extended(OUR_PAN, OTHER_EXT), true);
+        assert!(!classify(&other_ext).ack);
     }
 
-    if data[offset] != 0x02 {
-        return None;
+    #[test]
+    fn never_acks_broadcasts_or_nwk_broadcast_values() {
+        // A malformed broadcast with AR set must still not be acknowledged.
+        let broadcast = data_frame(MacAddress::Short(OUR_PAN, ShortAddress(0xFFFF)), true);
+        assert_eq!(
+            classify(&broadcast),
+            RxDisposition {
+                accept: true,
+                ack: false
+            }
+        );
+        // 0xFFFD/0xFFFC are NWK broadcast values, never MAC destinations.
+        for nwk_bcast in [0xFFFD, 0xFFFC] {
+            let frame = data_frame(MacAddress::Short(OUR_PAN, ShortAddress(nwk_bcast)), true);
+            assert!(!classify(&frame).accept);
+            assert!(!classify(&frame).ack);
+        }
     }
 
-    let short = u16::from_le_bytes([data[offset + 1], data[offset + 2]]);
-    let status = data[offset + 3];
+    #[test]
+    fn association_response_to_our_ieee_is_acked_while_unassociated() {
+        // Unassociated: PAN and short address still 0xFFFF.
+        let mut rsp = heapless::Vec::<u8, 32>::new();
+        rsp.extend_from_slice(&[0x63, 0xCC, 0x05, 0x62, 0x1A])
+            .unwrap();
+        rsp.extend_from_slice(&OUR_EXT).unwrap();
+        rsp.extend_from_slice(&OTHER_EXT).unwrap();
+        rsp.extend_from_slice(&[0x02, 0x44, 0x33, 0x00]).unwrap();
+        let d = classify_rx(&rsp, false, PanId(0xFFFF), ShortAddress(0xFFFF), &OUR_EXT);
+        assert_eq!(
+            d,
+            RxDisposition {
+                accept: true,
+                ack: true
+            }
+        );
+        assert_eq!(
+            frames::parse_association_response(&rsp),
+            Some((OUR_SHORT, 0x00))
+        );
 
-    Some((ShortAddress(short), status))
+        // The same response for another joiner is neither accepted nor ACKed.
+        let d = classify_rx(&rsp, false, PanId(0xFFFF), ShortAddress(0xFFFF), &OTHER_EXT);
+        assert!(!d.accept && !d.ack);
+    }
+
+    #[test]
+    fn truncated_association_response_is_rejected_without_panic() {
+        // dst ext + src ext + PAN compression: command id at offset 21.
+        let mut rsp = heapless::Vec::<u8, 32>::new();
+        rsp.extend_from_slice(&[0x63, 0xCC, 0x05, 0x62, 0x1A])
+            .unwrap();
+        rsp.extend_from_slice(&OUR_EXT).unwrap();
+        rsp.extend_from_slice(&OTHER_EXT).unwrap();
+        rsp.extend_from_slice(&[0x02, 0x44, 0x33]).unwrap(); // status byte missing
+        for len in 0..=rsp.len() {
+            assert_eq!(frames::parse_association_response(&rsp[..len]), None);
+            let _ = classify(&rsp[..len]);
+            let _ = data_payload(&rsp[..len]);
+        }
+    }
+
+    #[test]
+    fn rejects_acks_truncated_and_destinationless_frames() {
+        assert!(!classify(&[0x02, 0x00, 0x07]).accept);
+        // FCF claims a short destination but the address bytes are missing.
+        assert!(!classify(&[0x61, 0x88, 0x07, 0x62]).accept);
+        // No destination address (only meaningful to a PAN coordinator).
+        let no_dst = [0x41, 0x80, 0x07, 0x62, 0x1A, 0x00, 0x00, 0xAA];
+        assert!(!classify(&no_dst).accept);
+        assert!(classify_rx(&no_dst, true, OUR_PAN, OUR_SHORT, &OUR_EXT).accept);
+        assert!(!classify_rx(&no_dst, true, OUR_PAN, OUR_SHORT, &OUR_EXT).ack);
+    }
+
+    #[test]
+    fn promiscuous_accepts_foreign_frames_but_never_acks_them() {
+        let other_node = data_frame(MacAddress::Short(OUR_PAN, ShortAddress(0x0001)), true);
+        let d = classify_rx(&other_node, true, OUR_PAN, OUR_SHORT, &OUR_EXT);
+        assert!(d.accept);
+        assert!(!d.ack);
+    }
+
+    #[test]
+    fn ack_must_match_data_request_sequence() {
+        assert_eq!(matching_ack(&[0x12, 0x00, 0x42], 0x42), Some(true));
+        assert_eq!(matching_ack(&[0x02, 0x00, 0x42], 0x42), Some(false));
+        assert_eq!(matching_ack(&[0x02, 0x00, 0x41], 0x42), None);
+        assert_eq!(matching_ack(&[0x12, 0x00, 0x41], 0x42), None);
+        assert_eq!(matching_ack(&[0x41, 0x88, 0x42], 0x42), None);
+        assert_eq!(matching_ack(&[0x02, 0x00], 0x42), None);
+    }
+
+    #[test]
+    fn data_frames_use_destination_address_mode() {
+        let short = data_frame(MacAddress::Short(OUR_PAN, ShortAddress(0x0000)), true);
+        assert_eq!(u16::from_le_bytes([short[0], short[1]]), 0x8861);
+        assert_eq!(short.len(), 3 + 2 + 2 + 2 + 2);
+
+        let ext = data_frame(MacAddress::Extended(OUR_PAN, OTHER_EXT), true);
+        assert_eq!(u16::from_le_bytes([ext[0], ext[1]]), 0x8C61);
+        assert_eq!(ext.len(), 3 + 2 + 8 + 2 + 2);
+        let (src, dst, offset, _) = frames::parse_mac_addresses(&ext);
+        assert_eq!(dst, MacAddress::Extended(OUR_PAN, OTHER_EXT));
+        assert_eq!(src, MacAddress::Short(OUR_PAN, ShortAddress(0x0000)));
+        assert_eq!(&ext[offset..], &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn data_requests_match_coordinator_address_mode() {
+        let short_coord = MacAddress::Short(OUR_PAN, ShortAddress(0x0000));
+        let ieee_src = frames::build_data_request(9, &short_coord, &OUR_EXT);
+        assert_eq!(u16::from_le_bytes([ieee_src[0], ieee_src[1]]), 0xC863);
+        assert_eq!(ieee_src.len(), 3 + 2 + 2 + 8 + 1);
+        let (src, dst, offset, _) = frames::parse_mac_addresses(&ieee_src);
+        assert_eq!(dst, short_coord);
+        assert_eq!(src, MacAddress::Extended(OUR_PAN, OUR_EXT));
+        assert_eq!(&ieee_src[offset..], &[0x04]);
+
+        let short_src = frames::build_data_request_short(9, &short_coord, OUR_SHORT);
+        let (src, _, offset, _) = frames::parse_mac_addresses(&short_src);
+        assert_eq!(src, MacAddress::Short(OUR_PAN, OUR_SHORT));
+        assert_eq!(&short_src[offset..], &[0x04]);
+    }
+
+    #[test]
+    fn csma_backoff_is_device_unique_and_bounded() {
+        let a = csma_seed(&OUR_EXT);
+        let b = csma_seed(&OTHER_EXT);
+        assert_ne!(a, b);
+        assert_ne!(csma_seed(&[0; 8]), 0);
+
+        let mut state = a;
+        let mut seen = [false; 8];
+        for _ in 0..256 {
+            state = xorshift32(state);
+            assert_ne!(state, 0);
+            let slots = backoff_slots(state, 3);
+            assert!(slots < 8);
+            seen[slots as usize] = true;
+        }
+        assert!(seen.iter().all(|s| *s), "backoff never covered full window");
+        assert_eq!(backoff_slots(u32::MAX, 0), 0);
+        assert_eq!(backoff_slots(u32::MAX, 5), 31);
+        // macMaxBE is capped at 8 even if the PIB holds a larger value.
+        assert_eq!(backoff_slots(u32::MAX, 40), 255);
+    }
 }
