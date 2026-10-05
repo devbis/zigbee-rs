@@ -23,6 +23,26 @@ pub fn key_fingerprint(key: &AesKey) -> u32 {
     hash
 }
 
+/// Overwrite secret material with zeros in a way the optimiser cannot elide.
+///
+/// Uses volatile byte stores followed by a compiler fence, so the wipe is not
+/// removed as a dead store even when the buffer is dropped or reused right
+/// after. `no_std`, allocation-free and dependency-free.
+#[inline(never)]
+pub fn zeroize(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        // SAFETY: `byte` is a valid, aligned, exclusive reference.
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// [`zeroize`] for a single AES key.
+#[inline]
+pub fn zeroize_key(key: &mut AesKey) {
+    zeroize(key);
+}
+
 /// AES-CCM* nonce length used by Zigbee.
 pub const CCM_STAR_NONCE_LEN: usize = 13;
 /// MIC length for Zigbee ENC-MIC-32 security.
@@ -714,6 +734,17 @@ mod install_code_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zeroize_clears_every_byte() {
+        let mut key = [0xA5u8; 16];
+        super::zeroize_key(&mut key);
+        assert_eq!(key, [0u8; 16]);
+        let mut buf = [0x5Au8; 37];
+        super::zeroize(&mut buf[3..]);
+        assert_eq!(&buf[..3], &[0x5A; 3]);
+        assert!(buf[3..].iter().all(|b| *b == 0));
+    }
 
     #[test]
     fn nwk_golden_vector_matches_independent_ccm() {
