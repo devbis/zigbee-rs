@@ -43,8 +43,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: tc32-${{ github.ref }}
-  cancel-in-progress: true
+  group: tc32-${{ (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
 
 env:
   TC32_TOOLCHAIN_TAG: tc32-1.98.1-20261003-31a272

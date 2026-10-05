@@ -6,16 +6,16 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Allow deploying to GitHub Pages
+# Least privilege by default; only deploy-site receives Pages/OIDC tokens.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
-# Only one Pages deploy at a time
+# Supersede stale runs for the same PR/branch, but give every main/master
+# push its own group so each commit is fully checked. Pages deployment is
+# serialized separately on the deploy-site job.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ci-${{ github.workflow }}-${{ (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -1321,6 +1321,14 @@ jobs:
         needs.clippy.result == 'success' && needs.fmt.result == 'success' &&
         needs.doc.result == 'success'
       }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    # Only one Pages deploy at a time; never cancel one already running.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
