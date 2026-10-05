@@ -12,6 +12,8 @@
 //!   across the switch.
 //! * [`profile`] — the endpoint/cluster profile this product selects, with
 //!   OTA composed in only where a backend for it exists.
+//! * [`chip_temperature`] — ESP-IDF-equivalent TSENS range selection and
+//!   per-chip eFuse calibration for the on-die temperature source.
 //!
 //! Both supported chips own a two-slot OTA partition table and firmware
 //! writer:
@@ -35,6 +37,7 @@ compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 #[cfg(not(any(feature = "esp32c6", feature = "esp32h2")))]
 compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 
+pub mod chip_temperature;
 #[cfg(any(target_os = "none", test))]
 pub mod executor;
 pub mod migration;

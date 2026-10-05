@@ -80,9 +80,15 @@ successful compilation.
 
 The reported temperature is the on-chip sensor reading, not ambient
 temperature. Real self-heating is possible. No guessed temperature offset is
-applied. C6, like H2, now powers its temperature sensor only around samples.
-Validating TSENS range and calibration is separate from measuring the effect
-of sleep.
+applied. Both chips select ESP-IDF's default −10…80 °C TSENS range (DAC 15,
+offset 0) before every sample, verify it by read-back, and subtract the
+per-chip sign-magnitude `TEMP_CALIB` eFuse delta exactly as ESP-IDF v5.5
+does (`products/esp32-zigbee-devkit/src/chip_temperature.rs`). Earlier C6
+builds used esp-hal's hard-coded offset −1 without programming the DAC,
+which over-reports by 27.88 °C when the DAC is in the default range. C6,
+like H2, powers its temperature sensor only around samples. Accuracy against
+a reference thermometer is still a hardware gate, separate from measuring the
+effect of sleep.
 
 OTA cluster events reach `OtaTransport` before generic application handling.
 When the image is ready, `SensorApp` checkpoints Zigbee security state before

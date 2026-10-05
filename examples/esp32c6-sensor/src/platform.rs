@@ -1,7 +1,6 @@
 //! ESP32-C6 capabilities for the shared sleepy-sensor application.
 
-use core::convert::Infallible;
-
+use esp32_zigbee_devkit_product::chip_temperature;
 use esp_hal::tsens::TemperatureSensor;
 use sensor_sed_app::{
     DiagnosticEvent, Diagnostics, EnvironmentReading, EnvironmentSource, Supervisor,
@@ -24,20 +23,23 @@ impl<'d> C6Environment<'d> {
 }
 
 impl EnvironmentSource for C6Environment<'_> {
-    type Error = Infallible;
+    type Error = chip_temperature::Error;
 
     async fn sample(&mut self) -> Result<EnvironmentReading, Self::Error> {
+        // esp-hal's `get_temperature()` assumes offset -1 (DAC 7) without
+        // programming the range DAC, and ignores the per-chip eFuse
+        // calibration. Select ESP-IDF's default range before every sample
+        // (the analog block may lose it across sleep) and convert with the
+        // read-back DAC offset and eFuse delta instead.
+        let calibration = chip_temperature::configure()?;
         self.sensor.power_up();
         esp_hal::delay::Delay::new().delay_micros(300);
-        let raw = self.sensor.get_temperature();
+        let raw = self.sensor.get_temperature().raw_value;
         self.sensor.power_down();
-        // Preserve the existing fixed-point conversion used by this example.
-        let temperature_centi_celsius =
-            ((raw.raw_value as i32) * 4_386 - (raw.offset as i32) * 278_800 - 205_200) / 100;
         self.humidity_tick = self.humidity_tick.wrapping_add(1);
 
         Ok(EnvironmentReading {
-            temperature_centi_celsius: temperature_centi_celsius as i16,
+            temperature_centi_celsius: calibration.centi_celsius(raw),
             humidity_centi_percent: 5_000 + ((self.humidity_tick % 100) as u16) * 10,
             pressure_tenth_kpa: None,
         })
