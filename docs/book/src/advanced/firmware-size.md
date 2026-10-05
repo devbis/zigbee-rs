@@ -66,6 +66,10 @@ reserve remains 8,448 B.
 
 ## Local image snapshots
 
+This page is the single source of truth for recorded sizes; `BUILD.md` and the
+README link here instead of duplicating tables. CI firmware jobs also upload
+`*.size.json` measurements for the exact commit they built.
+
 Baseline snapshot: **2026-09-06**. EFR32MG1 was refreshed **2026-09-08**.
 The TLSR8258 parent-router, always-on nRF52840, EFR32MG21, CC2340 fallback,
 and ESP32-C6/H2 rows were refreshed

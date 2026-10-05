@@ -213,8 +213,9 @@ sensor or router behavior is moved to a new MCU.
 ## Current targets
 
 “Build” means the pinned release image compiles and passes its layout checks;
-it is not a hardware claim. The exact 2026-08-27 image measurements are
-build/layout-tested only. Hardware evidence in the last column is prior
+it is not a hardware claim. Image measurements, which are build/layout-tested
+only, are maintained on the book's
+[Firmware Size](docs/book/src/advanced/firmware-size.md) page. Hardware evidence in the last column is prior
 path-level evidence unless an exact-image rerun is explicitly named; this
 worktree records no such rerun for the current byte-for-byte images.
 
@@ -233,8 +234,9 @@ worktree records no such rerun for the current byte-for-byte images.
 | TLSR8258 TB-04 | environmental sleepy End Device | yes | prior evidence covers the SUSPEND primitive; repeated application/network acceptance remains open |
 | TLSR8258 TB-04 | child-capable router | yes | prior evidence covers join/restart/Link Status/relay; corrected-image child acceptance remains open |
 
-See [BUILD.md](BUILD.md) for pinned commands, measured images, partition
-boundaries, and exact remaining gates.
+See [BUILD.md](BUILD.md) for pinned commands, partition boundaries, and exact
+remaining gates, and
+[Firmware Size](docs/book/src/advanced/firmware-size.md) for measured images.
 
 Firmware byte counts remain reported, but artificial regression budgets no
 longer fail builds. Real Flash/RAM limits, protected partitions, OTA-slot
