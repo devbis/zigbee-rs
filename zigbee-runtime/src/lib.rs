@@ -9190,32 +9190,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         let mut state = Self::load_valid_security_state(store)
             .map_err(event_loop::StartError::PersistenceFailed)?;
 
-        let nib = self.bdb.zdo().nwk().nib();
-        state.extended_pan_id = nib.extended_pan_id;
-        state.pan_id = nib.pan_id.0;
-        state.short_address = nib.network_address.0;
-        state.channel = nib.logical_channel;
-        state.depth = nib.depth;
-        state.parent_address = nib.parent_address.0;
-        // Round-trip the NIB's own notion of validity: a rejoin that started
-        // from an unknown update state and has not yet learned one must not be
-        // persisted as an authoritative `0`.
-        match nib.nwk_update_id() {
-            Some(update_id) => {
-                state.update_id = update_id;
-                state.update_id_valid = true;
-            }
-            None => {
-                state.update_id = 0;
-                state.update_id_valid = false;
-            }
-        }
         // A secured rejoin re-selects a parent, so the negotiation the NWK
         // layer just reset (and whatever the new parent has already answered)
         // is committed together with the new parent address.
-        state.parent_information = nib.parent_information;
-        state.parent_information_valid = nib.parent_information_valid;
-        state.end_device_timeout = nib.end_device_timeout;
+        Self::copy_rejoined_location(&mut state, self.bdb.zdo().nwk().nib());
         state.rejoin_pending = false;
         state.device_announce_pending = true;
         state.parent_link_provisional = false;
@@ -9333,6 +9311,35 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         error
     }
 
+    /// Copy the network position a successful rejoin selected from the NIB.
+    ///
+    /// Shared by the secured and Trust Center rejoin checkpoints. The NIB's
+    /// own notion of `nwkUpdateId` validity is round-tripped: a rejoin that
+    /// started from an unknown update state and has not yet learned one must
+    /// not be persisted as an authoritative `0`.
+    #[inline(never)]
+    fn copy_rejoined_location(state: &mut PersistentSecurityState, nib: &zigbee_nwk::nib::Nib) {
+        state.extended_pan_id = nib.extended_pan_id;
+        state.pan_id = nib.pan_id.0;
+        state.short_address = nib.network_address.0;
+        state.channel = nib.logical_channel;
+        state.depth = nib.depth;
+        state.parent_address = nib.parent_address.0;
+        match nib.nwk_update_id() {
+            Some(update_id) => {
+                state.update_id = update_id;
+                state.update_id_valid = true;
+            }
+            None => {
+                state.update_id = 0;
+                state.update_id_valid = false;
+            }
+        }
+        state.parent_information = nib.parent_information;
+        state.parent_information_valid = nib.parent_information_valid;
+        state.end_device_timeout = nib.end_device_timeout;
+    }
+
     fn persist_trust_center_rejoin_network<S: SecurityStateStore>(
         &mut self,
         store: &mut S,
@@ -9359,23 +9366,8 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             .checked_add(zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE)
             .ok_or(SecurityStoreError::CounterExhausted)?;
 
-        state.extended_pan_id = nib.extended_pan_id;
-        state.pan_id = nib.pan_id.0;
-        state.short_address = nib.network_address.0;
+        Self::copy_rejoined_location(&mut state, nib);
         state.ieee_address = nib.ieee_address;
-        state.channel = nib.logical_channel;
-        state.depth = nib.depth;
-        state.parent_address = nib.parent_address.0;
-        match nib.nwk_update_id() {
-            Some(update_id) => {
-                state.update_id = update_id;
-                state.update_id_valid = true;
-            }
-            None => {
-                state.update_id = 0;
-                state.update_id_valid = false;
-            }
-        }
         state.network_key = network_key;
         state.key_sequence = key_sequence;
         state.staged_network_key_present = false;
@@ -9384,9 +9376,6 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         state.secondary_network_key_is_previous = false;
         state.network_key_forwarding_pending = false;
         state.global_counter_limit = limit;
-        state.parent_information = nib.parent_information;
-        state.parent_information_valid = nib.parent_information_valid;
-        state.end_device_timeout = nib.end_device_timeout;
         state.rejoin_pending = true;
         state.device_announce_pending = true;
         state.parent_link_provisional = true;
