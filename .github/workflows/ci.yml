@@ -88,10 +88,10 @@ jobs:
       # `embassy-nrf`), but their battery-curve and profile logic is
       # host-testable because the hardware dependencies are
       # `cfg(target_os = "none")`-gated.
-      - run: cargo test --manifest-path products/nrf52840-sensor/Cargo.toml
-      - run: cargo test --manifest-path products/nrf52840-sensor/Cargo.toml --features sensor-bme280
-      - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml
-      - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml --features sensor-bme280
+      - run: cargo test --manifest-path products/nrf52840-sensor/Cargo.toml --locked
+      - run: cargo test --manifest-path products/nrf52840-sensor/Cargo.toml --features sensor-bme280 --locked
+      - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml --locked
+      - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml --features sensor-bme280 --locked
 
   standalone-host:
     name: Host ${{ matrix.name }}
@@ -103,58 +103,67 @@ jobs:
           - name: LP-EM-CC2340R5 board
             manifest: boards/lp-em-cc2340r5/Cargo.toml
             workspace: boards/lp-em-cc2340r5
-            locked: false
             features: ""
           - name: CC2340 sensor product
             manifest: products/cc2340-sensor/Cargo.toml
             workspace: products/cc2340-sensor
-            locked: false
             features: ""
           - name: ESP32-C6 sensor product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
-            locked: false
             features: esp32c6
           - name: ESP32-H2 sensor product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
-            locked: false
             features: esp32h2
           - name: ESP32-C6 light-sleep product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
-            locked: false
             features: esp32c6,light-sleep
           - name: ESP32-H2 light-sleep product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
-            locked: false
             features: esp32h2,light-sleep
           - name: nRF52840 always-on End Device product
             manifest: products/nrf52840-router/Cargo.toml
             workspace: products/nrf52840-router
-            locked: true
             features: ""
           - name: EFR32MG21 board
             manifest: boards/efr32mg21-devkit/Cargo.toml
             workspace: boards/efr32mg21-devkit
-            locked: true
             features: ""
           - name: EFR32MG21 sensor product
             manifest: products/efr32mg21-sensor/Cargo.toml
             workspace: products/efr32mg21-sensor
-            locked: true
             features: ""
           - name: PHY6222 sensor product
             manifest: products/phy62x2-evk/Cargo.toml
             workspace: products/phy62x2-evk
-            locked: false
             features: ""
           - name: PHY6252 sensor product
             manifest: products/phy62x2-evk/Cargo.toml
             workspace: products/phy62x2-evk
-            locked: false
             features: phy6252
+          # The EFR32MG1 HAL currently has host clippy findings
+          # (manual is_multiple_of, Result<_, ()>); test it until they are
+          # fixed, then drop `clippy: false`.
+          - name: EFR32MG1 HAL
+            manifest: efr32mg1-hal/Cargo.toml
+            workspace: efr32mg1-hal
+            features: ""
+            clippy: false
+          - name: EFR32MG1 TRADFRI board
+            manifest: boards/efr32mg1-tradfri/Cargo.toml
+            workspace: boards/efr32mg1-tradfri
+            features: ""
+          - name: EFR32MG1 TRADFRI product
+            manifest: products/efr32mg1-tradfri/Cargo.toml
+            workspace: products/efr32mg1-tradfri
+            features: ""
+          - name: EFR32MG21 HAL
+            manifest: efr32mg21-hal/Cargo.toml
+            workspace: efr32mg21-hal
+            features: ""
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
@@ -166,26 +175,22 @@ jobs:
           workspaces: ${{ matrix.workspace }}
           cache-targets: false
           # Variant names are unique; raw feature lists contain cache-invalid commas.
-          key: x86_64-unknown-linux-gnu-host-${{ matrix.name }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', 'boards/**/Cargo.lock', 'products/**/Cargo.lock', 'boards/**/Cargo.toml', 'products/**/Cargo.toml') }}
+          key: x86_64-unknown-linux-gnu-host-${{ matrix.name }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', '*-hal/Cargo.lock', 'boards/**/Cargo.lock', 'products/**/Cargo.lock', '*-hal/Cargo.toml', 'boards/**/Cargo.toml', 'products/**/Cargo.toml') }}
       - name: Test and lint standalone crate
+        env:
+          MANIFEST: ${{ matrix.manifest }}
+          FEATURES: ${{ matrix.features }}
+          CLIPPY: ${{ matrix.clippy }}
         run: |
           HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-          LOCKED=
-          if [[ "${{ matrix.locked }}" == true ]]; then
-            LOCKED=--locked
+          # Every standalone crate commits its Cargo.lock; never re-resolve.
+          ARGS=(--manifest-path "$MANIFEST" --target "$HOST_TARGET" --locked)
+          if [[ -n "$FEATURES" ]]; then
+            ARGS+=(--no-default-features --features "$FEATURES")
           fi
-          if [[ -n "${{ matrix.features }}" ]]; then
-            cargo test --manifest-path "${{ matrix.manifest }}" \
-              --target "$HOST_TARGET" $LOCKED \
-              --no-default-features --features "${{ matrix.features }}"
-            cargo clippy --manifest-path "${{ matrix.manifest }}" \
-              --target "$HOST_TARGET" --all-targets $LOCKED \
-              --no-default-features --features "${{ matrix.features }}" -- -D warnings
-          else
-            cargo test --manifest-path "${{ matrix.manifest }}" \
-              --target "$HOST_TARGET" $LOCKED
-            cargo clippy --manifest-path "${{ matrix.manifest }}" \
-              --target "$HOST_TARGET" --all-targets $LOCKED -- -D warnings
+          cargo test "${ARGS[@]}"
+          if [[ "$CLIPPY" != false ]]; then
+            cargo clippy "${ARGS[@]}" --all-targets -- -D warnings
           fi
 
   clippy:
@@ -791,7 +796,7 @@ jobs:
           python3 products/esp32-zigbee-devkit/partitions/test_esp_app_image.py \
             --write-corpus "$ESP_OTA_PREFLIGHT_CORPUS" --chip esp32c6
           HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-          cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
+          cargo test --locked --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
             --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/esp32c6-ota-host" \
             --no-default-features --features esp32c6 -- --include-ignored
           ./tools/firmware-size-report.sh \
@@ -864,7 +869,7 @@ jobs:
           python3 products/esp32-zigbee-devkit/partitions/test_esp_app_image.py \
             --write-corpus "$ESP_OTA_PREFLIGHT_CORPUS" --chip esp32h2
           HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-          cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
+          cargo test --locked --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
             --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/esp32h2-ota-host" \
             --no-default-features --features esp32h2 -- --include-ignored
           ./tools/firmware-size-report.sh \
@@ -927,7 +932,7 @@ jobs:
           python3 products/esp32-zigbee-devkit/partitions/test_esp_app_image.py \
             --write-corpus "$ESP_OTA_PREFLIGHT_CORPUS" --chip "$CHIP"
           HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-          cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
+          cargo test --locked --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
             --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/$CHIP-light-sleep-host" \
             --no-default-features --features "$CHIP,light-sleep" -- --include-ignored
           ./tools/firmware-size-report.sh "$CHIP-light-sleep" "${ELF}.app.bin" "${ELF}.size.json"
