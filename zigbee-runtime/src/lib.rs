@@ -6056,6 +6056,16 @@ pub const MAX_ENDPOINTS: usize = 8;
 pub const MAX_ENDPOINTS: usize = 4;
 #[cfg(feature = "compact-single-endpoint")]
 const _: () = assert!(MAX_ENDPOINTS <= zigbee_zdo::MAX_LOCAL_ENDPOINTS);
+
+/// Counters the legacy NV restore skips past the stored floor. Older records
+/// stored the live counter rather than a write-ahead limit.
+#[cfg(feature = "legacy-nv")]
+pub const LEGACY_NV_FRAME_COUNTER_MARGIN: u32 = 1000;
+/// Size of each write-ahead NWK frame-counter reservation in legacy NV.
+/// The device stops securing frames when it is exhausted until the next
+/// successful `save_state`.
+#[cfg(feature = "legacy-nv")]
+pub const LEGACY_NV_FRAME_COUNTER_RESERVATION: u32 = 4096;
 /// Maximum clusters per endpoint
 #[cfg(feature = "router")]
 pub const MAX_CLUSTERS_PER_ENDPOINT: usize = 16;
@@ -11228,66 +11238,91 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     ///
     /// Call after: join, key update, bind/unbind, group changes, or before sleep.
     ///
-    /// This legacy item-by-item format is not crash-safe for Zigbee security
-    /// counters or unique Trust Center link keys. New secured devices must use
-    /// `SecurityStateStore` and `start_or_resume_with_security_store()`.
-    pub fn save_state(&self, nv: &mut dyn NvStorage) {
-        let nib = self.bdb.zdo().nwk().nib();
+    /// Every write error is returned; the record is only complete when this
+    /// returns `Ok`. The NWK frame counter is persisted write-ahead: the stored
+    /// value is a reservation limit that every counter the device can transmit
+    /// stays below, and the live NIB reservation is only extended after that
+    /// limit is durably written.
+    ///
+    /// This legacy item-by-item format is not crash-safe as a whole and does
+    /// not persist the Trust Center link key, APS key table, bindings or
+    /// groups. New secured devices must use `SecurityStateStore` and
+    /// `start_or_resume_with_security_store()`.
+    #[cfg(feature = "legacy-nv")]
+    #[deprecated(
+        note = "legacy NV does not persist TCLK/bindings; use SecurityStateStore with start_or_resume_with_security_store()"
+    )]
+    pub fn save_state(&mut self, nv: &mut dyn NvStorage) -> Result<(), crate::nv_storage::NvError> {
+        // Write-ahead the frame counter first so a later item failure can never
+        // leave the NIB transmitting above the durable limit.
+        if let Some(key_entry) = self.bdb.zdo().nwk().security().active_key() {
+            let (key, seq) = (key_entry.key, key_entry.seq_number);
+            let nib = self.bdb.zdo().nwk().nib();
+            let current = nib.outgoing_frame_counter;
+            let limit = current
+                .saturating_add(LEGACY_NV_FRAME_COUNTER_RESERVATION)
+                .max(nib.outgoing_frame_counter_limit);
+            nv.write(NvItemId::NwkFrameCounter, &limit.to_le_bytes())?;
+            let extended = self
+                .bdb
+                .zdo_mut()
+                .nwk_mut()
+                .nib_mut()
+                .set_frame_counter_reservation(current, limit);
+            debug_assert!(extended);
+            nv.write(NvItemId::NwkKey, &key)?;
+            nv.write(NvItemId::NwkKeySeqNum, &[seq])?;
+        }
 
+        let nib = self.bdb.zdo().nwk().nib();
         // Network identity
-        let _ = nv.write(NvItemId::NwkPanId, &nib.pan_id.0.to_le_bytes());
-        let _ = nv.write(NvItemId::NwkChannel, &[nib.logical_channel]);
-        let _ = nv.write(
+        nv.write(NvItemId::NwkPanId, &nib.pan_id.0.to_le_bytes())?;
+        nv.write(NvItemId::NwkChannel, &[nib.logical_channel])?;
+        nv.write(
             NvItemId::NwkShortAddress,
             &nib.network_address.0.to_le_bytes(),
-        );
-        let _ = nv.write(NvItemId::NwkExtendedPanId, &nib.extended_pan_id);
-        let _ = nv.write(NvItemId::NwkIeeeAddress, &nib.ieee_address);
-        let _ = nv.write(NvItemId::NwkDepth, &[nib.depth]);
-        let _ = nv.write(
+        )?;
+        nv.write(NvItemId::NwkExtendedPanId, &nib.extended_pan_id)?;
+        nv.write(NvItemId::NwkIeeeAddress, &nib.ieee_address)?;
+        nv.write(NvItemId::NwkDepth, &[nib.depth])?;
+        nv.write(
             NvItemId::NwkParentAddress,
             &nib.parent_address.0.to_le_bytes(),
-        );
+        )?;
         // Only a known-good `nwkUpdateId` may be written. Persisting the
         // placeholder of an unknown state would let the next boot read back a
         // "known" 0 and start rejecting every beacon in 0x81..=0xFF as stale,
         // so the item is removed instead and the unknown state survives.
         match nib.nwk_update_id() {
-            Some(update_id) => {
-                let _ = nv.write(NvItemId::NwkUpdateId, &[update_id]);
-            }
-            None => {
-                let _ = nv.delete(NvItemId::NwkUpdateId);
-            }
+            Some(update_id) => nv.write(NvItemId::NwkUpdateId, &[update_id])?,
+            None => match nv.delete(NvItemId::NwkUpdateId) {
+                Ok(()) | Err(crate::nv_storage::NvError::NotFound) => {}
+                Err(error) => return Err(error),
+            },
         }
-
-        // NWK security — active key + frame counter
-        if let Some(key_entry) = self.bdb.zdo().nwk().security().active_key() {
-            let _ = nv.write(NvItemId::NwkKey, &key_entry.key);
-            let _ = nv.write(NvItemId::NwkKeySeqNum, &[key_entry.seq_number]);
-        }
-        let fc = nib.outgoing_frame_counter;
-        let _ = nv.write(NvItemId::NwkFrameCounter, &fc.to_le_bytes());
 
         // BDB state
-        let on_network: u8 = if self.bdb.is_on_network() { 1 } else { 0 };
-        let _ = nv.write(NvItemId::BdbNodeIsOnNetwork, &[on_network]);
-        let _ = nv.write(
+        let attributes = self.bdb.attributes();
+        nv.write(
             NvItemId::BdbCommissioningMode,
-            &[self.bdb.attributes().commissioning_mode.0],
-        );
-        let _ = nv.write(
+            &[attributes.commissioning_mode.0],
+        )?;
+        nv.write(
             NvItemId::BdbPrimaryChannelSet,
-            &self.bdb.attributes().primary_channel_set.0.to_le_bytes(),
-        );
-        let _ = nv.write(
+            &attributes.primary_channel_set.0.to_le_bytes(),
+        )?;
+        nv.write(
             NvItemId::BdbSecondaryChannelSet,
-            &self.bdb.attributes().secondary_channel_set.0.to_le_bytes(),
-        );
-        let _ = nv.write(
+            &attributes.secondary_channel_set.0.to_le_bytes(),
+        )?;
+        nv.write(
             NvItemId::BdbCommissioningGroupId,
-            &self.bdb.attributes().commissioning_group_id.to_le_bytes(),
-        );
+            &attributes.commissioning_group_id.to_le_bytes(),
+        )?;
+        // Written last: a record interrupted part-way still restores as
+        // "not on a network" (or as the previous complete record).
+        let on_network: u8 = if self.bdb.is_on_network() { 1 } else { 0 };
+        nv.write(NvItemId::BdbNodeIsOnNetwork, &[on_network])?;
 
         log::debug!(
             "[NV] Saved network state (PAN=0x{:04X}, ch={}, addr=0x{:04X})",
@@ -11295,45 +11330,61 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             nib.logical_channel,
             nib.network_address.0
         );
+        Ok(())
     }
 
     /// Restore network state from non-volatile storage.
     ///
     /// Call on startup before `start()`. If state is found, the device can
     /// attempt rejoin instead of full commissioning.
-    /// Returns `true` if valid state was restored.
+    /// Returns `Ok(true)` if valid state was restored and `Ok(false)` when
+    /// there is no complete on-network record.
+    ///
+    /// The stored frame counter is treated as a floor: the device resumes
+    /// `LEGACY_NV_FRAME_COUNTER_MARGIN` above it (covering records written by
+    /// the older format, which stored the live counter rather than a limit)
+    /// and writes the new reservation limit back *before* installing it, so a
+    /// reset between restore and the next save can never reuse a counter. If
+    /// that write-ahead fails nothing is applied and the error is returned.
     ///
     /// This legacy format is not suitable for production secured restore; use
     /// `restore_security_state()` through
     /// `start_or_resume_with_security_store()` instead.
-    pub fn restore_state(&mut self, nv: &mut dyn NvStorage) -> bool {
+    #[cfg(feature = "legacy-nv")]
+    #[deprecated(
+        note = "legacy NV does not persist TCLK/bindings; use SecurityStateStore with start_or_resume_with_security_store()"
+    )]
+    pub fn restore_state(
+        &mut self,
+        nv: &mut dyn NvStorage,
+    ) -> Result<bool, crate::nv_storage::NvError> {
         let mut buf = [0u8; 16];
 
         // Check if we have stored network state
         let on_network = match nv.read(NvItemId::BdbNodeIsOnNetwork, &mut buf) {
             Ok(1) => buf[0] != 0,
-            _ => return false,
+            _ => return Ok(false),
         };
         if !on_network {
-            return false;
+            return Ok(false);
         }
 
-        // Restore network identity
+        // Read and validate the whole record before touching the NIB.
         let pan_id = match nv.read(NvItemId::NwkPanId, &mut buf) {
             Ok(2) => PanId(u16::from_le_bytes([buf[0], buf[1]])),
-            _ => return false,
+            _ => return Ok(false),
         };
         let channel = match nv.read(NvItemId::NwkChannel, &mut buf) {
             Ok(1) => buf[0],
-            _ => return false,
+            _ => return Ok(false),
         };
         let short_addr = match nv.read(NvItemId::NwkShortAddress, &mut buf) {
             Ok(2) => ShortAddress(u16::from_le_bytes([buf[0], buf[1]])),
-            _ => return false,
+            _ => return Ok(false),
         };
         let mut epid = [0u8; 8];
         if nv.read(NvItemId::NwkExtendedPanId, &mut epid).is_err() {
-            return false;
+            return Ok(false);
         }
         let depth = match nv.read(NvItemId::NwkDepth, &mut buf) {
             Ok(1) => buf[0],
@@ -11353,6 +11404,31 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 None
             }
         };
+        let mut ieee = None;
+        let mut ieee_buf = [0u8; 8];
+        if let Ok(8) = nv.read(NvItemId::NwkIeeeAddress, &mut ieee_buf) {
+            ieee = Some(ieee_buf);
+        }
+
+        let mut network_key = None;
+        let mut key_buf = [0u8; 16];
+        if let Ok(16) = nv.read(NvItemId::NwkKey, &mut key_buf) {
+            let seq = match nv.read(NvItemId::NwkKeySeqNum, &mut buf) {
+                Ok(1) => buf[0],
+                _ => 0,
+            };
+            // A key without its counter floor cannot be resumed safely.
+            let stored = match nv.read(NvItemId::NwkFrameCounter, &mut buf) {
+                Ok(4) => u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+                _ => return Ok(false),
+            };
+            let current = stored.saturating_add(LEGACY_NV_FRAME_COUNTER_MARGIN);
+            let limit = current.saturating_add(LEGACY_NV_FRAME_COUNTER_RESERVATION);
+            // Write-ahead: the new limit is durable before any counter below
+            // it can be transmitted.
+            nv.write(NvItemId::NwkFrameCounter, &limit.to_le_bytes())?;
+            network_key = Some((key_buf, seq, current, limit, stored));
+        }
 
         // Apply to NIB
         {
@@ -11365,50 +11441,29 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             nib.parent_address = parent;
             nib.restore_nwk_update_id(update_id);
             // Restore IEEE address (critical for NWK security headers)
-            let mut ieee_buf = [0u8; 8];
-            if let Ok(8) = nv.read(NvItemId::NwkIeeeAddress, &mut ieee_buf) {
-                nib.ieee_address = ieee_buf;
+            if let Some(ieee) = ieee {
+                nib.ieee_address = ieee;
             }
         }
 
-        // Restore NWK security key
-        let mut key_buf = [0u8; 16];
-        if let Ok(16) = nv.read(NvItemId::NwkKey, &mut key_buf) {
-            let seq = match nv.read(NvItemId::NwkKeySeqNum, &mut buf) {
-                Ok(1) => buf[0],
-                _ => 0,
-            };
-            let fc = match nv.read(NvItemId::NwkFrameCounter, &mut buf) {
-                Ok(4) => u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-                _ => 0,
-            };
+        if let Some((key, seq, current, limit, stored)) = network_key {
             self.bdb
                 .zdo_mut()
                 .nwk_mut()
                 .security_mut()
-                .set_network_key(key_buf, seq);
-            {
-                let nib = self.bdb.zdo_mut().nwk_mut().nib_mut();
-                nib.active_key_seq_number = seq;
-                nib.security_enabled = true;
-            }
-            // Restore frame counter with safety margin: frames may have been
-            // sent after the last NV save, so the coordinator's expected counter
-            // is higher than what we saved. Add 1000 to avoid replay rejection.
-            const FC_SAFETY_MARGIN: u32 = 1000;
-            let fc_safe = fc.saturating_add(FC_SAFETY_MARGIN);
+                .set_network_key(key, seq);
+            let nib = self.bdb.zdo_mut().nwk_mut().nib_mut();
+            nib.active_key_seq_number = seq;
+            nib.security_enabled = true;
+            let installed = nib.set_frame_counter_reservation(current, limit);
+            debug_assert!(installed);
             log::info!(
-                "[NV] Restored NWK key seq={}, fc={} (saved={} +{})",
+                "[NV] Restored NWK key seq={}, fc={} (stored floor={}, limit={})",
                 seq,
-                fc_safe,
-                fc,
-                FC_SAFETY_MARGIN
+                current,
+                stored,
+                limit
             );
-            self.bdb
-                .zdo_mut()
-                .nwk_mut()
-                .nib_mut()
-                .outgoing_frame_counter = fc_safe;
         }
 
         // Mark as on-network in BDB
@@ -11436,7 +11491,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             channel,
             short_addr.0
         );
-        true
+        Ok(true)
     }
 
     // ── MAC proxy ───────────────────────────────────────────
@@ -17221,10 +17276,11 @@ mod role_tests {
 /// carry no update state at all. Restoring such a record as a *known* `0`
 /// would arm the rejoin staleness gate against a value the device never
 /// learned, and every beacon in `0x81..=0xFF` would then look stale.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-nv"))]
+#[allow(deprecated)]
 mod legacy_nv_update_id_tests {
     use super::ZigbeeDevice;
-    use crate::nv_storage::{NvItemId, NvStorage, RamNvStorage};
+    use crate::nv_storage::{NvError, NvItemId, NvStorage, RamNvStorage};
     use zigbee_mac::mock::MockMac;
     use zigbee_nwk::DeviceType;
 
@@ -17259,7 +17315,7 @@ mod legacy_nv_update_id_tests {
         assert!(!nv.exists(NvItemId::NwkUpdateId).unwrap());
 
         let mut device = new_device();
-        assert!(device.restore_state(&mut nv));
+        assert_eq!(device.restore_state(&mut nv), Ok(true));
 
         let nib = device.bdb.zdo().nwk().nib();
         assert_eq!(
@@ -17281,7 +17337,7 @@ mod legacy_nv_update_id_tests {
         nv.write(NvItemId::NwkUpdateId, &[0x2A]).unwrap();
 
         let mut device = new_device();
-        assert!(device.restore_state(&mut nv));
+        assert_eq!(device.restore_state(&mut nv), Ok(true));
         assert_eq!(device.bdb.zdo().nwk().nib().nwk_update_id(), Some(0x2A));
 
         // Including a genuine, authoritative 0.
@@ -17289,7 +17345,7 @@ mod legacy_nv_update_id_tests {
         write_legacy_record(&mut nv);
         nv.write(NvItemId::NwkUpdateId, &[0]).unwrap();
         let mut device = new_device();
-        assert!(device.restore_state(&mut nv));
+        assert_eq!(device.restore_state(&mut nv), Ok(true));
         assert_eq!(device.bdb.zdo().nwk().nib().nwk_update_id(), Some(0));
     }
 
@@ -17301,7 +17357,7 @@ mod legacy_nv_update_id_tests {
         nv.write(NvItemId::NwkUpdateId, &[0x07, 0x08]).unwrap();
 
         let mut device = new_device();
-        assert!(device.restore_state(&mut nv));
+        assert_eq!(device.restore_state(&mut nv), Ok(true));
         assert_eq!(device.bdb.zdo().nwk().nib().nwk_update_id(), None);
     }
 
@@ -17311,9 +17367,9 @@ mod legacy_nv_update_id_tests {
         // A stale item from a previous commissioning.
         nv.write(NvItemId::NwkUpdateId, &[0x2A]).unwrap();
 
-        let device = new_device();
+        let mut device = new_device();
         assert_eq!(device.bdb.zdo().nwk().nib().nwk_update_id(), None);
-        device.save_state(&mut nv);
+        device.save_state(&mut nv).unwrap();
 
         assert!(
             !nv.exists(NvItemId::NwkUpdateId).unwrap(),
@@ -17331,7 +17387,7 @@ mod legacy_nv_update_id_tests {
             .nwk_mut()
             .nib_mut()
             .set_nwk_update_id(0x2A);
-        device.save_state(&mut nv);
+        device.save_state(&mut nv).unwrap();
 
         let mut buf = [0u8; 4];
         assert_eq!(nv.read(NvItemId::NwkUpdateId, &mut buf).unwrap(), 1);
@@ -17347,7 +17403,7 @@ mod legacy_nv_update_id_tests {
         nv.write(NvItemId::NwkUpdateId, &[0x2A]).unwrap();
 
         let mut device = new_device();
-        assert!(device.restore_state(&mut nv));
+        assert_eq!(device.restore_state(&mut nv), Ok(true));
         assert_eq!(device.bdb.zdo().nwk().nib().nwk_update_id(), Some(0x2A));
 
         // Something clears the update state (a leave, say) and the record is
@@ -17359,10 +17415,136 @@ mod legacy_nv_update_id_tests {
             .nib_mut()
             .clear_nwk_update_id();
         write_legacy_record(&mut nv);
-        device.save_state(&mut nv);
+        device.save_state(&mut nv).unwrap();
 
         let mut rebooted = new_device();
-        assert!(rebooted.restore_state(&mut nv));
+        assert_eq!(rebooted.restore_state(&mut nv), Ok(true));
         assert_eq!(rebooted.bdb.zdo().nwk().nib().nwk_update_id(), None);
+    }
+
+    /// Fails every write to one item; everything else is RAM-backed.
+    struct FailingItemNv {
+        inner: RamNvStorage,
+        fail: NvItemId,
+    }
+
+    impl NvStorage for FailingItemNv {
+        fn read(&mut self, id: NvItemId, buf: &mut [u8]) -> Result<usize, NvError> {
+            self.inner.read(id, buf)
+        }
+        fn write(&mut self, id: NvItemId, data: &[u8]) -> Result<(), NvError> {
+            if id == self.fail {
+                return Err(NvError::HardwareError);
+            }
+            self.inner.write(id, data)
+        }
+        fn delete(&mut self, id: NvItemId) -> Result<(), NvError> {
+            self.inner.delete(id)
+        }
+        fn exists(&mut self, id: NvItemId) -> Result<bool, NvError> {
+            self.inner.exists(id)
+        }
+        fn item_length(&mut self, id: NvItemId) -> Result<usize, NvError> {
+            self.inner.item_length(id)
+        }
+        fn compact(&mut self) -> Result<(), NvError> {
+            self.inner.compact()
+        }
+    }
+
+    fn stored_counter(nv: &mut dyn NvStorage) -> u32 {
+        let mut buf = [0u8; 4];
+        assert_eq!(nv.read(NvItemId::NwkFrameCounter, &mut buf).unwrap(), 4);
+        u32::from_le_bytes(buf)
+    }
+
+    fn write_secured_record(nv: &mut RamNvStorage, counter: u32) {
+        write_legacy_record(nv);
+        nv.write(NvItemId::NwkKey, &[0x5A; 16]).unwrap();
+        nv.write(NvItemId::NwkKeySeqNum, &[3]).unwrap();
+        nv.write(NvItemId::NwkFrameCounter, &counter.to_le_bytes())
+            .unwrap();
+    }
+
+    #[test]
+    fn restore_writes_the_counter_reservation_ahead_of_use() {
+        let mut nv = RamNvStorage::new();
+        write_secured_record(&mut nv, 500);
+
+        let mut device = new_device();
+        assert_eq!(device.restore_state(&mut nv), Ok(true));
+        let nib = device.bdb.zdo().nwk().nib();
+        let current = 500 + super::LEGACY_NV_FRAME_COUNTER_MARGIN;
+        let limit = current + super::LEGACY_NV_FRAME_COUNTER_RESERVATION;
+        assert_eq!(nib.outgoing_frame_counter, current);
+        assert_eq!(nib.outgoing_frame_counter_limit, limit);
+        assert_eq!(nib.active_key_seq_number, 3);
+        // Durable before any counter of the reservation is used: a reset
+        // right now resumes above every counter this boot can transmit.
+        assert_eq!(stored_counter(&mut nv), limit);
+
+        let mut rebooted = new_device();
+        assert_eq!(rebooted.restore_state(&mut nv), Ok(true));
+        assert!(rebooted.bdb.zdo().nwk().nib().outgoing_frame_counter >= limit);
+    }
+
+    #[test]
+    fn a_failed_counter_write_ahead_restores_nothing() {
+        let mut ram = RamNvStorage::new();
+        write_secured_record(&mut ram, 500);
+        let mut nv = FailingItemNv {
+            inner: ram,
+            fail: NvItemId::NwkFrameCounter,
+        };
+
+        let mut device = new_device();
+        assert_eq!(device.restore_state(&mut nv), Err(NvError::HardwareError));
+        assert!(!device.bdb.is_on_network());
+        assert_ne!(device.bdb.zdo().nwk().nib().network_address.0, 0x4321);
+        assert_eq!(device.bdb.zdo().nwk().nib().outgoing_frame_counter_limit, 0);
+    }
+
+    #[test]
+    fn save_reports_write_errors_and_extends_only_a_durable_reservation() {
+        let mut ram = RamNvStorage::new();
+        write_secured_record(&mut ram, 500);
+        let mut device = new_device();
+        assert_eq!(device.restore_state(&mut ram), Ok(true));
+        let before = device.bdb.zdo().nwk().nib().outgoing_frame_counter_limit;
+        // Consume most of the reservation.
+        let current = before - 10;
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .nib_mut()
+            .set_frame_counter_reservation(current, before);
+
+        let mut failing = FailingItemNv {
+            inner: ram,
+            fail: NvItemId::NwkFrameCounter,
+        };
+        assert_eq!(device.save_state(&mut failing), Err(NvError::HardwareError));
+        assert_eq!(
+            device.bdb.zdo().nwk().nib().outgoing_frame_counter_limit,
+            before,
+            "a reservation must not grow past what is durably stored"
+        );
+
+        let mut ram = failing.inner;
+        assert_eq!(device.save_state(&mut ram), Ok(()));
+        let extended = current + super::LEGACY_NV_FRAME_COUNTER_RESERVATION;
+        assert_eq!(
+            device.bdb.zdo().nwk().nib().outgoing_frame_counter_limit,
+            extended
+        );
+        assert_eq!(stored_counter(&mut ram), extended);
+
+        // Any later item failure is reported, not swallowed.
+        let mut failing = FailingItemNv {
+            inner: ram,
+            fail: NvItemId::BdbNodeIsOnNetwork,
+        };
+        assert_eq!(device.save_state(&mut failing), Err(NvError::HardwareError));
     }
 }
