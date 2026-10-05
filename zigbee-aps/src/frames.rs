@@ -147,7 +147,9 @@ pub struct ApsExtendedHeader {
     pub fragmentation: u8,
     /// Block number (fragment index), present when fragmentation != 0
     pub block_number: u8,
-    /// Ack bitfield (for fragment acks), present for first fragment
+    /// Ack bitfield — present only in a fragmented APS *acknowledgement*
+    /// (R22 §2.2.5.1.8). Data-frame fragments never carry it; it is ignored
+    /// when serialising any other frame type.
     pub ack_bitfield: Option<u8>,
 }
 
@@ -155,6 +157,8 @@ pub struct ApsExtendedHeader {
 pub const FRAG_NONE: u8 = 0x00;
 pub const FRAG_FIRST: u8 = 0x01;
 pub const FRAG_SUBSEQUENT: u8 = 0x02;
+/// Reserved fragmentation sub-field value (R22 Table 2-22).
+pub const FRAG_RESERVED: u8 = 0x03;
 
 // ── APS Header ──────────────────────────────────────────────────
 
@@ -292,13 +296,26 @@ impl ApsHeader {
             let ext_fc = data[offset];
             offset += 1;
             let fragmentation = ext_fc & 0x03;
+            // R22 §2.2.5.1.8 / Table 2-22: 0b11 is reserved; frames whose
+            // parameters fall outside the fragmentation protocol are rejected
+            // (§2.2.8.4.5.1).
+            if fragmentation == FRAG_RESERVED {
+                return None;
+            }
             let (block_number, ack_bitfield) = if fragmentation != FRAG_NONE {
                 if data.len() <= offset {
                     return None;
                 }
                 let bn = data[offset];
                 offset += 1;
-                let abf = if fragmentation == FRAG_FIRST && data.len() > offset {
+                // R22 §2.2.5.1.8: the ACK bitfield is present *only* when the
+                // frame type is an acknowledgement and the transmission is
+                // fragmented. A data frame's extended header is the extended
+                // frame control plus the block number — never a bitfield.
+                let abf = if frame_type == ApsFrameType::Ack {
+                    if data.len() <= offset {
+                        return None;
+                    }
                     let a = data[offset];
                     offset += 1;
                     Some(a)
@@ -380,8 +397,10 @@ impl ApsHeader {
             if ext.fragmentation != FRAG_NONE {
                 buf[offset] = ext.block_number;
                 offset += 1;
-                if let Some(abf) = ext.ack_bitfield {
-                    buf[offset] = abf;
+                // R22 §2.2.5.1.8: the ACK bitfield is serialised only in a
+                // fragmented APS acknowledgement, where it is mandatory.
+                if self.frame_control.frame_type == ApsFrameType::Ack as u8 {
+                    buf[offset] = ext.ack_bitfield.unwrap_or(0);
                     offset += 1;
                 }
             }
@@ -574,5 +593,110 @@ mod tests {
             assert_eq!(parsed.cluster_id, None);
             assert_eq!(parsed.profile_id, None);
         }
+    }
+
+    // ── Fragmentation interop vectors (R22 §2.2.5.1.8) ──────────────
+    //
+    // Generated with scapy 2.7.0 `ZigbeeAppDataPayload` (field layout taken
+    // from the Wireshark `zbee_aps` dissector): unicast, ZCL HA profile
+    // 0x0104, cluster 0x0019, endpoints 1 → 1, APS counter 0x42.
+
+    /// First block of a 3-block transmission: ext FC 0x01 + block count,
+    /// then payload. No ACK bitfield.
+    const FIRST_FRAGMENT: [u8; 14] = [
+        0xC0, 0x01, 0x19, 0x00, 0x04, 0x01, 0x01, 0x42, 0x01, 0x03, 0x01, 0x02, 0x03, 0x04,
+    ];
+    /// Second block (block number 1): ext FC 0x02 + block number.
+    const SUBSEQUENT_FRAGMENT: [u8; 12] = [
+        0xC0, 0x01, 0x19, 0x00, 0x04, 0x01, 0x01, 0x42, 0x02, 0x01, 0x05, 0x06,
+    ];
+    /// Fragment ACK for the window starting at block 0, all bits set.
+    const FRAGMENT_ACK: [u8; 11] = [
+        0x82, 0x01, 0x19, 0x00, 0x04, 0x01, 0x01, 0x42, 0x01, 0x00, 0xFF,
+    ];
+
+    fn data_fragment_header(fragmentation: u8, block_number: u8) -> ApsHeader {
+        ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Data as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request: true,
+                extended_header: true,
+            },
+            dst_endpoint: Some(0x01),
+            group_address: None,
+            cluster_id: Some(0x0019),
+            profile_id: Some(0x0104),
+            src_endpoint: Some(0x01),
+            aps_counter: 0x42,
+            extended_header: Some(ApsExtendedHeader {
+                fragmentation,
+                block_number,
+                ack_bitfield: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn first_data_fragment_has_no_ack_bitfield() {
+        let (parsed, consumed) = ApsHeader::parse(&FIRST_FRAGMENT).unwrap();
+        assert_eq!(consumed, 10, "header ends after the block number");
+        let ext = parsed.extended_header.unwrap();
+        assert_eq!(ext.fragmentation, FRAG_FIRST);
+        assert_eq!(ext.block_number, 3, "first block carries the block count");
+        assert_eq!(ext.ack_bitfield, None);
+        assert_eq!(&FIRST_FRAGMENT[consumed..], &[0x01, 0x02, 0x03, 0x04]);
+
+        let mut buf = [0u8; 16];
+        let len = data_fragment_header(FRAG_FIRST, 3).serialize(&mut buf);
+        assert_eq!(&buf[..len], &FIRST_FRAGMENT[..10]);
+    }
+
+    #[test]
+    fn a_stray_ack_bitfield_is_never_serialised_into_a_data_fragment() {
+        let mut header = data_fragment_header(FRAG_FIRST, 3);
+        header.extended_header.as_mut().unwrap().ack_bitfield = Some(0);
+        let mut buf = [0u8; 16];
+        let len = header.serialize(&mut buf);
+        assert_eq!(&buf[..len], &FIRST_FRAGMENT[..10]);
+    }
+
+    #[test]
+    fn subsequent_data_fragment_round_trips() {
+        let (parsed, consumed) = ApsHeader::parse(&SUBSEQUENT_FRAGMENT).unwrap();
+        assert_eq!(consumed, 10);
+        let ext = parsed.extended_header.unwrap();
+        assert_eq!(ext.fragmentation, FRAG_SUBSEQUENT);
+        assert_eq!(ext.block_number, 1);
+        assert_eq!(ext.ack_bitfield, None);
+
+        let mut buf = [0u8; 16];
+        let len = data_fragment_header(FRAG_SUBSEQUENT, 1).serialize(&mut buf);
+        assert_eq!(&buf[..len], &SUBSEQUENT_FRAGMENT[..10]);
+    }
+
+    #[test]
+    fn fragment_ack_carries_block_number_and_bitfield() {
+        let (parsed, consumed) = ApsHeader::parse(&FRAGMENT_ACK).unwrap();
+        assert_eq!(consumed, FRAGMENT_ACK.len());
+        assert_eq!(parsed.frame_control.frame_type, ApsFrameType::Ack as u8);
+        let ext = parsed.extended_header.unwrap();
+        assert_eq!(ext.fragmentation, FRAG_FIRST);
+        assert_eq!(ext.block_number, 0);
+        assert_eq!(ext.ack_bitfield, Some(0xFF));
+
+        let mut buf = [0u8; 16];
+        let len = parsed.serialize(&mut buf);
+        assert_eq!(&buf[..len], &FRAGMENT_ACK);
+    }
+
+    #[test]
+    fn fragment_ack_without_bitfield_and_reserved_fragmentation_are_rejected() {
+        assert!(ApsHeader::parse(&FRAGMENT_ACK[..FRAGMENT_ACK.len() - 1]).is_none());
+        let mut reserved = SUBSEQUENT_FRAGMENT;
+        reserved[8] = FRAG_RESERVED;
+        assert!(ApsHeader::parse(&reserved).is_none());
     }
 }

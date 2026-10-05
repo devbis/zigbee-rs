@@ -16,7 +16,11 @@ log = "0.4"
 
 [features]
 sleepy-end-device = []
-router = ["zigbee-nwk/router"]
+# R22 §2.2.8.4.5 APS fragmentation: windowed transmit and reassembly of ASDUs
+# up to 256 octets. Routers enable it; end-device images (tight flash/RAM
+# budgets) leave it off and drop fragmented frames as DEFRAG_UNSUPPORTED.
+fragmentation = []
+router = ["zigbee-nwk/router", "fragmentation"]
 trust-center = ["router"]
 trace = ["zigbee-nwk/trace"]
 
