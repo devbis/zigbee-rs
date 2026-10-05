@@ -561,6 +561,106 @@ mod builder_cluster_tests {
         assert_eq!(node_descriptor.server_mask & 0x007E, 0);
     }
 
+    /// Storage pre-filled with a non-zero, invalid-for-`bool` pattern so a
+    /// field that `assemble_into` forgets to write is observable (and is UB
+    /// that Miri reports) instead of silently reading zeroed memory.
+    fn poisoned_storage<T>() -> MaybeUninit<T> {
+        let mut storage = MaybeUninit::<T>::uninit();
+        // SAFETY: writing raw bytes into owned, uninitialized storage.
+        unsafe {
+            core::ptr::write_bytes(
+                storage.as_mut_ptr().cast::<u8>(),
+                0xA5,
+                core::mem::size_of::<T>(),
+            );
+        }
+        storage
+    }
+
+    fn assert_runtime_fields_match<R: crate::role::DeviceRole>(
+        built: &ZigbeeDevice<MockMac, R>,
+        built_into: &ZigbeeDevice<MockMac, R>,
+    ) {
+        assert_eq!(built.defer_aps_ack, built_into.defer_aps_ack);
+        assert!(!built_into.defer_aps_ack);
+        assert_eq!(
+            built.trust_center_removal_pending,
+            built_into.trust_center_removal_pending
+        );
+        assert!(!built_into.trust_center_removal_pending);
+        assert!(built.deferred_mgmt_leave.is_none());
+        assert!(built_into.deferred_mgmt_leave.is_none());
+        assert_eq!(
+            built.binding_persistence.enabled,
+            built_into.binding_persistence.enabled
+        );
+        assert!(!built_into.binding_persistence.enabled);
+        assert!(built_into.binding_persistence.response.is_none());
+        assert!(!built_into.binding_persistence_pending());
+        assert_eq!(
+            built.persisted_aps_table_fingerprint,
+            built_into.persisted_aps_table_fingerprint
+        );
+        assert_eq!(built_into.persisted_aps_table_fingerprint, 0);
+        assert_eq!(built.aps_tables_persisted, built_into.aps_tables_persisted);
+        assert!(!built_into.aps_tables_persisted);
+        #[cfg(feature = "router")]
+        {
+            assert!(built.pending_security_indication.is_none());
+            assert!(built_into.pending_security_indication.is_none());
+        }
+        assert_eq!(built.state_dirty, built_into.state_dirty);
+        assert_eq!(
+            built.secure_rejoin_retry_at,
+            built_into.secure_rejoin_retry_at
+        );
+        assert!(built_into.pending_action.is_none());
+        assert_eq!(built.zcl_seq, built_into.zcl_seq);
+        assert_eq!(built.power_now_ms, built_into.power_now_ms);
+        assert_eq!(built.automatic_polling, built_into.automatic_polling);
+        assert_eq!(built.channel_mask, built_into.channel_mask);
+        assert_eq!(built.endpoints.len(), built_into.endpoints.len());
+        assert_eq!(
+            built.identify_clusters.len(),
+            built_into.identify_clusters.len()
+        );
+        assert!(built_into.pending_responses.is_empty());
+        assert_eq!(built.remote_reporting(), built_into.remote_reporting());
+    }
+
+    #[test]
+    fn build_into_initializes_every_runtime_field_over_poisoned_storage() {
+        let make = || {
+            ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8])).endpoint(
+                1,
+                0x0104,
+                DeviceId::TEMPERATURE_SENSOR,
+                |endpoint| endpoint.cluster_server(ClusterId::IDENTIFY),
+            )
+        };
+        let built = make().build();
+        let mut storage = poisoned_storage();
+        let built_into = make().build_into(&mut storage);
+        assert_runtime_fields_match(&built, built_into);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn router_build_into_initializes_every_runtime_field_over_poisoned_storage() {
+        let make = || ZigbeeDevice::builder(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]));
+        let built = make().build_router();
+        let mut storage = poisoned_storage();
+        assert_runtime_fields_match(&built, make().build_router_into(&mut storage));
+
+        let built = make().build_relay();
+        let mut storage = poisoned_storage();
+        assert_runtime_fields_match(&built, make().build_relay_into(&mut storage));
+
+        let built = make().build_coordinator();
+        let mut storage = poisoned_storage();
+        assert_runtime_fields_match(&built, make().build_coordinator_into(&mut storage));
+    }
+
     #[test]
     #[cfg(feature = "router")]
     fn both_builder_paths_agree_on_the_node_descriptor() {

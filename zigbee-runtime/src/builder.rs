@@ -22,6 +22,88 @@ use zigbee_zcl::foundation::reporting::ReportingEngine;
 use zigbee_zcl::{ClusterId, DeviceId};
 use zigbee_zdo::ZdoLayer;
 
+/// The single source of truth for every [`ZigbeeDevice`] field except `bdb`.
+///
+/// Both the by-value builder (`assemble`) and the in-place builder
+/// (`assemble_into`) expand this list, so the two construction paths cannot
+/// diverge: the by-value path is a struct literal (the compiler rejects a
+/// missing field), and the in-place path writes each listed field through
+/// `addr_of_mut!` and carries an exhaustive destructuring guard so a field
+/// added to `ZigbeeDevice` but not to this list is a compile error instead of
+/// uninitialized memory.
+macro_rules! zigbee_device_fields {
+    (
+        $emit:ident!($($ctx:tt)*);
+        endpoints: $endpoints:expr,
+        power_mode: $power_mode:expr,
+        automatic_polling: $automatic_polling:expr,
+        basic_cluster: $basic_cluster:expr,
+        identify_clusters: $identify_clusters:expr,
+        channel_mask: $channel_mask:expr,
+        role: $role:ty $(,)?
+    ) => {
+        $emit!($($ctx)*;
+            endpoints: $endpoints,
+            reporting: ReportingEngine::new(),
+            remote_reporting: crate::remote_reporting::RemoteReportingState::new(),
+            power: PowerManager::new($power_mode),
+            power_now_ms: 0,
+            automatic_polling: $automatic_polling,
+            pending_action: None,
+            #[cfg(feature = "router")]
+            pending_security_indication: None,
+            defer_aps_ack: false,
+            trust_center_removal_pending: false,
+            deferred_mgmt_leave: None,
+            binding_persistence: Default::default(),
+            zcl_seq: 0,
+            basic_cluster: $basic_cluster,
+            identify_clusters: $identify_clusters,
+            channel_mask: $channel_mask,
+            pending_responses: heapless::Vec::new(),
+            scratch: super::RuntimeScratch::new(),
+            state_dirty: false,
+            persisted_aps_table_fingerprint: 0,
+            aps_tables_persisted: false,
+            secure_rejoin_retry_at: None,
+            role_state: <$role as DeviceRole>::State::new(),
+            _role: core::marker::PhantomData,
+        )
+    };
+}
+
+/// Emit a complete `ZigbeeDevice` struct literal.
+macro_rules! emit_device_literal {
+    ($bdb:expr; $($(#[$attr:meta])* $field:ident: $value:expr,)*) => {
+        ZigbeeDevice {
+            bdb: $bdb,
+            $($(#[$attr])* $field: $value,)*
+        }
+    };
+}
+
+/// Write every listed field into `*$dst` in place.
+///
+/// # Safety
+///
+/// `$dst` must be a valid, properly aligned `*mut ZigbeeDevice<_, _>` whose
+/// `bdb` field has already been initialized.
+macro_rules! emit_device_writes {
+    ($dst:ident; $($(#[$attr:meta])* $field:ident: $value:expr,)*) => {{
+        $($(#[$attr])* core::ptr::addr_of_mut!((*$dst).$field).write($value);)*
+
+        // Exhaustiveness guard: no `..` rest pattern, so a `ZigbeeDevice`
+        // field that the list above does not write fails to compile.
+        #[allow(dead_code)]
+        fn _every_field_is_written<M: MacDriver, R: DeviceRole>(device: ZigbeeDevice<M, R>) {
+            let ZigbeeDevice {
+                bdb: _,
+                $($(#[$attr])* $field: _,)*
+            } = device;
+        }
+    }};
+}
+
 fn build_identify_clusters(
     endpoints: &[EndpointConfig],
 ) -> heapless::Vec<EndpointIdentifyCluster, MAX_ENDPOINTS> {
@@ -542,42 +624,25 @@ let _ = ZigbeeDevice::builder(MockMac::new([0; 8])).build_router();
         bdb.attributes_mut().primary_channel_set = self.channel_mask;
         bdb.attributes_mut().secondary_channel_set = ChannelMask(0);
         let identify_clusters = build_identify_clusters(&self.endpoints);
+        let basic_cluster = BasicCluster::new_with_application_version(
+            self.manufacturer_name,
+            self.model_identifier,
+            self.date_code,
+            self.sw_build_id,
+            self.application_version,
+            self.power_source,
+        );
 
-        ZigbeeDevice {
-            bdb,
+        zigbee_device_fields!(
+            emit_device_literal!(bdb);
             endpoints: self.endpoints,
-            reporting: ReportingEngine::new(),
-            remote_reporting: crate::remote_reporting::RemoteReportingState::new(),
-            power: PowerManager::new(self.power_mode),
-            power_now_ms: 0,
+            power_mode: self.power_mode,
             automatic_polling: self.automatic_polling,
-            pending_action: None,
-            #[cfg(feature = "router")]
-            pending_security_indication: None,
-            defer_aps_ack: false,
-            trust_center_removal_pending: false,
-            deferred_mgmt_leave: None,
-            binding_persistence: Default::default(),
-            zcl_seq: 0,
-            basic_cluster: BasicCluster::new_with_application_version(
-                self.manufacturer_name,
-                self.model_identifier,
-                self.date_code,
-                self.sw_build_id,
-                self.application_version,
-                self.power_source,
-            ),
-            identify_clusters,
+            basic_cluster: basic_cluster,
+            identify_clusters: identify_clusters,
             channel_mask: self.channel_mask,
-            pending_responses: heapless::Vec::new(),
-            scratch: super::RuntimeScratch::new(),
-            state_dirty: false,
-            persisted_aps_table_fingerprint: 0,
-            aps_tables_persisted: false,
-            secure_rejoin_retry_at: None,
-            role_state: <R as DeviceRole>::State::new(),
-            _role: core::marker::PhantomData,
-        }
+            role: R,
+        )
     }
 
     /// Build the ZigbeeDevice into caller-provided storage.
@@ -793,17 +858,12 @@ let _ = ZigbeeDevice::builder(MockMac::new([0; 8])).build_router();
                 zdo.set_power_descriptor(zigbee_zdo::descriptors::PowerDescriptor::default());
             }
 
-            core::ptr::addr_of_mut!((*dst).endpoints).write(endpoints);
-            core::ptr::addr_of_mut!((*dst).reporting).write(ReportingEngine::new());
-            core::ptr::addr_of_mut!((*dst).remote_reporting)
-                .write(crate::remote_reporting::RemoteReportingState::new());
-            core::ptr::addr_of_mut!((*dst).power).write(PowerManager::new(power_mode));
-            core::ptr::addr_of_mut!((*dst).power_now_ms).write(0);
-            core::ptr::addr_of_mut!((*dst).automatic_polling).write(automatic_polling);
-            core::ptr::addr_of_mut!((*dst).pending_action).write(None);
-            core::ptr::addr_of_mut!((*dst).zcl_seq).write(0);
-            core::ptr::addr_of_mut!((*dst).basic_cluster).write(
-                BasicCluster::new_with_application_version(
+            zigbee_device_fields!(
+                emit_device_writes!(dst);
+                endpoints: endpoints,
+                power_mode: power_mode,
+                automatic_polling: automatic_polling,
+                basic_cluster: BasicCluster::new_with_application_version(
                     manufacturer_name,
                     model_identifier,
                     date_code,
@@ -811,15 +871,10 @@ let _ = ZigbeeDevice::builder(MockMac::new([0; 8])).build_router();
                     application_version,
                     power_source,
                 ),
+                identify_clusters: identify_clusters,
+                channel_mask: channel_mask,
+                role: R,
             );
-            core::ptr::addr_of_mut!((*dst).identify_clusters).write(identify_clusters);
-            core::ptr::addr_of_mut!((*dst).channel_mask).write(channel_mask);
-            core::ptr::addr_of_mut!((*dst).pending_responses).write(heapless::Vec::new());
-            core::ptr::addr_of_mut!((*dst).scratch).write(super::RuntimeScratch::new());
-            core::ptr::addr_of_mut!((*dst).state_dirty).write(false);
-            core::ptr::addr_of_mut!((*dst).secure_rejoin_retry_at).write(None);
-            core::ptr::addr_of_mut!((*dst).role_state).write(<R as DeviceRole>::State::new());
-            core::ptr::addr_of_mut!((*dst)._role).write(core::marker::PhantomData);
 
             &mut *dst
         }
