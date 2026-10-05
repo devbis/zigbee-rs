@@ -279,13 +279,24 @@ impl RouteEntry {
     }
 }
 
-/// Pending route discovery
+/// Route discovery table entry (R22 Table 3-68).
+///
+/// One route discovery is identified network-wide by the pair
+/// (`originator`, `request_id`): route request IDs are allocated per
+/// originator, so the ID alone is ambiguous on any router that relays
+/// discoveries for several devices.
 #[derive(Debug, Clone)]
 pub struct RouteDiscovery {
     pub request_id: u8,
+    /// Network address of the device that initiated the route request.
+    pub originator: ShortAddress,
     pub destination: ShortAddress,
+    /// Neighbour that sent the lowest-cost copy of the route request: the
+    /// next hop a Route Reply is forwarded to on its way to the originator.
     pub sender: ShortAddress,
+    /// Lowest accumulated cost from the originator to this device.
     pub forward_cost: u8,
+    /// Lowest cost reported back from the destination to this device.
     pub residual_cost: u8,
     pub timestamp: u32,
     pub active: bool,
@@ -295,6 +306,7 @@ impl RouteDiscovery {
     fn empty() -> Self {
         Self {
             request_id: 0,
+            originator: ShortAddress(0xFFFF),
             destination: ShortAddress(0xFFFF),
             sender: ShortAddress(0xFFFF),
             forward_cost: 0xFF,
@@ -425,7 +437,46 @@ impl RoutingTable {
         }
     }
 
-    /// Find a pending route discovery by request ID.
+    /// Active route discovery table entries.
+    pub fn discoveries(&self) -> impl Iterator<Item = &RouteDiscovery> {
+        self.discoveries.iter().filter(|d| d.active)
+    }
+
+    /// The route discovery identified by (`originator`, `request_id`).
+    pub fn find_discovery_for(
+        &self,
+        originator: ShortAddress,
+        request_id: u8,
+    ) -> Option<&RouteDiscovery> {
+        self.discoveries
+            .iter()
+            .find(|d| d.active && d.originator == originator && d.request_id == request_id)
+    }
+
+    /// Mutable access to the route discovery identified by (`originator`,
+    /// `request_id`).
+    pub fn find_discovery_for_mut(
+        &mut self,
+        originator: ShortAddress,
+        request_id: u8,
+    ) -> Option<&mut RouteDiscovery> {
+        self.discoveries
+            .iter_mut()
+            .find(|d| d.active && d.originator == originator && d.request_id == request_id)
+    }
+
+    /// Complete the route discovery identified by (`originator`,
+    /// `request_id`).
+    pub fn complete_discovery_for(&mut self, originator: ShortAddress, request_id: u8) {
+        if let Some(d) = self.find_discovery_for_mut(originator, request_id) {
+            d.active = false;
+        }
+    }
+
+    /// Find a pending route discovery by request ID alone.
+    ///
+    /// Ambiguous on a router that relays discoveries for several
+    /// originators; prefer [`Self::find_discovery_for`].
     pub fn find_discovery(&self, request_id: u8) -> Option<&RouteDiscovery> {
         self.discoveries
             .iter()
@@ -459,10 +510,26 @@ impl RoutingTable {
         else {
             return;
         };
+        Self::fail_discovery_entry(disc, &mut self.routes);
+    }
+
+    /// Abandon the route discovery identified by (`originator`,
+    /// `request_id`); see [`Self::fail_discovery`].
+    pub fn fail_discovery_for(&mut self, originator: ShortAddress, request_id: u8) {
+        let Some(disc) = self
+            .discoveries
+            .iter_mut()
+            .find(|d| d.active && d.originator == originator && d.request_id == request_id)
+        else {
+            return;
+        };
+        Self::fail_discovery_entry(disc, &mut self.routes);
+    }
+
+    fn fail_discovery_entry(disc: &mut RouteDiscovery, routes: &mut [RouteEntry]) {
         disc.active = false;
         let destination = disc.destination;
-        if let Some(route) = self
-            .routes
+        if let Some(route) = routes
             .iter_mut()
             .find(|r| r.destination == destination && r.status == RouteStatus::DiscoveryUnderway)
         {
@@ -470,7 +537,10 @@ impl RoutingTable {
         }
     }
 
-    /// Complete a route discovery (remove from pending).
+    /// Complete a route discovery by request ID alone.
+    ///
+    /// Ambiguous on a router that relays discoveries for several
+    /// originators; prefer [`Self::complete_discovery_for`].
     pub fn complete_discovery(&mut self, request_id: u8) {
         if let Some(d) = self
             .discoveries
@@ -780,34 +850,29 @@ impl BtrTable {
             .any(|e| e.active && e.src_addr == src && e.seq_number == seq)
     }
 
+    /// Whether every entry is live, so a new broadcast cannot be recorded.
+    pub fn is_full(&self) -> bool {
+        self.entries.iter().all(|e| e.active)
+    }
+
     /// Record a broadcast (must call after is_duplicate check).
-    pub fn record(&mut self, src: ShortAddress, seq: u8) {
-        // Find empty slot first
-        let mut target_idx = None;
-        for (i, e) in self.entries.iter().enumerate() {
-            if !e.active {
-                target_idx = Some(i);
-                break;
-            }
-        }
-        // No empty slot — evict oldest (lowest expiry)
-        if target_idx.is_none() {
-            let mut min_expiry = u8::MAX;
-            for (i, e) in self.entries.iter().enumerate() {
-                if e.expiry < min_expiry {
-                    min_expiry = e.expiry;
-                    target_idx = Some(i);
-                }
-            }
-        }
-        if let Some(idx) = target_idx {
-            self.entries[idx] = BtrEntry {
-                src_addr: src,
-                seq_number: seq,
-                expiry: 9,
-                active: true,
-            };
-        }
+    ///
+    /// Returns `false` when the table is full. A live entry is never evicted
+    /// (R22 §3.6.5): forgetting a broadcast that is still circulating would
+    /// make this router accept and relay it again when a neighbour's copy
+    /// arrives, so the caller drops the *new* broadcast instead — see
+    /// [`Self::is_full`].
+    pub fn record(&mut self, src: ShortAddress, seq: u8) -> bool {
+        let Some(slot) = self.entries.iter_mut().find(|e| !e.active) else {
+            return false;
+        };
+        *slot = BtrEntry {
+            src_addr: src,
+            seq_number: seq,
+            expiry: 9,
+            active: true,
+        };
+        true
     }
 
     /// Age entries. Call every second.
@@ -826,6 +891,72 @@ impl BtrTable {
 impl Default for BtrTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Broadcast passive acknowledgement (R22 §3.6.5) ───────────
+
+/// Broadcasts this router is still waiting to hear relayed.
+#[cfg(feature = "router")]
+pub const MAX_PENDING_BROADCASTS: usize = 2;
+/// Router neighbours remembered per broadcast as having relayed it.
+#[cfg(feature = "router")]
+pub const MAX_PASSIVE_ACK_NEIGHBORS: usize = 8;
+
+/// A broadcast this router transmitted and keeps for retransmission until
+/// each of its router neighbours has been heard relaying it (passive
+/// acknowledgement) or `nwkMaxBroadcastRetries` is exhausted.
+#[cfg(feature = "router")]
+pub(crate) struct PendingBroadcast {
+    pub src: ShortAddress,
+    pub seq: u8,
+    /// The exact NWK frame put on air. A retransmission repeats it verbatim:
+    /// it is the same broadcast transaction, not a new one, so neighbours
+    /// that already received it drop the copy as a duplicate/replay.
+    pub frame: heapless::Vec<u8, { crate::nlde::MAX_NWK_FRAME }>,
+    pub retries_left: u8,
+    /// When the passive acknowledgement window closes.
+    pub deadline_us: u32,
+    /// Neighbours heard (re)transmitting this broadcast.
+    pub heard: heapless::Vec<ShortAddress, MAX_PASSIVE_ACK_NEIGHBORS>,
+}
+
+/// Broadcasts awaiting passive acknowledgement.
+#[cfg(feature = "router")]
+pub(crate) struct PassiveAckTable {
+    pub entries: heapless::Vec<PendingBroadcast, MAX_PENDING_BROADCASTS>,
+}
+
+#[cfg(feature = "router")]
+impl PassiveAckTable {
+    pub const fn new() -> Self {
+        Self {
+            entries: heapless::Vec::new(),
+        }
+    }
+
+    /// Start waiting for neighbours to relay a broadcast just transmitted.
+    ///
+    /// With no free entry the broadcast is simply not retransmitted; an
+    /// entry still inside its window is never displaced.
+    pub fn track(&mut self, pending: PendingBroadcast) -> bool {
+        self.entries.push(pending).is_ok()
+    }
+
+    /// Note that `by` was heard transmitting broadcast (`src`, `seq`).
+    pub fn note_relay(&mut self, src: ShortAddress, seq: u8, by: ShortAddress) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.src == src && e.seq == seq)
+            && !entry.heard.contains(&by)
+        {
+            let _ = entry.heard.push(by);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 }
 

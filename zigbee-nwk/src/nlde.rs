@@ -257,6 +257,18 @@ impl<M: MacDriver> NwkLayer<M> {
     ///
     /// The key is resolved before a counter is drawn so a frame that cannot be
     /// encrypted never burns durably reserved counter space.
+    /// The active network key together with its own sequence number.
+    ///
+    /// Every NWK-secured transmission takes both from this one entry so the
+    /// auxiliary header's key sequence number always names the key CCM*
+    /// actually used, whatever `nib.active_key_seq_number` holds.
+    #[inline]
+    pub(crate) fn active_tx_key(&self) -> Option<(crate::security::AesKey, u8)> {
+        self.security
+            .active_key()
+            .map(|entry| (entry.key, entry.seq_number))
+    }
+
     pub(crate) fn build_nwk_frame(
         &mut self,
         header: &NwkHeader,
@@ -279,7 +291,9 @@ impl<M: MacDriver> NwkLayer<M> {
         if self.security.activation_pending {
             return Err(NwkStatus::NotPermitted);
         }
-        let Some(key) = self.security.active_key().map(|entry| entry.key) else {
+        // The key and the sequence number named in the auxiliary header come
+        // from the same active key entry, so they cannot diverge.
+        let Some((key, key_seq_number)) = self.active_tx_key() else {
             log::warn!("[NWK] No active network key for encryption");
             return Err(NwkStatus::NoKey);
         };
@@ -290,7 +304,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 .next_frame_counter()
                 .ok_or(NwkStatus::MaxFrmCounterReached)?,
             source_address: self.nib.ieee_address,
-            key_seq_number: self.nib.active_key_seq_number,
+            key_seq_number,
         };
         if hdr_len + crate::security::NWK_AUX_HEADER_LEN > buf.len() {
             return Err(NwkStatus::FrameTooLong);
@@ -569,6 +583,19 @@ impl<M: MacDriver> NwkLayer<M> {
             })
             .await;
 
+        // R22 §3.6.5: a router keeps its own broadcast for passive
+        // acknowledgement by its router neighbours, like a relayed one.
+        #[cfg(feature = "router")]
+        if mac_result.is_ok() && next_hop == ShortAddress::BROADCAST && self.can_route() {
+            self.track_broadcast(
+                header.src_addr,
+                seq,
+                &nwk_buf[..total_len],
+                header.radius,
+                None,
+            );
+        }
+
         if let Err(ref e) = mac_result {
             log::warn!("[NWK TX] MAC send failed: {:?}", e);
             #[cfg(feature = "router")]
@@ -625,8 +652,7 @@ impl<M: MacDriver> NwkLayer<M> {
             crate::security::NwkSecurityHeader::parse(&frame[header_len..])
                 .ok_or(NwkStatus::BadCcmOutput)?;
         if security_header.source_address != self.nib.ieee_address
-            || security_header.security_control & !0x07
-                != crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT & !0x07
+            || !security_header.uses_network_key_with_extended_nonce()
         {
             // The queue holds frames already secured by this hop, not raw
             // received frames that would still need admission/replay checks.
@@ -1082,22 +1108,22 @@ impl<M: MacDriver> NwkLayer<M> {
     /// floor have been committed, in that order. Only then release relays.
     pub async fn complete_lifecycle_persistence(&mut self) {
         if let Some((replay, _)) = self.pending_lifecycle_replay.take() {
-            self.security.commit_frame_counter_for_key(
-                &replay.source,
-                replay.key_sequence,
-                replay.counter,
-            );
+            self.commit_replay_floor(replay);
             self.security.activation_pending = false;
         }
         if let Some((source, sequence)) = self.pending_lifecycle_btr.take() {
-            self.btr.record(source, sequence);
+            let _ = self.btr.record(source, sequence);
         }
         #[cfg(feature = "router")]
         {
             if let Some(relay) = self.pending_lifecycle_relay.take() {
                 let result = if is_nwk_broadcast(relay.header.dst_addr) {
-                    self.relay_broadcast(&relay.header, relay.payload.as_slice())
-                        .await
+                    self.relay_broadcast(
+                        &relay.header,
+                        relay.payload.as_slice(),
+                        relay.previous_hop,
+                    )
+                    .await
                 } else if relay.header.frame_control.frame_type == NwkFrameType::Command as u8
                     && relay.payload.first() == Some(&(NwkCommandId::RouteRecord as u8))
                 {
@@ -1143,12 +1169,44 @@ impl<M: MacDriver> NwkLayer<M> {
             log::error!("[NWK] Durable replay-counter commit failed");
             return false;
         }
+        self.commit_replay_floor(replay);
+        true
+    }
+
+    /// Record a verified incoming counter. When the replay table is full the
+    /// least-recently-heard source is evicted, never our parent or a child
+    /// while any other entry can go (see `commit_frame_counter_for_key_protecting`).
+    fn commit_replay_floor(&mut self, replay: crate::security::NwkReplayCounter) {
+        // A router keeps the floors of its parent and children when the replay
+        // table overflows; strangers are evicted least-recently-heard first.
+        #[cfg(feature = "router")]
+        {
+            let neighbors = &self.neighbors;
+            self.security.commit_frame_counter_for_key_protecting(
+                &replay.source,
+                replay.key_sequence,
+                replay.counter,
+                &|ieee: &IeeeAddress| {
+                    neighbors.find_by_ieee(ieee).is_some_and(|entry| {
+                        matches!(
+                            entry.relationship,
+                            crate::neighbor::Relationship::Parent
+                                | crate::neighbor::Relationship::Child
+                        )
+                    })
+                },
+            );
+        }
+        // NWK security is hop-by-hop, so an end device only verifies frames
+        // whose auxiliary source is its parent (or an overheard neighbour);
+        // the parent is always the most recently heard source and plain LRU
+        // keeps it, which keeps the sleepy build lean.
+        #[cfg(not(feature = "router"))]
         self.security.commit_frame_counter_for_key(
             &replay.source,
             replay.key_sequence,
             replay.counter,
         );
-        true
     }
 
     fn defer_incoming_replay(
@@ -1222,6 +1280,15 @@ impl<M: MacDriver> NwkLayer<M> {
                     }
                 }
                 self.record_command_outcome(outcome);
+            } else {
+                // A neighbour relaying our own broadcast is its passive
+                // acknowledgement (R22 §3.6.5).
+                #[cfg(feature = "router")]
+                if is_nwk_broadcast(dst)
+                    && let Some(hop) = prev_hop
+                {
+                    self.passive_acks.note_relay(src, header.seq_number, hop);
+                }
             }
             log::debug!(
                 "[NWK] Dropping self-originated frame seq={}",
@@ -1242,10 +1309,19 @@ impl<M: MacDriver> NwkLayer<M> {
         // before it is relayed or rebroadcast on our behalf and before any
         // command dispatch — rather than at the local-delivery gate below,
         // which a frame addressed elsewhere never reaches.
-        if !is_data && !is_command {
+        //
+        // NWK multicast (R22 §3.6.6) is not supported: this stack runs with
+        // nwkUseMulticast = FALSE and delivers APS group traffic as NWK
+        // broadcasts. The destination of a multicast frame is a *group ID*,
+        // never a device, so it must not be delivered as a unicast to a
+        // device whose short address happens to match, nor relayed as a
+        // unicast toward that "address" (or the parent): without member-mode
+        // support the frame is dropped.
+        if (!is_data && !is_command) || header.frame_control.multicast {
             log::debug!(
-                "[NWK] Dropping unsupported NWK frame type {} from 0x{:04X}",
+                "[NWK] Dropping unsupported NWK frame (type {}, multicast {}) from 0x{:04X}",
                 frame_type,
+                header.frame_control.multicast,
                 src.0
             );
             return None;
@@ -1399,22 +1475,49 @@ impl<M: MacDriver> NwkLayer<M> {
         #[cfg(feature = "router")]
         let relayable_broadcast = is_data || self.broadcast_command_is_relayable(src, command_id);
 
+        // R22 §3.6.1.5 / §3.6.3.1: every authenticated frame refreshes the
+        // transmitting neighbour's LQI average and incoming link cost; a
+        // router heard for the first time becomes a neighbour.
+        #[cfg(feature = "router")]
+        if self.rx_authenticated {
+            self.observe_transmitting_neighbor(
+                &header,
+                prev_hop.unwrap_or(src),
+                lqi,
+                payload.security_source(),
+                command_id,
+            );
+        }
+
         // Check a broadcast transaction before staging its replay. Recording
         // is delayed until the replay floor is durable, otherwise a failed
         // journal write would make the legitimate retransmission look like a
         // duplicate in this boot.
         #[cfg(feature = "router")]
-        if is_broadcast
-            && can_route
-            && !is_route_request
-            && self.btr.is_duplicate(src, header.seq_number)
-        {
-            log::debug!(
-                "[NWK] BTR dup: src=0x{:04X} seq={}",
-                src.0,
-                header.seq_number
-            );
-            return None;
+        if is_broadcast && can_route && !is_route_request {
+            if self.btr.is_duplicate(src, header.seq_number) {
+                // A neighbour's copy of a broadcast we already handled is its
+                // passive acknowledgement of our relay (R22 §3.6.5).
+                self.passive_acks
+                    .note_relay(src, header.seq_number, prev_hop.unwrap_or(src));
+                log::debug!(
+                    "[NWK] BTR dup: src=0x{:04X} seq={}",
+                    src.0,
+                    header.seq_number
+                );
+                return None;
+            }
+            if self.btr.is_full() {
+                // R22 §3.6.5: without room to record the transaction the new
+                // broadcast is dropped; live entries are never evicted, or a
+                // still-circulating broadcast would be accepted again.
+                log::warn!(
+                    "[NWK] Broadcast transaction table full — dropping src=0x{:04X} seq={}",
+                    src.0,
+                    header.seq_number
+                );
+                return None;
+            }
         }
 
         // BTR admission has succeeded. Adoption must precede classification so
@@ -1479,7 +1582,7 @@ impl<M: MacDriver> NwkLayer<M> {
 
         #[cfg(feature = "router")]
         if is_broadcast && can_route && !is_route_request && lifecycle_kind.is_none() {
-            self.btr.record(src, header.seq_number);
+            let _ = self.btr.record(src, header.seq_number);
         }
 
         if let Some(outcome) = conflict_outcome {
@@ -1552,7 +1655,9 @@ impl<M: MacDriver> NwkLayer<M> {
             && relayable_broadcast
             && !(authenticated_replay.is_some() && lifecycle_kind.is_some())
         {
-            let rebroadcast = self.relay_broadcast(&header, payload.as_slice()).await;
+            let rebroadcast = self
+                .relay_broadcast(&header, payload.as_slice(), prev_hop.unwrap_or(src))
+                .await;
             if let Err(e) = rebroadcast {
                 log::warn!(
                     "[NWK] Rebroadcast of frame from 0x{:04X} failed: {:?}",
@@ -1661,7 +1766,12 @@ impl<M: MacDriver> NwkLayer<M> {
             self.rx_security_stats.secured_frames.wrapping_add(1);
 
         let after_header = mac_payload.get(header_len..)?;
+        // R22 §4.3.1.2 step 1: NWK frames are secured with the network key
+        // (key identifier 1) and carry the extended nonce; anything else
+        // (a link/transport key identifier, or a missing source address
+        // the 14-byte auxiliary layout would otherwise misread) is rejected.
         let Some((sec_hdr, sec_consumed)) = crate::security::NwkSecurityHeader::parse(after_header)
+            .filter(|(hdr, _)| hdr.uses_network_key_with_extended_nonce())
         else {
             self.rx_security_stats.security_header_parse_failures = self
                 .rx_security_stats
@@ -1851,7 +1961,13 @@ impl<M: MacDriver> NwkLayer<M> {
                     .ok_or(NwkStatus::RouteError)?
             }
         } else {
-            self.resolve_next_hop(header.dst_addr)?
+            match self.resolve_next_hop(header.dst_addr) {
+                Ok(next_hop) => next_hop,
+                Err(status) => {
+                    self.handle_unroutable_relay(header).await;
+                    return Err(status);
+                }
+            }
         };
 
         // A parent forwarding its direct end-device child's data over a
@@ -1950,6 +2066,105 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         Ok(())
+    }
+
+    /// R22 §3.6.3.3: a router asked to relay a unicast it has no route for
+    /// initiates route discovery when the frame permits it; otherwise (or if
+    /// discovery cannot start) it tells the originator with a Network Status
+    /// "no route available" so the originator can repair the route itself.
+    /// The frame is not buffered pending discovery; the originator's
+    /// retransmission uses the repaired route.
+    #[cfg(feature = "router")]
+    async fn handle_unroutable_relay(&mut self, header: &NwkHeader) {
+        let destination = header.dst_addr;
+        if !is_unicast_address(destination) || header.src_addr == self.nib.network_address {
+            return;
+        }
+        if header.frame_control.discover_route != 0
+            && (self.routing.has_active_discovery(destination)
+                || self.discover_route(destination).await.is_ok())
+        {
+            return;
+        }
+        let pending = crate::PendingNetworkStatus {
+            destination: header.src_addr,
+            status_code: crate::frames::NetworkStatusCommand::NO_ROUTE_AVAILABLE,
+            failed_destination: destination,
+            next_hop: None,
+        };
+        if self.pending_route_errors.push(pending).is_err() {
+            log::warn!("[NWK] Network Status queue full");
+        }
+    }
+
+    /// Refresh (or learn) the neighbour that transmitted an authenticated
+    /// frame (R22 §3.6.1.5, §3.6.3.1).
+    ///
+    /// An existing entry folds the frame's LQI into its average and has its
+    /// age reset. An unknown transmitter is only added when it is provably a
+    /// router: it relayed or rebroadcast the frame (MAC source differs from
+    /// the NWK source — only routers forward), or the frame is a Link Status,
+    /// Route Request or Route Reply, which only routers send. Its IEEE
+    /// address must be authenticated: NWK security is hop by hop, so the
+    /// auxiliary header names the transmitter; on an unsecured network only
+    /// a directly sent frame's source IEEE address can name it. An IEEE
+    /// address already bound to another short address is left to address
+    /// conflict processing instead of being remapped here.
+    #[cfg(feature = "router")]
+    #[inline(never)]
+    fn observe_transmitting_neighbor(
+        &mut self,
+        header: &NwkHeader,
+        hop: ShortAddress,
+        lqi: u8,
+        security_source: Option<IeeeAddress>,
+        command_id: Option<u8>,
+    ) {
+        if !self.can_route() || !is_unicast_address(hop) || hop == self.nib.network_address {
+            return;
+        }
+        if let Some(entry) = self.neighbors.find_by_short_mut(hop) {
+            if security_source.is_none_or(|ieee| ieee == entry.ieee_address) {
+                entry.observe_frame(lqi);
+                entry.age = 0;
+            }
+            return;
+        }
+        let direct = hop == header.src_addr;
+        let router_command = matches!(
+            command_id.and_then(NwkCommandId::from_u8),
+            Some(NwkCommandId::LinkStatus | NwkCommandId::RouteRequest | NwkCommandId::RouteReply)
+        );
+        if direct && !router_command {
+            return;
+        }
+        let ieee = match security_source {
+            Some(ieee) => ieee,
+            None if !self.nib.security_enabled && direct => match header.src_ieee {
+                Some(ieee) => ieee,
+                None => return,
+            },
+            None => return,
+        };
+        if ieee == [0; 8]
+            || ieee == [0xFF; 8]
+            || ieee == self.nib.ieee_address
+            || self.neighbors.find_by_ieee(&ieee).is_some()
+        {
+            return;
+        }
+        let mut entry = crate::neighbor::NeighborEntry::new_from_annce(hop, ieee);
+        entry.device_type = if hop == ShortAddress::COORDINATOR {
+            crate::neighbor::NeighborDeviceType::Coordinator
+        } else {
+            crate::neighbor::NeighborDeviceType::Router
+        };
+        entry.rx_on_when_idle = true;
+        entry.relationship = crate::neighbor::Relationship::Sibling;
+        entry.observe_frame(lqi);
+        if self.neighbors.add_or_update(entry).is_ok() {
+            log::debug!("[NWK] Learned router neighbor 0x{:04X}", hop.0);
+        }
     }
 
     /// Whether `addr` is a child of ours that sleeps, and therefore can only
@@ -2251,11 +2466,17 @@ impl<M: MacDriver> NwkLayer<M> {
     /// `payload` is the authenticated plaintext; a secured broadcast is
     /// re-secured with this device's own key material, exactly like a unicast
     /// relay, because the decremented radius is authenticated header data.
+    ///
+    /// R22 §3.6.5: the relay waits a random jitter of up to
+    /// `nwkcMaxBroadcastJitter` first, so neighbours that heard the same copy
+    /// do not collide, and is then tracked for passive acknowledgement —
+    /// `previous_hop`, which transmitted it to us, already holds it.
     #[cfg(feature = "router")]
     async fn relay_broadcast(
         &mut self,
         header: &NwkHeader,
         payload: &[u8],
+        previous_hop: ShortAddress,
     ) -> Result<(), NwkStatus> {
         let new_radius = header.radius.saturating_sub(1);
         if new_radius == 0 {
@@ -2274,11 +2495,45 @@ impl<M: MacDriver> NwkLayer<M> {
             new_radius
         );
 
+        let jitter = crate::routing::routing_random_sample(
+            self.mac.monotonic_micros()
+                ^ (u32::from(self.nib.network_address.0) << 16)
+                ^ u32::from(header.src_addr.0)
+                ^ (u32::from(header.seq_number) << 8),
+        ) % crate::conflict::MAX_BROADCAST_JITTER_US;
+        self.mac.delay_micros(jitter).await;
+
+        self.send_tracked_broadcast(
+            header.src_addr,
+            header.seq_number,
+            &relay_buf[..total],
+            new_radius,
+            Some(previous_hop),
+        )
+        .await
+    }
+
+    /// MAC-broadcast a NWK broadcast frame and, when router neighbours are
+    /// expected to relay it further, keep it for passive acknowledgement
+    /// and up to `nwkMaxBroadcastRetries` retransmissions (R22 §3.6.5).
+    ///
+    /// A frame sent with radius 1 is not relayed by anyone, so no
+    /// acknowledgement can ever be heard for it and it is sent once.
+    #[cfg(feature = "router")]
+    #[inline(never)]
+    pub(crate) async fn send_tracked_broadcast(
+        &mut self,
+        src: ShortAddress,
+        seq: u8,
+        frame: &[u8],
+        radius: u8,
+        already_heard: Option<ShortAddress>,
+    ) -> Result<(), NwkStatus> {
         self.mac
             .mcps_data(McpsDataRequest {
                 src_addr_mode: AddressMode::Short,
                 dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
-                payload: &relay_buf[..total],
+                payload: frame,
                 msdu_handle: self.nib.next_seq(),
                 tx_options: TxOptions {
                     ack_tx: false, // No ACK for broadcast
@@ -2287,69 +2542,157 @@ impl<M: MacDriver> NwkLayer<M> {
             })
             .await
             .map_err(|_| NwkStatus::RouteError)?;
-
+        self.track_broadcast(src, seq, frame, radius, already_heard);
         Ok(())
+    }
+
+    /// Keep a broadcast just put on air for passive acknowledgement; see
+    /// [`Self::send_tracked_broadcast`].
+    #[cfg(feature = "router")]
+    #[inline(never)]
+    fn track_broadcast(
+        &mut self,
+        src: ShortAddress,
+        seq: u8,
+        frame: &[u8],
+        radius: u8,
+        already_heard: Option<ShortAddress>,
+    ) {
+        if radius > 1 && self.nib.max_broadcast_retries > 0 {
+            let mut heard = heapless::Vec::new();
+            if let Some(hop) = already_heard {
+                let _ = heard.push(hop);
+            }
+            if !self.all_router_neighbors_heard(&heard)
+                && let Ok(frame) = heapless::Vec::from_slice(frame)
+            {
+                let deadline_us = self
+                    .mac
+                    .monotonic_micros()
+                    .wrapping_add(u32::from(self.nib.passive_ack_timeout) * 1_000);
+                let _ = self.passive_acks.track(crate::routing::PendingBroadcast {
+                    src,
+                    seq,
+                    frame,
+                    retries_left: self.nib.max_broadcast_retries,
+                    deadline_us,
+                    heard,
+                });
+            }
+        }
+    }
+
+    /// Whether every rx-on-when-idle router neighbour is in `heard`.
+    #[cfg(feature = "router")]
+    fn all_router_neighbors_heard(&self, heard: &[ShortAddress]) -> bool {
+        heard.len() == crate::routing::MAX_PASSIVE_ACK_NEIGHBORS
+            || self.neighbors.iter().all(|n| {
+                !matches!(
+                    n.device_type,
+                    crate::neighbor::NeighborDeviceType::Router
+                        | crate::neighbor::NeighborDeviceType::Coordinator
+                ) || n.relationship == crate::neighbor::Relationship::PreviousChild
+                    || heard.contains(&n.network_address)
+            })
+    }
+
+    /// Retransmit broadcasts whose passive-acknowledgement window closed
+    /// before every router neighbour was heard relaying them (R22 §3.6.5).
+    ///
+    /// Called from [`NwkLayer::process_pending_routing`]; a retransmission
+    /// therefore happens at the first maintenance pass after
+    /// `nwkPassiveAckTimeout`, never before it.
+    #[cfg(feature = "router")]
+    #[inline(never)]
+    pub(crate) async fn service_passive_acks(&mut self) {
+        let mut index = 0;
+        while index < self.passive_acks.entries.len() {
+            let now = self.mac.monotonic_micros();
+            let entry = &self.passive_acks.entries[index];
+            if (now.wrapping_sub(entry.deadline_us) as i32) < 0 {
+                index += 1;
+                continue;
+            }
+            if entry.retries_left == 0 || self.all_router_neighbors_heard(&entry.heard) {
+                self.passive_acks.entries.swap_remove(index);
+                continue;
+            }
+            let frame = entry.frame.clone();
+            log::debug!(
+                "[NWK] Broadcast src=0x{:04X} seq={} not relayed by all router neighbours — retransmitting",
+                entry.src.0,
+                entry.seq,
+            );
+            let _ = self
+                .mac
+                .mcps_data(McpsDataRequest {
+                    src_addr_mode: AddressMode::Short,
+                    dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
+                    payload: &frame,
+                    msdu_handle: self.nib.next_seq(),
+                    tx_options: TxOptions {
+                        ack_tx: false,
+                        ..Default::default()
+                    },
+                })
+                .await;
+            let timeout = u32::from(self.nib.passive_ack_timeout) * 1_000;
+            let entry = &mut self.passive_acks.entries[index];
+            entry.retries_left -= 1;
+            entry.deadline_us = self.mac.monotonic_micros().wrapping_add(timeout);
+            index += 1;
+        }
     }
 
     /// Resolve the MAC next hop for a given NWK destination.
     ///
-    /// Strategy:
-    /// 1. If destination is a neighbor → send directly
-    /// 2. If destination is in routing table → use next_hop
-    /// 3. If we're an end device → send to parent
-    /// 4. For broadcast → send to all neighbors (simplified: send to parent)
+    /// * An end device hands every frame — unicast or broadcast — to its
+    ///   parent (R22 §3.6.3.3 / §3.6.5).
+    /// * A router sends broadcasts as MAC broadcasts, unicasts straight to a
+    ///   destination in its neighbor table (devices heard directly, including
+    ///   its children, R22 §3.6.1.5) and otherwise along an active routing
+    ///   table entry.
+    /// * Anything else is unroutable (`RouteError`): the caller starts route
+    ///   discovery or reports the failure. Knowing a device's address pair
+    ///   (address map) is never evidence that it is one hop away, and
+    ///   stochastic addressing has no tree to fall back on.
+    #[inline(never)]
     pub(crate) fn resolve_next_hop(
         &self,
         destination: ShortAddress,
     ) -> Result<ShortAddress, NwkStatus> {
-        // Broadcast: send to parent (end device) or all neighbors (router)
         if is_nwk_broadcast(destination) {
             if self.device_type == DeviceType::EndDevice {
                 return Ok(self.nib.parent_address);
             }
-            // Routers broadcast via MAC broadcast
             return Ok(ShortAddress::BROADCAST);
         }
-
         // Reserved (0xFFF8..=0xFFFA) or unassigned (0xFFFE): neither a device
         // nor a broadcast group. Refuse explicitly instead of flooding an
         // undefined address as a MAC broadcast.
         if !is_unicast_address(destination) {
             return Err(NwkStatus::InvalidParameter);
         }
-
-        // Direct neighbor?
+        if !cfg!(feature = "router") || self.device_type == DeviceType::EndDevice {
+            let parent = self.nib.parent_address;
+            return if is_unicast_address(parent) {
+                Ok(parent)
+            } else {
+                Err(NwkStatus::RouteError)
+            };
+        }
         if self.neighbors.find_by_short(destination).is_some() {
             return Ok(destination);
         }
-
-        // Routing table lookup
-        if let Some(next) = self.routing.next_hop(destination) {
-            return Ok(next);
+        if let Some(next_hop) = self.routing.next_hop(destination) {
+            return Ok(next_hop);
         }
-
-        // End device fallback: always route through parent
-        if self.device_type == DeviceType::EndDevice {
-            return Ok(self.nib.parent_address);
+        // The parent we joined through was one hop away; a restored image may
+        // not have re-learned it into the neighbor table yet.
+        if destination == self.nib.parent_address {
+            return Ok(destination);
         }
-
-        // Tree routing fallback
-        if let Some(next) = self.routing.tree_route(
-            self.nib.network_address,
-            destination,
-            self.nib.depth,
-            self.nib.max_routers,
-            self.nib.max_depth,
-        ) {
-            return Ok(next);
-        }
-
-        // Route to parent as last resort
-        if self.nib.parent_address.0 != 0xFFFF {
-            Ok(self.nib.parent_address)
-        } else {
-            Err(NwkStatus::RouteError)
-        }
+        Err(NwkStatus::RouteError)
     }
 
     // ── NWK Command Dispatch ─────────────────────────────────
@@ -2411,11 +2754,15 @@ impl<M: MacDriver> NwkLayer<M> {
             // whose path is being recorded, and a Link Status describes the
             // sender's own links: both stay keyed on the NWK source.
             #[cfg(feature = "router")]
-            Some(NwkCommandId::RouteReply) => self.handle_route_reply(prev_hop, cmd_payload),
+            Some(NwkCommandId::RouteReply) => self.handle_route_reply(prev_hop, lqi, cmd_payload),
             #[cfg(feature = "router")]
             Some(NwkCommandId::RouteRecord) => self.handle_route_record(src, cmd_payload),
             #[cfg(feature = "router")]
-            Some(NwkCommandId::LinkStatus) => self.handle_link_status(src, cmd_payload),
+            // Link Status is a one-hop frame (radius 1): a copy that did not
+            // come straight from its sender describes somebody else's links.
+            Some(NwkCommandId::LinkStatus) if prev_hop == src => {
+                self.handle_link_status(src, cmd_payload)
+            }
             Some(NwkCommandId::NetworkStatus) => {
                 return self.handle_network_status(src, cmd_payload);
             }
@@ -3031,37 +3378,19 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Cost of the path the request travelled to reach us: what the
         // previous hop advertised plus our link from it.
-        let link_cost = if is_many_to_one {
-            let Some(neighbor) = self.neighbors.find_by_short(prev_hop) else {
-                log::debug!(
-                    "[NWK] MTOR RREQ from unknown previous hop 0x{:04X} dropped",
-                    prev_hop.0,
-                );
-                return;
-            };
-            if neighbor.outgoing_cost == 0 {
-                log::debug!(
-                    "[NWK] MTOR RREQ via 0x{:04X} has no reciprocal link cost",
-                    prev_hop.0,
-                );
-                return;
-            }
-            let incoming_cost = crate::neighbor::link_cost_from_lqi(lqi);
-            core::cmp::max(incoming_cost, neighbor.outgoing_cost)
-        } else {
-            self.neighbors
-                .find_by_short(prev_hop)
-                .map(|neighbor| {
-                    let incoming_cost = crate::neighbor::link_cost_from_lqi(lqi);
-                    if neighbor.outgoing_cost == 0 {
-                        incoming_cost
-                    } else {
-                        core::cmp::max(incoming_cost, neighbor.outgoing_cost)
-                    }
-                })
-                .unwrap_or(7)
-        };
-        let forward_cost = rreq.path_cost.saturating_add(link_cost);
+        //
+        // R22 §3.6.3.1: the link cost is estimated from the LQI of this very
+        // frame; once the previous hop has reported its view of the link in a
+        // Link Status (outgoing cost != 0) the worse of the two directions is
+        // used, so a many-to-one route — which is used in the *opposite*
+        // direction — never prefers a link the neighbour cannot hear well.
+        // A request from a neighbour that has not exchanged Link Status yet
+        // (e.g. a concentrator's first MTORR after boot) is accepted with the
+        // incoming estimate instead of leaving the router without any route
+        // to the concentrator until its next advertisement.
+        let forward_cost = rreq
+            .path_cost
+            .saturating_add(self.received_link_cost(prev_hop, lqi));
 
         log::debug!(
             "[NWK] RREQ orig=0x{:04X} via 0x{:04X}: id={}, dst=0x{:04X}, cost={}→{}, m2o={}",
@@ -3129,68 +3458,112 @@ impl<M: MacDriver> NwkLayer<M> {
             return;
         }
 
-        // ── Standard RREQ handling ──
-        // If destination is us, or we have a route, we can reply. Decided
-        // before the reverse route below is installed, so a request naming its
-        // own originator as the destination cannot be "answered" out of the
-        // entry this hop just created for it.
-        let have_route =
-            rreq.dst_addr == our_addr || self.routing.next_hop(rreq.dst_addr).is_some();
+        // ── Standard RREQ handling (R22 §3.6.3.5.2) ──
+        //
+        // Only the destination itself, or the parent of an end-device
+        // destination, answers. A router that merely holds a (possibly stale)
+        // route to the destination must keep flooding the request: replying
+        // on the destination's behalf would make the originator trust a path
+        // that nobody has confirmed end to end. Decided before the reverse
+        // route below is installed, so a request naming its own originator as
+        // the destination cannot be "answered" out of the entry this hop just
+        // created for it.
+        let answer = rreq.dst_addr == our_addr || self.is_end_device_child(rreq.dst_addr);
 
-        // Reverse route toward the originator, used by the Route Reply on its
-        // way back and by any later traffic to the originator.
+        // Reverse route toward the originator, used by later traffic to the
+        // originator. The Route Reply itself retraces the discovery entry's
+        // `sender`, not this route.
         let _ = self
             .routing
             .update_route(originator, prev_hop, forward_cost);
 
-        if have_route {
-            // Record route discovery and complete it
-            let _ = self.routing.add_discovery(crate::routing::RouteDiscovery {
-                request_id: rreq.route_request_id,
-                destination: rreq.dst_addr,
-                sender: prev_hop,
-                forward_cost,
-                residual_cost: 0,
-                timestamp: self.mac.monotonic_micros(),
-                active: true,
-            });
-            self.routing.complete_discovery(rreq.route_request_id);
+        // Route discovery table entry for (originator, request ID). Admission
+        // above already rejected a costlier copy, so this copy is the best (or
+        // an equal-cost alternative) heard so far: its sender becomes the hop
+        // a Route Reply returns through.
+        let now = self.mac.monotonic_micros();
+        let recorded = match self
+            .routing
+            .find_discovery_for_mut(originator, rreq.route_request_id)
+        {
+            Some(disc) => {
+                disc.sender = prev_hop;
+                disc.forward_cost = forward_cost;
+                true
+            }
+            None => self
+                .routing
+                .add_discovery(crate::routing::RouteDiscovery {
+                    request_id: rreq.route_request_id,
+                    originator,
+                    destination: rreq.dst_addr,
+                    sender: prev_hop,
+                    forward_cost,
+                    residual_cost: 0xFF,
+                    timestamp: now,
+                    active: true,
+                })
+                .is_ok(),
+        };
 
-            // Queue RREP to be sent asynchronously back toward the RREQ
-            // originator. It travels to the neighbour we heard the request
-            // from, but it names the originator that started the discovery so
-            // every hop on the way back can forward it further.
-            let responder = if rreq.dst_addr == our_addr {
-                our_addr
-            } else {
-                rreq.dst_addr
-            };
+        if answer {
+            // The responder is the destination of the request — this device,
+            // or the end-device child it answers for. The reply starts with
+            // cost 0; every hop on the way back adds its own link cost.
             let _ = self.pending_route_replies.push(crate::PendingRouteReply {
                 next_hop: prev_hop,
                 originator,
-                responder,
-                path_cost: rreq.path_cost,
+                responder: rreq.dst_addr,
+                path_cost: 0,
                 route_request_id: rreq.route_request_id,
             });
             log::info!(
-                "[NWK] RREQ destination 0x{:04X} reachable — RREP queued toward 0x{:04X}",
+                "[NWK] RREQ id={} for 0x{:04X} answered — RREP queued toward 0x{:04X}",
+                rreq.route_request_id,
                 rreq.dst_addr.0,
                 prev_hop.0,
             );
-        } else {
-            // Router: record the discovery and carry the originator's request
-            // one hop further.
-            let _ = self.routing.add_discovery(crate::routing::RouteDiscovery {
-                request_id: rreq.route_request_id,
-                destination: rreq.dst_addr,
-                sender: prev_hop,
-                forward_cost,
-                residual_cost: 0xFF,
-                timestamp: self.mac.monotonic_micros(),
-                active: true,
-            });
-
+        } else if recorded {
             self.queue_rreq_forward(header, &rreq, forward_cost);
+        } else {
+            // Without a discovery entry the Route Reply could not be carried
+            // back through this device, so propagating the request would only
+            // attract a reply that is dropped here.
+            log::warn!(
+                "[NWK] Route discovery table full — RREQ id={} from 0x{:04X} not propagated",
+                rreq.route_request_id,
+                originator.0,
+            );
+            self.rreq_records.remove(originator, rreq.route_request_id);
+        }
+    }
+
+    /// Whether `addr` is one of this device's end-device children, for which
+    /// it answers route requests (R22 §3.6.3.5.2).
+    #[cfg(feature = "router")]
+    fn is_end_device_child(&self, addr: ShortAddress) -> bool {
+        self.neighbors.find_by_short(addr).is_some_and(|n| {
+            n.device_type == crate::neighbor::NeighborDeviceType::EndDevice
+                && matches!(
+                    n.relationship,
+                    crate::neighbor::Relationship::Child
+                        | crate::neighbor::Relationship::UnauthenticatedChild
+                )
+        })
+    }
+
+    /// Cost of the link a routing command was just received over: the
+    /// estimate from this frame's LQI, or — once the neighbour has reported
+    /// its own view in a Link Status — the worse of both directions
+    /// (R22 §3.6.3.1).
+    #[cfg(feature = "router")]
+    fn received_link_cost(&self, prev_hop: ShortAddress, lqi: u8) -> u8 {
+        let incoming_cost = crate::neighbor::link_cost_from_lqi(lqi);
+        match self.neighbors.find_by_short(prev_hop) {
+            Some(neighbor) if neighbor.outgoing_cost != 0 => {
+                core::cmp::max(incoming_cost, neighbor.outgoing_cost)
+            }
+            _ => incoming_cost,
         }
     }
 
@@ -3262,13 +3635,18 @@ impl<M: MacDriver> NwkLayer<M> {
         }
     }
 
-    /// Handle incoming Route Reply (RREP).
+    /// Handle incoming Route Reply (RREP) per R22 §3.6.3.5.3.
     ///
     /// `prev_hop` is the neighbour that transmitted the reply — the next hop
-    /// of the route being installed. The RREP names the originator that
-    /// started the discovery, which is where the reply is forwarded on to.
+    /// of the route being installed — and `lqi` the quality it was heard
+    /// with. A reply is only meaningful against the route discovery entry for
+    /// its (originator, route request ID): one with no matching discovery is
+    /// dropped, and one whose accumulated cost is no better than a reply
+    /// already accepted for that discovery is dropped too. A relaying router
+    /// carries the reply back to the neighbour it heard the best copy of the
+    /// request from, adding its own link cost on the way.
     #[cfg(feature = "router")]
-    fn handle_route_reply(&mut self, prev_hop: ShortAddress, payload: &[u8]) {
+    fn handle_route_reply(&mut self, prev_hop: ShortAddress, lqi: u8, payload: &[u8]) {
         if !self.can_route() {
             // A Route Reply answers a Route Request, which only a router or the
             // coordinator originates (see `discover_route`), and it installs a
@@ -3280,49 +3658,73 @@ impl<M: MacDriver> NwkLayer<M> {
             return;
         };
 
+        let path_cost = rrep
+            .path_cost
+            .saturating_add(self.received_link_cost(prev_hop, lqi));
+
         log::debug!(
-            "[NWK] RREP from 0x{:04X}: id={}, orig=0x{:04X}, resp=0x{:04X}, cost={}",
+            "[NWK] RREP from 0x{:04X}: id={}, orig=0x{:04X}, resp=0x{:04X}, cost={}→{}",
             prev_hop.0,
             rrep.route_request_id,
             rrep.originator.0,
             rrep.responder.0,
-            rrep.path_cost
+            rrep.path_cost,
+            path_cost,
         );
 
-        // Update routing table: route to responder via the sender
-        let _ = self
+        let Some(disc) = self
             .routing
-            .update_route(rrep.responder, prev_hop, rrep.path_cost);
+            .find_discovery_for_mut(rrep.originator, rrep.route_request_id)
+        else {
+            log::debug!(
+                "[NWK] RREP id={} for originator 0x{:04X} matches no discovery — dropped",
+                rrep.route_request_id,
+                rrep.originator.0,
+            );
+            return;
+        };
+        if disc.destination != rrep.responder || path_cost >= disc.residual_cost {
+            // A reply for another destination, or one no better than the reply
+            // already accepted for this discovery.
+            return;
+        }
+        disc.residual_cost = path_cost;
+        let reply_hop = disc.sender;
 
-        // Complete the route discovery
-        self.routing.complete_discovery(rrep.route_request_id);
+        if self
+            .routing
+            .update_route(rrep.responder, prev_hop, path_cost)
+            .is_err()
+        {
+            log::warn!(
+                "[NWK] No routing-table capacity for 0x{:04X}",
+                rrep.responder.0
+            );
+            return;
+        }
 
-        let our_addr = self.nib.network_address;
-
-        if rrep.originator != our_addr {
-            // Not the originator — forward RREP toward originator via routing
-            let forward_hop = self
-                .routing
-                .next_hop(rrep.originator)
-                .unwrap_or(self.nib.parent_address);
+        if rrep.originator != self.nib.network_address {
+            // The discovery entry stays active until it times out, so a
+            // better reply arriving later can still replace this one.
             let _ = self.pending_route_replies.push(crate::PendingRouteReply {
-                next_hop: forward_hop,
+                next_hop: reply_hop,
                 originator: rrep.originator,
                 responder: rrep.responder,
-                path_cost: rrep.path_cost,
+                path_cost,
                 route_request_id: rrep.route_request_id,
             });
             log::debug!(
-                "[NWK] Forwarding RREP toward originator 0x{:04X} via 0x{:04X}",
+                "[NWK] Forwarding RREP toward originator 0x{:04X} via 0x{:04X} (cost={})",
                 rrep.originator.0,
-                forward_hop.0,
+                reply_hop.0,
+                path_cost,
             );
         } else {
             log::info!(
                 "[NWK] Route discovered to 0x{:04X} via 0x{:04X} (cost={})",
                 rrep.responder.0,
                 prev_hop.0,
-                rrep.path_cost
+                path_cost,
             );
         }
     }
@@ -3446,10 +3848,21 @@ impl<M: MacDriver> NwkLayer<M> {
         };
 
         let our_addr = self.nib.network_address;
+        // The receive path has already learned an authenticated router sender
+        // as a neighbour (R22 §3.6.3.4.2: "identified, or created").
         let Some(neighbor) = self.neighbors.find_by_short_mut(src) else {
             log::debug!("[NWK] LinkStatus from unknown neighbor 0x{:04X}", src.0);
             return;
         };
+        if neighbor.device_type == crate::neighbor::NeighborDeviceType::Unknown {
+            // Only routers send Link Status; an entry learned with an unknown
+            // type (e.g. from a Device_annce) is a router after all.
+            neighbor.device_type = if src == ShortAddress::COORDINATOR {
+                crate::neighbor::NeighborDeviceType::Coordinator
+            } else {
+                crate::neighbor::NeighborDeviceType::Router
+            };
+        }
         // R22 §3.6.3.4.2: reset the age of the transmitting device's entry.
         neighbor.link_status_age = 0;
         neighbor.age = 0;
@@ -3703,6 +4116,20 @@ mod tests {
         nwk
     }
 
+    /// Re-secure a plaintext on-air frame as `transmitter` would send it:
+    /// NWK security is hop by hop, so the auxiliary header names the
+    /// transmitter, not the NWK source.
+    #[cfg(feature = "router")]
+    fn secure_as(transmitter: &mut NwkLayer<MockMac>, plain: &[u8]) -> heapless::Vec<u8, 128> {
+        let (mut header, consumed) = NwkHeader::parse(plain).expect("plain frame parses");
+        header.frame_control.security = true;
+        let mut bytes = [0; 128];
+        let len = transmitter
+            .build_nwk_frame(&header, &plain[consumed..], &mut bytes)
+            .expect("the transmitter secures the frame");
+        heapless::Vec::from_slice(&bytes[..len]).unwrap()
+    }
+
     fn frame_with_network_key(
         header: &NwkHeader,
         payload: &[u8],
@@ -3725,6 +4152,60 @@ mod tests {
             .build_nwk_frame(&header, payload, &mut bytes)
             .unwrap();
         heapless::Vec::from_slice(&bytes[..len]).unwrap()
+    }
+
+    #[test]
+    fn secured_transmissions_name_the_sequence_of_the_key_actually_used() {
+        // The NIB copy drifts (as public `nib_mut()` access allows); every
+        // secured sender must still name the active key entry's sequence.
+        let check = |nwk: &NwkLayer<MockMac>, index: usize| {
+            let bytes = nwk.mac.tx_history()[index].payload.as_slice();
+            let (_, header_len) = NwkHeader::parse(bytes).unwrap();
+            let (aux, _) = crate::security::NwkSecurityHeader::parse(&bytes[header_len..]).unwrap();
+            assert_eq!(aux.key_seq_number, KEY_SEQ);
+            let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+            receiver.joined = true;
+            assert!(block_on(receiver.process_incoming_nwk_frame(bytes, 42)).is_some());
+        };
+
+        let mut sender = secured_node(DeviceType::EndDevice, ORIGIN, ORIGIN_IEEE);
+        sender.nib.active_key_seq_number = KEY_SEQ.wrapping_add(9);
+        block_on(sender.nlde_data_request(OUR_ADDR, 5, &[0xAB], true, false)).unwrap();
+        check(&sender, 0);
+
+        let mut leaver = secured_node(DeviceType::EndDevice, ORIGIN, ORIGIN_IEEE);
+        leaver.nib.active_key_seq_number = KEY_SEQ.wrapping_add(9);
+        block_on(leaver.nlme_leave(false)).unwrap();
+        let (_, header_len) =
+            NwkHeader::parse(leaver.mac.tx_history()[0].payload.as_slice()).unwrap();
+        let (aux, _) = crate::security::NwkSecurityHeader::parse(
+            &leaver.mac.tx_history()[0].payload.as_slice()[header_len..],
+        )
+        .unwrap();
+        assert_eq!(aux.key_seq_number, KEY_SEQ);
+    }
+
+    #[test]
+    fn incoming_frames_must_name_the_network_key_with_the_extended_nonce() {
+        let header = frame(NwkFrameType::Data, ORIGIN, OUR_ADDR);
+        let on_air = frame_with_network_key(&header, &[0xCA, 0xFE], NETWORK_KEY, KEY_SEQ, 10);
+        let (_, header_len) = NwkHeader::parse(&on_air).unwrap();
+        // Key identifier 0 (data/link key), 2 (key-transport), and the
+        // extended nonce cleared, each with an otherwise valid frame.
+        for tamper in [
+            |sc: u8| sc & !0x18,
+            |sc: u8| (sc & !0x18) | 0x10,
+            |sc: u8| sc & !0x20,
+        ] {
+            let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+            let mut bad = on_air.clone();
+            bad[header_len] = tamper(bad[header_len]);
+            assert!(block_on(receiver.process_incoming_nwk_frame(&bad, 42)).is_none());
+            assert_eq!(receiver.rx_security_stats.security_header_parse_failures, 1);
+            assert_eq!(receiver.rx_security_stats.decrypt_failures, 0);
+            // Nothing was committed, so the genuine frame still authenticates.
+            assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_some());
+        }
     }
 
     #[test]
@@ -4677,20 +5158,60 @@ mod tests {
 
     #[test]
     #[cfg(feature = "router")]
-    fn mtor_requires_a_known_nonzero_reciprocal_link_cost() {
+    fn mtor_without_link_status_yet_uses_the_incoming_link_estimate() {
         let mut router = node(DeviceType::Router, OUR_ADDR);
         router.update_neighbor_address(CONCENTRATOR, [0xC0; 8]);
         let neighbor = router.neighbors.find_by_short_mut(CONCENTRATOR).unwrap();
         neighbor.device_type = crate::neighbor::NeighborDeviceType::Router;
         neighbor.outgoing_cost = 0;
+        // LQI 120 → incoming link cost 3.
         let on_air = rreq_on_air(CONCENTRATOR, 0x32, 5, &many_to_one_rreq(5, 0));
 
         assert!(
-            block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(CONCENTRATOR),))
+            block_on(router.process_incoming_nwk_frame_from(&on_air, 120, Some(CONCENTRATOR),))
                 .is_none()
         );
-        assert!(router.routing.get_entry(CONCENTRATOR).is_none());
-        assert!(router.pending_rreq_forwards.is_empty());
+        let route = router
+            .routing
+            .get_entry(CONCENTRATOR)
+            .expect("the many-to-one route is installed");
+        assert_eq!(route.next_hop, CONCENTRATOR);
+        assert_eq!(route.path_cost, 3);
+        assert_eq!(router.pending_rreq_forwards.len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn mtor_from_an_unknown_relaying_router_teaches_a_neighbour_and_a_route() {
+        // The concentrator is two hops away; NEXT_HOP rebroadcasts its MTORR
+        // and has never been heard before.
+        let mut router = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let mut rebroadcaster = secured_node(DeviceType::Router, NEXT_HOP, [0x44; 8]);
+        let on_air = rreq_on_air(CONCENTRATOR, 0x32, 5, &many_to_one_rreq(5, 2));
+        let secured = secure_as(&mut rebroadcaster, &on_air);
+
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&secured, 220, Some(NEXT_HOP)))
+                .is_none()
+        );
+
+        let neighbor = router
+            .neighbors
+            .find_by_short(NEXT_HOP)
+            .expect("an authenticated relaying router becomes a neighbour");
+        assert_eq!(neighbor.ieee_address, [0x44; 8]);
+        assert!(neighbor.is_router());
+        assert_eq!(neighbor.incoming_cost, 1);
+        let route = router
+            .routing
+            .get_entry(CONCENTRATOR)
+            .expect("the many-to-one route is installed");
+        assert_eq!(route.next_hop, NEXT_HOP);
+        assert_eq!(route.path_cost, 3);
+        assert!(
+            router.neighbors.find_by_short(CONCENTRATOR).is_none(),
+            "the concentrator itself is not one hop away"
+        );
     }
 
     #[test]
@@ -5216,6 +5737,18 @@ mod tests {
         use crate::frames::RouteReply;
 
         let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.routing
+            .add_discovery(crate::routing::RouteDiscovery {
+                request_id: 9,
+                originator: OUR_ADDR,
+                destination: FAR,
+                sender: OUR_ADDR,
+                forward_cost: 0,
+                residual_cost: 0xFF,
+                timestamp: 0,
+                active: true,
+            })
+            .unwrap();
         let rrep = RouteReply {
             command_options: 0x00,
             route_request_id: 9,
@@ -5242,6 +5775,588 @@ mod tests {
         assert!(
             nwk.pending_route_replies.is_empty(),
             "a reply addressed to us is not forwarded further"
+        );
+    }
+
+    // ── NWK multicast (R22 §3.6.6) ───────────────────────────
+
+    fn multicast_to(group: ShortAddress) -> heapless::Vec<u8, 128> {
+        let mut header = frame(NwkFrameType::Data, PEER, group);
+        header.frame_control.multicast = true;
+        header.multicast_control = Some(0x09); // non-member mode, radius 1
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &[0x6D], &mut buf);
+        heapless::Vec::from_slice(&buf[..len]).expect("the frame fits")
+    }
+
+    #[test]
+    fn a_multicast_frame_is_never_taken_for_a_unicast_to_a_matching_address() {
+        for device_type in [DeviceType::EndDevice, DeviceType::Router] {
+            let mut nwk = node(device_type, OUR_ADDR);
+            // The group ID numerically equals our own short address.
+            let bytes = multicast_to(OUR_ADDR);
+            assert!(block_on(nwk.process_incoming_nwk_frame(&bytes, 200)).is_none());
+            assert!(nwk.mac.tx_history().is_empty());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_router_never_unicasts_a_multicast_frame_to_its_group_id() {
+        const GROUP: ShortAddress = ShortAddress(0x4321);
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        // A neighbour and a route that happen to match the group ID, and a
+        // parent to fall back on.
+        neighbour_with_cost(&mut router, GROUP, 1);
+        router.routing.update_route(FAR, NEXT_HOP, 1).unwrap();
+        let bytes = multicast_to(GROUP);
+        assert!(block_on(router.process_incoming_nwk_frame(&bytes, 200)).is_none());
+        block_on(router.process_pending_routing());
+        assert!(
+            router.mac.tx_history().is_empty(),
+            "the frame is neither unicast to the group ID nor handed to the parent"
+        );
+    }
+
+    // ── Broadcast delivery (R22 §3.6.5) ──────────────────────
+
+    #[cfg(feature = "router")]
+    fn broadcast_from(src: ShortAddress, seq: u8, radius: u8) -> heapless::Vec<u8, 128> {
+        let mut header = frame(NwkFrameType::Data, src, ShortAddress::BROADCAST);
+        header.seq_number = seq;
+        header.radius = radius;
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &[0xB0], &mut buf);
+        heapless::Vec::from_slice(&buf[..len]).expect("the frame fits")
+    }
+
+    #[cfg(feature = "router")]
+    fn pass_time(nwk: &mut NwkLayer<MockMac>, micros: u32) {
+        block_on(nwk.mac.delay_micros(micros));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_full_broadcast_transaction_table_drops_the_new_broadcast() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        for seq in 0..crate::routing::MAX_BTR as u8 {
+            assert!(router.btr.record(ORIGIN, seq));
+        }
+        assert!(
+            !router.btr.record(PEER, 0),
+            "a full table refuses a new entry"
+        );
+
+        let bytes = broadcast_from(PEER, 0x80, 5);
+        assert!(
+            block_on(router.process_incoming_nwk_frame(&bytes, 200)).is_none(),
+            "a broadcast that cannot be recorded is dropped"
+        );
+        assert!(router.mac.tx_history().is_empty(), "and not relayed");
+        for seq in 0..crate::routing::MAX_BTR as u8 {
+            assert!(
+                router.btr.is_duplicate(ORIGIN, seq),
+                "live transactions are never evicted"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relayed_broadcast_is_jittered_within_nwkc_max_broadcast_jitter() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        let mut delays = heapless::Vec::<u32, 8>::new();
+        for seq in 0..8u8 {
+            let start = router.mac.monotonic_micros();
+            let bytes = broadcast_from(PEER, seq, 5);
+            assert!(block_on(router.process_incoming_nwk_frame(&bytes, 200)).is_some());
+            let delay = router.mac.monotonic_micros().wrapping_sub(start);
+            assert!(delay < crate::conflict::MAX_BROADCAST_JITTER_US);
+            delays.push(delay).unwrap();
+        }
+        assert!(
+            delays.iter().any(|d| *d != delays[0]),
+            "the relay delay is randomised: {delays:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relayed_broadcast_is_retransmitted_until_every_router_neighbour_relays_it() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        let bytes = broadcast_from(PEER, 0x21, 5);
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER))).is_some()
+        );
+        assert_eq!(router.mac.tx_history().len(), 1, "relayed once");
+
+        // Inside nwkPassiveAckTimeout nothing is repeated.
+        block_on(router.process_pending_routing());
+        assert_eq!(router.mac.tx_history().len(), 1);
+
+        // NEXT_HOP stays silent: once the window closes the frame is repeated
+        // verbatim.
+        pass_time(&mut router, 500_001);
+        block_on(router.process_pending_routing());
+        assert_eq!(router.mac.tx_history().len(), 2, "one retransmission");
+        assert_eq!(
+            recorded_frame(&router, 1),
+            recorded_frame(&router, 0),
+            "the retransmission is the same broadcast"
+        );
+
+        // NEXT_HOP's relay is the passive acknowledgement.
+        let mut relayed = frame(NwkFrameType::Data, PEER, ShortAddress::BROADCAST);
+        relayed.seq_number = 0x21;
+        relayed.radius = 4;
+        let mut buf = [0u8; 128];
+        let len = encode(&relayed, &[0xB0], &mut buf);
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&buf[..len], 200, Some(NEXT_HOP)))
+                .is_none(),
+            "the neighbour's copy is a duplicate"
+        );
+        pass_time(&mut router, 500_001);
+        block_on(router.process_pending_routing());
+        assert_eq!(
+            router.mac.tx_history().len(),
+            2,
+            "acknowledged — no more retries"
+        );
+        assert!(router.passive_acks.entries.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn broadcast_retransmissions_stop_at_nwk_max_broadcast_retries() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        let bytes = broadcast_from(PEER, 0x22, 5);
+        block_on(router.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER)));
+        for _ in 0..6 {
+            pass_time(&mut router, 500_001);
+            block_on(router.process_pending_routing());
+        }
+        assert_eq!(
+            router.mac.tx_history().len(),
+            1 + usize::from(router.nib.max_broadcast_retries),
+        );
+        assert!(router.passive_acks.entries.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_broadcast_nobody_will_relay_is_not_retransmitted() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        // Relayed with radius 1: no neighbour may carry it further.
+        let bytes = broadcast_from(PEER, 0x23, 2);
+        block_on(router.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER)));
+        // Only the router neighbour it came from exists.
+        let mut lone = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut lone, PEER, 1);
+        let bytes = broadcast_from(PEER, 0x24, 5);
+        block_on(lone.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER)));
+        for nwk in [&mut router, &mut lone] {
+            pass_time(nwk, 500_001);
+            block_on(nwk.process_pending_routing());
+            assert_eq!(nwk.mac.tx_history().len(), 1);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_routers_own_broadcast_is_acknowledged_by_its_neighbours_relay() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        block_on(router.nlde_data_request(ShortAddress::BROADCAST, 5, &[0x01], false, false))
+            .expect("broadcast sent");
+        assert_eq!(router.mac.tx_history().len(), 1);
+        let own = recorded_frame(&router, 0);
+        let (mut header, consumed) = NwkHeader::parse(&own).unwrap();
+        header.radius -= 1;
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &own[consumed..], &mut buf);
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&buf[..len], 200, Some(PEER)))
+                .is_none()
+        );
+        pass_time(&mut router, 500_001);
+        block_on(router.process_pending_routing());
+        assert_eq!(
+            router.mac.tx_history().len(),
+            1,
+            "PEER relayed it — no retry"
+        );
+
+        // Without that relay the router repeats its own broadcast.
+        block_on(router.nlde_data_request(ShortAddress::BROADCAST, 5, &[0x02], false, false))
+            .expect("broadcast sent");
+        pass_time(&mut router, 500_001);
+        block_on(router.process_pending_routing());
+        assert_eq!(router.mac.tx_history().len(), 3);
+    }
+
+    // ── Route Reply correlation (R22 §3.6.3.5) ───────────────
+
+    /// The bytes of a Route Reply unicast from `transmitter` to `receiver`.
+    #[cfg(feature = "router")]
+    fn rrep_on_air(
+        transmitter: ShortAddress,
+        receiver: ShortAddress,
+        rrep: &crate::frames::RouteReply,
+    ) -> heapless::Vec<u8, 128> {
+        let mut body = [0u8; 32];
+        let body_len = rrep.serialize(&mut body);
+        let mut payload = [0u8; 32];
+        let payload_len =
+            command_payload(NwkCommandId::RouteReply, &body[..body_len], &mut payload);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(NwkFrameType::Command, transmitter, receiver),
+            &payload[..payload_len],
+            &mut buf,
+        );
+        heapless::Vec::from_slice(&buf[..len]).expect("the frame fits")
+    }
+
+    #[cfg(feature = "router")]
+    fn reply(
+        id: u8,
+        originator: ShortAddress,
+        responder: ShortAddress,
+        cost: u8,
+    ) -> crate::frames::RouteReply {
+        crate::frames::RouteReply {
+            command_options: 0,
+            route_request_id: id,
+            originator,
+            responder,
+            path_cost: cost,
+            originator_ieee: None,
+            responder_ieee: None,
+        }
+    }
+
+    /// Every Route Reply a node transmitted: `(MAC destination, NWK header,
+    /// reply)`.
+    #[cfg(feature = "router")]
+    fn sent_route_replies(
+        nwk: &NwkLayer<MockMac>,
+    ) -> heapless::Vec<(ShortAddress, NwkHeader, crate::frames::RouteReply), 8> {
+        let mut out = heapless::Vec::new();
+        for record in nwk.mac.tx_history() {
+            let bytes = record.payload.as_slice();
+            let (header, consumed) = NwkHeader::parse(bytes).expect("recorded frame parses");
+            if header.frame_control.frame_type != NwkFrameType::Command as u8
+                || bytes[consumed] != NwkCommandId::RouteReply as u8
+            {
+                continue;
+            }
+            let rrep = crate::frames::RouteReply::parse(&bytes[consumed + 1..])
+                .expect("the recorded RREP parses");
+            let _ = out.push((tx_short_dst(record).expect("short MAC dst"), header, rrep));
+        }
+        out
+    }
+
+    #[cfg(feature = "router")]
+    fn sent_route_requests(nwk: &NwkLayer<MockMac>) -> usize {
+        nwk.mac
+            .tx_history()
+            .iter()
+            .filter(|record| {
+                let bytes = record.payload.as_slice();
+                let (header, consumed) = NwkHeader::parse(bytes).expect("recorded frame parses");
+                header.frame_control.frame_type == NwkFrameType::Command as u8
+                    && bytes[consumed] == NwkCommandId::RouteRequest as u8
+            })
+            .count()
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_parent_answers_a_route_request_for_its_end_device_child() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        parent.nib.permit_joining = true;
+        let child = parent
+            .handle_child_association([0x5C; 8], 0x80)
+            .expect("the end device joins");
+        neighbour_with_cost(&mut parent, PEER, 1);
+
+        let on_air = rreq_on_air(ORIGIN, 0x31, 5, &standard_rreq(0x2A, child, 3));
+        assert!(
+            block_on(parent.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER))).is_none()
+        );
+        block_on(parent.process_pending_routing());
+
+        let replies = sent_route_replies(&parent);
+        assert_eq!(replies.len(), 1, "the parent answers for its child");
+        let (mac_dst, header, rrep) = &replies[0];
+        assert_eq!(
+            *mac_dst, PEER,
+            "the reply goes to the neighbour the request came from"
+        );
+        assert_eq!(header.dst_addr, PEER);
+        assert_eq!(rrep.route_request_id, 0x2A, "the real request ID is echoed");
+        assert_eq!(rrep.originator, ORIGIN);
+        assert_eq!(
+            rrep.responder, child,
+            "the responder is the end-device child"
+        );
+        assert_eq!(rrep.path_cost, 0, "the reply starts with zero cost");
+        assert_eq!(
+            sent_route_requests(&parent),
+            0,
+            "an answered request is not propagated further"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_router_with_only_a_cached_route_forwards_instead_of_answering() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        router.routing.update_route(FAR, NEXT_HOP, 2).unwrap();
+
+        let on_air = rreq_on_air(ORIGIN, 0x32, 5, &standard_rreq(0x11, FAR, 0));
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER))).is_none()
+        );
+        block_on(router.process_pending_routing());
+
+        assert!(
+            sent_route_replies(&router).is_empty(),
+            "a cached route does not entitle a router to answer for the destination"
+        );
+        assert!(
+            sent_route_requests(&router) > 0,
+            "the request keeps flooding"
+        );
+        let (_, forwarded) = parse_rreq(&recorded_frame(&router, 0));
+        assert_eq!(
+            forwarded.path_cost, 1,
+            "the forward carries the accumulated cost"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_route_reply_matching_no_discovery_is_dropped() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        let on_air = rreq_on_air(ORIGIN, 0x33, 5, &standard_rreq(9, FAR, 0));
+        block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER)));
+        block_on(router.process_pending_routing());
+        let sent = router.mac.tx_history().len();
+
+        // Same request ID, another originator; same originator, another ID.
+        for rrep in [reply(9, CONCENTRATOR, FAR, 1), reply(10, ORIGIN, FAR, 1)] {
+            let bytes = rrep_on_air(NEXT_HOP, OUR_ADDR, &rrep);
+            assert!(
+                block_on(router.process_incoming_nwk_frame_from(&bytes, 255, Some(NEXT_HOP)))
+                    .is_none()
+            );
+            block_on(router.process_pending_routing());
+        }
+
+        assert_eq!(
+            router.routing.next_hop(FAR),
+            None,
+            "no route from an unmatched reply"
+        );
+        assert_eq!(
+            router.mac.tx_history().len(),
+            sent,
+            "and nothing is forwarded"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relayed_route_reply_retraces_the_discovery_sender_with_accumulated_cost() {
+        const DETOUR: ShortAddress = ShortAddress(0x5555);
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        neighbour_with_cost(&mut router, NEXT_HOP, 2);
+        let on_air = rreq_on_air(ORIGIN, 0x34, 5, &standard_rreq(9, FAR, 0));
+        block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER)));
+        block_on(router.process_pending_routing());
+        // Whatever the routing table says about the originator later, the
+        // reply follows the path the request actually took.
+        router.routing.update_route(ORIGIN, DETOUR, 1).unwrap();
+        router.nib.parent_address = DETOUR;
+
+        let bytes = rrep_on_air(NEXT_HOP, OUR_ADDR, &reply(9, ORIGIN, FAR, 4));
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&bytes, 255, Some(NEXT_HOP))).is_none()
+        );
+        block_on(router.process_pending_routing());
+
+        let entry = router
+            .routing
+            .get_entry(FAR)
+            .expect("the forward route is installed");
+        assert_eq!(entry.next_hop, NEXT_HOP);
+        assert_eq!(
+            entry.path_cost,
+            4 + 2,
+            "reply cost plus our link to its sender"
+        );
+        let replies = sent_route_replies(&router);
+        assert_eq!(replies.len(), 1);
+        let (mac_dst, _, rrep) = &replies[0];
+        assert_eq!(
+            *mac_dst, PEER,
+            "the discovery entry's sender, not a route or the parent"
+        );
+        assert_eq!(rrep.route_request_id, 9);
+        assert_eq!(rrep.originator, ORIGIN);
+        assert_eq!(rrep.responder, FAR);
+        assert_eq!(
+            rrep.path_cost, 6,
+            "the forwarded reply carries the accumulated cost"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn the_originator_keeps_the_cheapest_route_reply() {
+        let mut origin = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut origin, PEER, 1);
+        neighbour_with_cost(&mut origin, NEXT_HOP, 1);
+        let id = block_on(origin.discover_route(FAR)).expect("the discovery starts");
+
+        let deliver = |nwk: &mut NwkLayer<MockMac>, from: ShortAddress, cost: u8| {
+            let bytes = rrep_on_air(from, OUR_ADDR, &reply(id, OUR_ADDR, FAR, cost));
+            assert!(
+                block_on(nwk.process_incoming_nwk_frame_from(&bytes, 255, Some(from))).is_none()
+            );
+        };
+        deliver(&mut origin, PEER, 4);
+        assert_eq!(origin.routing.next_hop(FAR), Some(PEER));
+        assert_eq!(origin.routing.get_entry(FAR).unwrap().path_cost, 5);
+
+        deliver(&mut origin, NEXT_HOP, 1);
+        assert_eq!(
+            origin.routing.next_hop(FAR),
+            Some(NEXT_HOP),
+            "a cheaper reply wins"
+        );
+        assert_eq!(origin.routing.get_entry(FAR).unwrap().path_cost, 2);
+
+        deliver(&mut origin, PEER, 1);
+        assert_eq!(
+            origin.routing.next_hop(FAR),
+            Some(NEXT_HOP),
+            "an equal-cost later reply does not displace the accepted one"
+        );
+        deliver(&mut origin, PEER, 7);
+        assert_eq!(origin.routing.next_hop(FAR), Some(NEXT_HOP));
+        assert!(
+            origin.pending_route_replies.is_empty(),
+            "the originator forwards nothing"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn send_route_reply_names_the_recorded_route_request_id() {
+        let mut dest = node(DeviceType::Router, OUR_ADDR);
+        assert_eq!(
+            block_on(dest.send_route_reply(PEER, ORIGIN, 0)),
+            Err(NwkStatus::InvalidRequest),
+            "a reply with no discovery to answer cannot be correlated"
+        );
+
+        let on_air = rreq_on_air(ORIGIN, 0x35, 5, &standard_rreq(0x4D, OUR_ADDR, 0));
+        block_on(dest.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER)));
+        dest.pending_route_replies.clear();
+        block_on(dest.send_route_reply(PEER, ORIGIN, 0)).expect("the reply is sent");
+        block_on(dest.send_route_reply_with_id(PEER, ORIGIN, 0x13, 0)).expect("sent");
+
+        let replies = sent_route_replies(&dest);
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0].2.route_request_id, 0x4D);
+        assert_eq!(replies[0].2.responder, OUR_ADDR);
+        assert_eq!(replies[1].2.route_request_id, 0x13);
+    }
+
+    /// Four devices, one hop apart in a line: A — B — C ⇢ E, where E is a
+    /// sleepy end-device child of C and A cannot hear C.
+    #[test]
+    #[cfg(feature = "router")]
+    fn route_discovery_reaches_an_end_device_two_routers_away() {
+        const A: ShortAddress = ShortAddress(0x000A);
+        const B: ShortAddress = ShortAddress(0x000B);
+        const C: ShortAddress = ShortAddress(0x000C);
+        let named = |addr: ShortAddress, ieee: u8| {
+            let mut nwk = node(DeviceType::Router, addr);
+            nwk.nib.ieee_address = [ieee; 8];
+            nwk
+        };
+        let (mut a, mut b, mut c) = (named(A, 0xA1), named(B, 0xB1), named(C, 0xC1));
+        c.nib.permit_joining = true;
+        let e = c
+            .handle_child_association([0xE1; 8], 0x80)
+            .expect("E joins C");
+
+        // A floods the Route Request; only B hears it.
+        let id = block_on(a.discover_route(e)).expect("A starts discovering E");
+        let rreq = recorded_frame(&a, 0);
+        assert!(block_on(b.process_incoming_nwk_frame_from(&rreq, 230, Some(A))).is_none());
+        block_on(b.process_pending_routing());
+
+        // B's forward reaches C, which answers for its child.
+        let forwarded = recorded_frame(&b, 0);
+        assert_eq!(parse_rreq(&forwarded).1.path_cost, 1);
+        assert!(block_on(c.process_incoming_nwk_frame_from(&forwarded, 230, Some(B))).is_none());
+        block_on(c.process_pending_routing());
+        assert_eq!(
+            sent_route_requests(&c),
+            0,
+            "C answers instead of flooding further"
+        );
+        let c_replies = sent_route_replies(&c);
+        assert_eq!(c_replies.len(), 1);
+        assert_eq!(c_replies[0].0, B);
+        assert_eq!(c_replies[0].2.responder, e);
+        assert_eq!(c_replies[0].2.route_request_id, id);
+
+        // B carries the reply back to A, adding its link to C.
+        let c_tx = c.mac.tx_history().len() - 1;
+        let rrep = recorded_frame(&c, c_tx);
+        assert!(block_on(b.process_incoming_nwk_frame_from(&rrep, 230, Some(C))).is_none());
+        block_on(b.process_pending_routing());
+        assert_eq!(b.routing.next_hop(e), Some(C));
+        let b_replies = sent_route_replies(&b);
+        assert_eq!(b_replies.len(), 1);
+        assert_eq!(b_replies[0].0, A);
+        assert_eq!(b_replies[0].2.path_cost, 1);
+
+        let b_tx = b.mac.tx_history().len() - 1;
+        let rrep = recorded_frame(&b, b_tx);
+        assert!(block_on(a.process_incoming_nwk_frame_from(&rrep, 230, Some(B))).is_none());
+        assert_eq!(a.routing.next_hop(e), Some(B), "A routes to E through B");
+        assert_eq!(a.routing.get_entry(e).unwrap().path_cost, 2);
+
+        // Data now follows the discovered path hop by hop.
+        let a_sent = a.mac.tx_history().len();
+        block_on(a.nlde_data_request(e, 5, &[0xDA], false, false)).expect("A sends to E");
+        let data_record = &a.mac.tx_history()[a_sent];
+        assert_eq!(tx_short_dst(data_record), Some(B));
+        let data = recorded_frame(&a, a_sent);
+        let b_sent = b.mac.tx_history().len();
+        assert!(block_on(b.process_incoming_nwk_frame_from(&data, 230, Some(A))).is_none());
+        assert_eq!(tx_short_dst(&b.mac.tx_history()[b_sent]), Some(C));
+        let relayed = recorded_frame(&b, b_sent);
+        assert!(block_on(c.process_incoming_nwk_frame_from(&relayed, 230, Some(B))).is_none());
+        assert!(
+            c.indirect_queue().has_pending(e),
+            "C holds the frame for its sleeping child"
         );
     }
 
@@ -5642,6 +6757,103 @@ mod tests {
             })
         );
         assert!(!nwk.is_joined());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn link_status_from_an_unknown_router_creates_a_neighbour_with_its_cost() {
+        // Two routers that have never met: B advertises A (incoming cost 2).
+        let mut a = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let mut b = secured_node(DeviceType::Router, NEXT_HOP, [0x44; 8]);
+        neighbour_with_cost(&mut b, OUR_ADDR, 2);
+        block_on(b.send_link_status()).expect("B sends its link status");
+        let on_air = recorded_frame(&b, 0);
+
+        assert!(
+            block_on(a.process_incoming_nwk_frame_from(&on_air, 220, Some(NEXT_HOP))).is_none()
+        );
+
+        let learned = a
+            .neighbors
+            .find_by_short(NEXT_HOP)
+            .expect("R22 §3.6.3.4.2: the sender's entry is created");
+        assert_eq!(learned.ieee_address, [0x44; 8]);
+        assert!(learned.is_router());
+        assert_eq!(learned.outgoing_cost, 2, "B's view of the link to A");
+        assert_eq!(learned.incoming_cost, 1, "A's own LQI estimate");
+        assert_eq!(learned.link_status_age, 0);
+
+        // A now advertises B in its own Link Status.
+        block_on(a.send_link_status()).expect("A sends its link status");
+        let (_, _, payload) = decrypt_recorded(&recorded_frame(&a, 0));
+        let report = crate::frames::LinkStatusReport::parse(&payload[1..]).expect("parses");
+        assert_eq!(report.incoming_cost_for(NEXT_HOP), Some(1));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relayed_link_status_teaches_nothing() {
+        let mut a = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let mut b = secured_node(DeviceType::Router, NEXT_HOP, [0x44; 8]);
+        neighbour_with_cost(&mut b, OUR_ADDR, 2);
+        block_on(b.send_link_status()).expect("B sends its link status");
+        let on_air = recorded_frame(&b, 0);
+
+        // Claimed to have arrived through PEER: not B's one-hop report.
+        let _ = block_on(a.process_incoming_nwk_frame_from(&on_air, 220, Some(PEER)));
+
+        assert!(
+            a.neighbors
+                .find_by_short(NEXT_HOP)
+                .is_none_or(|entry| entry.outgoing_cost == 0)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn every_frame_from_a_neighbour_refreshes_its_lqi_and_incoming_cost() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        router.update_neighbor_address(PEER, [0x33; 8]);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(NwkFrameType::Data, PEER, OUR_ADDR),
+            &[0x01],
+            &mut buf,
+        );
+
+        let _ = block_on(router.process_incoming_nwk_frame(&buf[..len], 220));
+        let entry = router.neighbors.find_by_short(PEER).unwrap();
+        assert_eq!(entry.lqi, 220);
+        assert_eq!(entry.incoming_cost, 1);
+
+        for _ in 0..20 {
+            let _ = block_on(router.process_incoming_nwk_frame(&buf[..len], 40));
+        }
+        let entry = router.neighbors.find_by_short(PEER).unwrap();
+        assert!(
+            entry.lqi <= 50,
+            "the average follows the link: {}",
+            entry.lqi
+        );
+        assert_eq!(entry.incoming_cost, 7);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_direct_data_frame_from_a_stranger_does_not_create_a_neighbour() {
+        // It may be somebody else's end device; only router evidence counts.
+        let mut router = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let mut stranger = secured_node(DeviceType::EndDevice, PEER, [0x33; 8]);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(NwkFrameType::Data, PEER, OUR_ADDR),
+            &[0x01],
+            &mut buf,
+        );
+        let secured = secure_as(&mut stranger, &buf[..len]);
+
+        assert!(block_on(router.process_incoming_nwk_frame(&secured, 220)).is_some());
+        assert!(router.neighbors.find_by_short(PEER).is_none());
     }
 
     #[test]
@@ -6527,6 +7739,171 @@ mod tests {
         assert!(
             !nwk.indirect_queue().has_pending(FAR),
             "an announced neighbour must not be parked in the indirect queue"
+        );
+    }
+
+    // ── Address map versus neighbor table (R22 §3.6.1.5) ─────
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_announced_device_lands_in_the_address_map_not_the_neighbor_table() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        let ieee = [9u8; 8];
+
+        nwk.note_announced_address(FAR, ieee);
+
+        assert!(
+            nwk.neighbor_table().find_by_short(FAR).is_none(),
+            "an announcing device may be any number of hops away"
+        );
+        assert_eq!(nwk.address_map().ieee_of(FAR), Some(ieee));
+        assert_eq!(nwk.find_short_by_ieee(&ieee), Some(FAR));
+        assert_eq!(nwk.find_ieee_by_short(FAR), Some(ieee));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relayed_source_ieee_never_makes_the_originator_a_neighbour() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.nib.ieee_address = [0x11; 8];
+        let mut header = frame(NwkFrameType::Data, FAR, OUR_ADDR);
+        header.frame_control.src_ieee_present = true;
+        header.src_ieee = Some([0x22; 8]);
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &[0x01], &mut buf);
+
+        // The frame was relayed to us by PEER: FAR is not one hop away.
+        assert!(
+            block_on(nwk.process_incoming_nwk_frame_from(&buf[..len], 42, Some(PEER))).is_some()
+        );
+
+        assert!(nwk.neighbor_table().find_by_short(FAR).is_none());
+        assert_eq!(nwk.find_ieee_by_short(FAR), Some([0x22; 8]));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_known_but_multi_hop_destination_is_discovered_not_sent_direct() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.nib.parent_address = ShortAddress(0xFFFF);
+        nwk.note_announced_address(FAR, [9u8; 8]);
+
+        let result = block_on(nwk.nlde_data_request(FAR, 30, &[0x01], false, true));
+
+        assert_eq!(result.err(), Some(NwkStatus::RouteDiscoveryFailed));
+        assert!(nwk.routing.has_active_discovery(FAR));
+        let history = nwk.mac.tx_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            tx_short_dst(&history[0]),
+            Some(ShortAddress::BROADCAST),
+            "only the route request goes out; nothing is unicast to FAR"
+        );
+        assert_eq!(tx_frame(&history[0]).1, NwkCommandId::RouteRequest as u8);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_router_reaches_its_parent_before_relearning_it_as_a_neighbour() {
+        // A restored router may not have its parent in the neighbor table yet;
+        // the parent it joined through is still one hop away.
+        let nwk = node(DeviceType::Router, OUR_ADDR);
+        assert!(
+            nwk.neighbor_table()
+                .find_by_short(ShortAddress(0x0000))
+                .is_none()
+        );
+        assert_eq!(
+            nwk.resolve_next_hop(ShortAddress(0x0000)),
+            Ok(ShortAddress(0x0000))
+        );
+        assert_eq!(nwk.resolve_next_hop(FAR), Err(NwkStatus::RouteError));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_router_relaying_to_an_unroutable_destination_discovers_or_reports() {
+        // discover_route set: the relay starts discovery itself.
+        let mut relay = node(DeviceType::Router, OUR_ADDR);
+        let mut header = frame(NwkFrameType::Data, PEER, FAR);
+        header.frame_control.discover_route = 1;
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &[0x01], &mut buf);
+        assert!(block_on(relay.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+        assert!(relay.routing.has_active_discovery(FAR));
+        assert!(relay.pending_route_errors.is_empty());
+
+        // discover_route clear: the originator learns there is no route.
+        let mut relay = node(DeviceType::Router, OUR_ADDR);
+        let len = encode(&frame(NwkFrameType::Data, PEER, FAR), &[0x01], &mut buf);
+        assert!(block_on(relay.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+        assert!(!relay.routing.has_active_discovery(FAR));
+        assert!(
+            relay
+                .mac
+                .tx_history()
+                .iter()
+                .all(|record| tx_short_dst(record) != Some(ShortAddress(0x0000))),
+            "an unroutable relay never falls back to the parent"
+        );
+        assert_eq!(relay.pending_route_errors.len(), 1);
+        assert_eq!(relay.pending_route_errors[0].destination, PEER);
+        assert_eq!(relay.pending_route_errors[0].failed_destination, FAR);
+        assert_eq!(
+            relay.pending_route_errors[0].status_code,
+            crate::frames::NetworkStatusCommand::NO_ROUTE_AVAILABLE
+        );
+    }
+
+    #[test]
+    fn an_unauthenticated_announce_is_ignored_on_a_secured_network() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.nib.security_enabled = true;
+
+        nwk.note_announced_address(FAR, [9u8; 8]);
+
+        assert_eq!(nwk.find_ieee_by_short(FAR), None);
+        assert!(nwk.take_command_outcome().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_announce_never_rewrites_a_child_mapping() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.nib.permit_joining = true;
+        let child_ieee = [7u8; 8];
+        let child = nwk
+            .handle_child_association(child_ieee, 0x80)
+            .expect("the child associates");
+
+        nwk.note_announced_address(FAR, child_ieee);
+
+        let entry = nwk
+            .neighbor_table()
+            .find_by_ieee(&child_ieee)
+            .expect("the child stays in the neighbor table");
+        assert_eq!(
+            entry.network_address, child,
+            "only join/rejoin/conflict processing may move a child"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn an_end_device_announce_never_rewrites_the_parent_mapping() {
+        let mut nwk = node(DeviceType::EndDevice, OUR_ADDR);
+        let parent_ieee = [0xAA; 8];
+        let mut parent =
+            crate::neighbor::NeighborEntry::new_from_annce(ShortAddress(0x0000), parent_ieee);
+        parent.relationship = crate::neighbor::Relationship::Parent;
+        parent.active = true;
+        nwk.neighbors.add_or_update(parent).unwrap();
+
+        nwk.note_announced_address(FAR, parent_ieee);
+
+        assert_eq!(
+            nwk.find_short_by_ieee(&parent_ieee),
+            Some(ShortAddress(0x0000))
         );
     }
 

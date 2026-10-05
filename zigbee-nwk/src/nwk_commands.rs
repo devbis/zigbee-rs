@@ -317,6 +317,7 @@ impl<M: MacDriver> NwkLayer<M> {
             .routing
             .add_discovery(crate::routing::RouteDiscovery {
                 request_id: rreq_id,
+                originator: self.nib.network_address,
                 destination: dest,
                 sender: self.nib.network_address,
                 forward_cost: 0,
@@ -334,7 +335,8 @@ impl<M: MacDriver> NwkLayer<M> {
             // Nothing was broadcast, so nothing may be waited for: withdraw
             // the record this call installed and report why the discovery
             // could not be started.
-            self.routing.fail_discovery(rreq_id);
+            self.routing
+                .fail_discovery_for(self.nib.network_address, rreq_id);
             log::warn!(
                 "[NWK] Route Request for 0x{:04X} not sent ({:?}); discovery withdrawn",
                 dest.0,
@@ -346,26 +348,78 @@ impl<M: MacDriver> NwkLayer<M> {
     }
 
     /// Send a Route Reply (RREP) unicast toward the originator.
+    ///
+    /// The reply names the route request ID of the discovery this device —
+    /// as its destination — recorded for `originator`; a reply cannot be
+    /// correlated without it, so `InvalidRequest` is returned when no such
+    /// discovery is known. Prefer [`Self::send_route_reply_with_id`].
     pub async fn send_route_reply(
         &mut self,
         dest: ShortAddress,
         originator: ShortAddress,
         path_cost: u8,
     ) -> Result<(), NwkStatus> {
+        let our_addr = self.nib.network_address;
+        let Some(route_request_id) = self
+            .routing
+            .discoveries()
+            .find(|d| d.originator == originator && d.destination == our_addr)
+            .map(|d| d.request_id)
+        else {
+            return Err(NwkStatus::InvalidRequest);
+        };
+        self.send_route_reply_with_id(dest, originator, route_request_id, path_cost)
+            .await
+    }
+
+    /// Send a Route Reply (RREP) for discovery (`originator`,
+    /// `route_request_id`) with this device as responder, unicast to the
+    /// next hop `dest` toward the originator (R22 §3.4.2).
+    pub async fn send_route_reply_with_id(
+        &mut self,
+        dest: ShortAddress,
+        originator: ShortAddress,
+        route_request_id: u8,
+        path_cost: u8,
+    ) -> Result<(), NwkStatus> {
         let rrep = RouteReply {
             command_options: 0x00,
-            route_request_id: 0,
+            route_request_id,
             originator,
             responder: self.nib.network_address,
             path_cost,
             originator_ieee: None,
             responder_ieee: None,
         };
+        self.send_route_reply_frame(dest, &rrep).await
+    }
+
+    /// Unicast a Route Reply to the neighbour `next_hop`.
+    ///
+    /// A Route Reply always travels exactly one hop — to the neighbour the
+    /// best copy of the request was heard from — and each hop re-issues it
+    /// (R22 §3.6.3.5.2/3), so the NWK destination is that neighbour and the
+    /// frame is handed to the MAC for it directly. That neighbour is known to
+    /// be in range because its request was just received, even when it has
+    /// not been entered into the neighbour table.
+    async fn send_route_reply_frame(
+        &mut self,
+        next_hop: ShortAddress,
+        rrep: &RouteReply,
+    ) -> Result<(), NwkStatus> {
         let mut payload = [0u8; 32];
         let len = rrep.serialize(&mut payload);
-
-        self.send_nwk_command(dest, NwkCommandId::RouteReply, &payload[..len])
-            .await
+        self.send_nwk_command_from_with_radius(
+            next_hop,
+            self.nib.network_address,
+            Some(self.nib.ieee_address),
+            None,
+            NwkCommandId::RouteReply,
+            &payload[..len],
+            1,
+            Some(next_hop),
+        )
+        .await
     }
 
     /// Send this device's Link Status (R22 §3.4.8, §3.6.3.4.1).
@@ -896,14 +950,9 @@ impl<M: MacDriver> NwkLayer<M> {
                 originator_ieee: None,
                 responder_ieee: None,
             };
-            let mut payload = [0u8; 32];
-            let len = rrep.serialize(&mut payload);
-
-            if let Err(e) = zigbee_types::await_out_of_line!(self.send_nwk_command(
-                pending.next_hop,
-                NwkCommandId::RouteReply,
-                &payload[..len]
-            )) {
+            if let Err(e) = zigbee_types::await_out_of_line!(
+                self.send_route_reply_frame(pending.next_hop, &rrep)
+            ) {
                 log::warn!(
                     "[NWK] Failed to send queued RREP to 0x{:04X}: {:?}",
                     pending.next_hop.0,
@@ -922,6 +971,10 @@ impl<M: MacDriver> NwkLayer<M> {
                 );
             }
         }
+
+        // Retransmit broadcasts no router neighbour was heard relaying
+        #[cfg(feature = "router")]
+        zigbee_types::await_out_of_line!(self.service_passive_acks());
 
         // Send link status if due
         if self.link_status_due {

@@ -4358,10 +4358,16 @@ mod resume_tests {
     #[test]
     fn router_relays_traffic_for_other_devices_and_delivers_its_own_locally() {
         let mut device = resumed_router();
+        // The destination must be routable: a one-hop neighbour here. (An
+        // unknown destination is never forwarded to the parent as a guess.)
+        device
+            .bdb
+            .zdo_mut()
+            .nwk_mut()
+            .update_neighbor_address(NEIGHBOUR, [9u8; 8]);
 
         // Addressed to another device: authenticated first, then forwarded
-        // toward the best next hop (here the parent, the last resort of
-        // `resolve_next_hop`) under freshly applied NWK security.
+        // toward the next hop under freshly applied NWK security.
         let relayed = nwk_frame(
             zigbee_nwk::frames::NwkFrameType::Data,
             NEIGHBOUR,
@@ -4388,7 +4394,7 @@ mod resume_tests {
             assert!(header.frame_control.security);
             assert!(matches!(
                 history[0].dst,
-                zigbee_types::MacAddress::Short(_, COORDINATOR)
+                zigbee_types::MacAddress::Short(_, NEIGHBOUR)
             ));
 
             // The mutated header is CCM* additional authenticated data, so the

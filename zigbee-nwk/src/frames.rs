@@ -5,6 +5,19 @@
 
 use zigbee_types::{IeeeAddress, PanId, ShortAddress};
 
+/// nwkcProtocolVersion (R22 Table 3-57): every Zigbee PRO NWK frame carries 2.
+pub const NWKC_PROTOCOL_VERSION: u8 = 0x02;
+
+/// Read a full 64-bit IEEE address at `*offset`, advancing it. `None` when the
+/// buffer is truncated.
+fn read_ieee(data: &[u8], offset: &mut usize) -> Option<IeeeAddress> {
+    let bytes = data.get(*offset..*offset + 8)?;
+    let mut addr = [0u8; 8];
+    addr.copy_from_slice(bytes);
+    *offset += 8;
+    Some(addr)
+}
+
 /// NWK frame types (2-bit field in Frame Control)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -155,6 +168,11 @@ impl NwkHeader {
 
         let fc_raw = u16::from_le_bytes([data[0], data[1]]);
         let frame_control = NwkFrameControl::parse(fc_raw);
+        // R22 §3.3.1.1.2: a frame carrying a protocol version other than
+        // nwkcProtocolVersion (0x02) is not ours to interpret.
+        if frame_control.protocol_version != NWKC_PROTOCOL_VERSION {
+            return None;
+        }
         let dst_addr = ShortAddress(u16::from_le_bytes([data[2], data[3]]));
         let src_addr = ShortAddress(u16::from_le_bytes([data[4], data[5]]));
         let radius = data[6];
@@ -162,29 +180,21 @@ impl NwkHeader {
 
         let mut offset = 8;
 
-        // Optional destination IEEE
-        let dst_ieee = if frame_control.dst_ieee_present && data.len() >= offset + 8 {
-            let mut addr = [0u8; 8];
-            addr.copy_from_slice(&data[offset..offset + 8]);
-            offset += 8;
-            Some(addr)
+        // Optional fields announced by the frame control must be present in
+        // full. Skipping a truncated field would silently shift every later
+        // offset and hand the upper layer a misaligned payload.
+        let dst_ieee = if frame_control.dst_ieee_present {
+            Some(read_ieee(data, &mut offset)?)
         } else {
             None
         };
-
-        // Optional source IEEE
-        let src_ieee = if frame_control.src_ieee_present && data.len() >= offset + 8 {
-            let mut addr = [0u8; 8];
-            addr.copy_from_slice(&data[offset..offset + 8]);
-            offset += 8;
-            Some(addr)
+        let src_ieee = if frame_control.src_ieee_present {
+            Some(read_ieee(data, &mut offset)?)
         } else {
             None
         };
-
-        // Multicast control
-        let multicast_control = if frame_control.multicast && data.len() > offset {
-            let mc = data[offset];
+        let multicast_control = if frame_control.multicast {
+            let mc = *data.get(offset)?;
             offset += 1;
             Some(mc)
         } else {
@@ -361,10 +371,8 @@ impl RouteRequest {
         let route_request_id = data[1];
         let dst_addr = ShortAddress(u16::from_le_bytes([data[2], data[3]]));
         let path_cost = data[4];
-        let dst_ieee = if command_options & (1 << 5) != 0 && data.len() >= 13 {
-            let mut addr = [0u8; 8];
-            addr.copy_from_slice(&data[5..13]);
-            Some(addr)
+        let dst_ieee = if command_options & (1 << 5) != 0 {
+            Some(read_ieee(data, &mut 5)?)
         } else {
             None
         };
@@ -417,18 +425,13 @@ impl RouteReply {
         let responder = ShortAddress(u16::from_le_bytes([data[4], data[5]]));
         let path_cost = data[6];
         let mut offset = 7;
-        let originator_ieee = if command_options & (1 << 4) != 0 && data.len() >= offset + 8 {
-            let mut addr = [0u8; 8];
-            addr.copy_from_slice(&data[offset..offset + 8]);
-            offset += 8;
-            Some(addr)
+        let originator_ieee = if command_options & (1 << 4) != 0 {
+            Some(read_ieee(data, &mut offset)?)
         } else {
             None
         };
-        let responder_ieee = if command_options & (1 << 5) != 0 && data.len() >= offset + 8 {
-            let mut addr = [0u8; 8];
-            addr.copy_from_slice(&data[offset..offset + 8]);
-            Some(addr)
+        let responder_ieee = if command_options & (1 << 5) != 0 {
+            Some(read_ieee(data, &mut offset)?)
         } else {
             None
         };
@@ -1014,6 +1017,68 @@ mod tests {
         for frame in malformed {
             assert!(NwkHeader::parse(frame).is_none(), "{frame:02X?}");
         }
+    }
+
+    #[test]
+    fn rejects_frames_with_truncated_optional_header_fields() {
+        // Destination IEEE flagged (bit 11) but only 4 bytes follow.
+        let dst_ieee: &[u8] = &[0x08, 0x08, 1, 0, 2, 0, 5, 1, 1, 2, 3, 4];
+        // Source IEEE flagged (bit 12) but only 7 bytes follow.
+        let src_ieee: &[u8] = &[0x08, 0x10, 1, 0, 2, 0, 5, 1, 1, 2, 3, 4, 5, 6, 7];
+        // Multicast flagged (bit 8) but the multicast control byte is missing.
+        let multicast: &[u8] = &[0x08, 0x01, 1, 0, 2, 0, 5, 1];
+        for frame in [dst_ieee, src_ieee, multicast] {
+            assert!(NwkHeader::parse(frame).is_none(), "{frame:02X?}");
+        }
+
+        // The complete versions parse and consume every optional field.
+        let mut full = [0u8; 8 + 8 + 8 + 1 + 2];
+        full[..8].copy_from_slice(&[0x08, 0x19, 1, 0, 2, 0, 5, 1]);
+        full[8..16].fill(0xD1);
+        full[16..24].fill(0x51);
+        full[24] = 0x0C;
+        full[25..].copy_from_slice(&[0xAA, 0xBB]);
+        let (hdr, consumed) = NwkHeader::parse(&full).unwrap();
+        assert_eq!(consumed, 25);
+        assert_eq!(hdr.dst_ieee, Some([0xD1; 8]));
+        assert_eq!(hdr.src_ieee, Some([0x51; 8]));
+        assert_eq!(hdr.multicast_control, Some(0x0C));
+    }
+
+    #[test]
+    fn rejects_frames_with_a_foreign_protocol_version() {
+        // Same header with protocol version 2 (0x08) parses; 1 and 3 do not.
+        assert!(NwkHeader::parse(&[0x08, 0x00, 1, 0, 2, 0, 5, 1]).is_some());
+        assert!(NwkHeader::parse(&[0x04, 0x00, 1, 0, 2, 0, 5, 1]).is_none());
+        assert!(NwkHeader::parse(&[0x0C, 0x00, 1, 0, 2, 0, 5, 1]).is_none());
+    }
+
+    #[test]
+    fn route_commands_reject_truncated_optional_ieee_addresses() {
+        use super::{RouteReply, RouteRequest};
+        // RREQ with the destination-IEEE option but only 3 address bytes.
+        assert!(RouteRequest::parse(&[0x20, 1, 0x34, 0x12, 0, 1, 2, 3]).is_none());
+        let mut rreq = [0u8; 13];
+        rreq[..5].copy_from_slice(&[0x20, 1, 0x34, 0x12, 0]);
+        rreq[5..].fill(0xEE);
+        assert_eq!(
+            RouteRequest::parse(&rreq).unwrap().dst_ieee,
+            Some([0xEE; 8])
+        );
+
+        // RREP with both IEEE options: originator complete, responder cut short.
+        let mut rrep = [0u8; 7 + 8 + 4];
+        rrep[..7].copy_from_slice(&[0x30, 1, 1, 0, 2, 0, 3]);
+        assert!(RouteReply::parse(&rrep).is_none());
+        // Originator IEEE flagged but absent.
+        assert!(RouteReply::parse(&[0x10, 1, 1, 0, 2, 0, 3]).is_none());
+        let mut ok = [0u8; 7 + 16];
+        ok[..7].copy_from_slice(&[0x30, 1, 1, 0, 2, 0, 3]);
+        ok[7..15].fill(0x0A);
+        ok[15..].fill(0x0B);
+        let parsed = RouteReply::parse(&ok).unwrap();
+        assert_eq!(parsed.originator_ieee, Some([0x0A; 8]));
+        assert_eq!(parsed.responder_ieee, Some([0x0B; 8]));
     }
 
     #[test]

@@ -1006,7 +1006,11 @@ impl<M: MacDriver> NwkLayer<M> {
         let total_len;
 
         if secured {
-            // Encrypt rejoin request with network key
+            // Encrypt rejoin request with network key. Key and sequence come
+            // from one entry; resolve them before a frame counter is drawn.
+            let Some((key, key_seq_number)) = self.active_tx_key() else {
+                return Err(NwkStatus::InvalidRequest);
+            };
             let sec_hdr = crate::security::NwkSecurityHeader {
                 security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
                 frame_counter: self
@@ -1014,30 +1018,26 @@ impl<M: MacDriver> NwkLayer<M> {
                     .next_frame_counter()
                     .ok_or(NwkStatus::InvalidRequest)?,
                 source_address: self.nib.ieee_address,
-                key_seq_number: self.nib.active_key_seq_number,
+                key_seq_number,
             };
             let sec_hdr_len = sec_hdr.serialize(&mut nwk_frame_buf[hdr_len..]);
             let aad_len = hdr_len + sec_hdr_len;
 
-            if let Some(key_entry) = self.security.active_key() {
-                if let Some(encrypted) = self.security.encrypt_with(
-                    &mut self.mac,
-                    &nwk_frame_buf[..aad_len],
-                    &cmd_payload,
-                    &key_entry.key,
-                    &sec_hdr,
-                ) {
-                    if aad_len + encrypted.len() > nwk_frame_buf.len() {
-                        return Err(NwkStatus::FrameTooLong);
-                    }
-                    nwk_frame_buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
-                    total_len = aad_len + encrypted.len();
-                    // Zigbee transmits security level 0 in the auxiliary
-                    // header while authenticating with the actual level 5.
-                    nwk_frame_buf[hdr_len] &= !0x07;
-                } else {
-                    return Err(NwkStatus::InvalidRequest);
+            if let Some(encrypted) = self.security.encrypt_with(
+                &mut self.mac,
+                &nwk_frame_buf[..aad_len],
+                &cmd_payload,
+                &key,
+                &sec_hdr,
+            ) {
+                if aad_len + encrypted.len() > nwk_frame_buf.len() {
+                    return Err(NwkStatus::FrameTooLong);
                 }
+                nwk_frame_buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+                total_len = aad_len + encrypted.len();
+                // Zigbee transmits security level 0 in the auxiliary
+                // header while authenticating with the actual level 5.
+                nwk_frame_buf[hdr_len] &= !0x07;
             } else {
                 return Err(NwkStatus::InvalidRequest);
             }
@@ -1412,6 +1412,9 @@ impl<M: MacDriver> NwkLayer<M> {
         let total_len;
         if self.nib.security_enabled {
             // Apply NWK security — same path as rejoin and data frames
+            let Some((key, key_seq_number)) = self.active_tx_key() else {
+                return Err(NwkStatus::NoKey);
+            };
             let sec_hdr = crate::security::NwkSecurityHeader {
                 security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
                 frame_counter: self
@@ -1419,30 +1422,23 @@ impl<M: MacDriver> NwkLayer<M> {
                     .next_frame_counter()
                     .ok_or(NwkStatus::InvalidRequest)?,
                 source_address: self.nib.ieee_address,
-                key_seq_number: self.nib.active_key_seq_number,
+                key_seq_number,
             };
             let sec_hdr_len = sec_hdr.serialize(&mut buf[hdr_len..]);
             let aad_len = hdr_len + sec_hdr_len;
 
-            if let Some(key_entry) = self.security.active_key() {
-                if let Some(encrypted) = self.security.encrypt_with(
-                    &mut self.mac,
-                    &buf[..aad_len],
-                    &payload,
-                    &key_entry.key,
-                    &sec_hdr,
-                ) {
-                    if aad_len + encrypted.len() > buf.len() {
-                        return Err(NwkStatus::FrameTooLong);
-                    }
-                    buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
-                    total_len = aad_len + encrypted.len();
-                    buf[hdr_len] &= !0x07;
-                } else {
-                    return Err(NwkStatus::BadCcmOutput);
+            if let Some(encrypted) =
+                self.security
+                    .encrypt_with(&mut self.mac, &buf[..aad_len], &payload, &key, &sec_hdr)
+            {
+                if aad_len + encrypted.len() > buf.len() {
+                    return Err(NwkStatus::FrameTooLong);
                 }
+                buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+                total_len = aad_len + encrypted.len();
+                buf[hdr_len] &= !0x07;
             } else {
-                return Err(NwkStatus::NoKey);
+                return Err(NwkStatus::BadCcmOutput);
             }
         } else {
             // No security — send plaintext
@@ -1485,12 +1481,15 @@ impl<M: MacDriver> NwkLayer<M> {
     fn finish_leave(&mut self, rejoin: bool) {
         self.joined = false;
         self.neighbors = crate::neighbor::NeighborTable::new();
+        self.address_map.clear();
         self.routing = crate::routing::RoutingTable::new();
         // Conflict work belongs to the network being left: an address-conflict
         // announcement names an address this device no longer holds, and a
         // deferred PAN identifier switch would retune the radio away from
         // whatever network it joins next (R22 §3.6.1.9.3, §3.6.1.13.3).
         self.pending_conflicts.clear();
+        #[cfg(feature = "router")]
+        self.passive_acks.clear();
         self.pending_pan_id_update = None;
         self.pending_pan_id_broadcast = None;
         self.abort_lifecycle_persistence();
@@ -1731,10 +1730,13 @@ impl<M: MacDriver> NwkLayer<M> {
         if !warm_start {
             self.nib = Nib::new();
             self.neighbors = crate::neighbor::NeighborTable::new();
+            self.address_map.clear();
             self.routing = crate::routing::RoutingTable::new();
             self.security = crate::security::NwkSecurity::new();
             self.joined = false;
             self.pending_conflicts.clear();
+            #[cfg(feature = "router")]
+            self.passive_acks.clear();
             self.pending_pan_id_update = None;
             self.pending_pan_id_broadcast = None;
             self.abort_lifecycle_persistence();
