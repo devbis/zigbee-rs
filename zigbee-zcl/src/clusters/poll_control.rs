@@ -152,17 +152,75 @@ impl PollControlCluster {
     }
 
     /// Enter fast-polling mode with the given timeout (in quarter-seconds).
+    ///
+    /// The timeout applies to this fast-poll period only; the FastPollTimeout
+    /// attribute (the default period) is left unchanged.
     pub fn set_fast_polling(&mut self, timeout: u16) {
-        let _ = self
-            .store
-            .set_raw(ATTR_FAST_POLL_TIMEOUT, ZclValue::U16(timeout));
         self.fast_poll_remaining = timeout;
-        self.fast_polling = true;
+        self.fast_polling = timeout != 0;
     }
 
     /// Whether the device is currently in fast-polling mode.
     pub fn is_fast_polling(&self) -> bool {
         self.fast_polling
+    }
+
+    fn u32_attr(&self, id: AttributeId) -> u32 {
+        match self.store.get(id) {
+            Some(ZclValue::U32(v)) => *v,
+            Some(ZclValue::U16(v)) => *v as u32,
+            _ => 0,
+        }
+    }
+
+    /// Range/ordering rules for the poll intervals (ZCL r8 §3.16.4).
+    fn check_value(&self, id: AttributeId, value: &ZclValue) -> Result<(), ZclStatus> {
+        let ok = match (id, value) {
+            // 0 disables check-ins; otherwise within range, not below the
+            // product minimum and not shorter than the long poll interval.
+            (ATTR_CHECK_IN_INTERVAL, ZclValue::U32(v)) => {
+                *v == 0
+                    || (*v <= MAX_POLL_INTERVAL
+                        && *v >= self.u32_attr(ATTR_CHECK_IN_INTERVAL_MIN)
+                        && *v >= self.u32_attr(ATTR_LONG_POLL_INTERVAL))
+            }
+            (ATTR_FAST_POLL_TIMEOUT, ZclValue::U16(v)) => self.fast_poll_timeout_ok(*v),
+            _ => true,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(ZclStatus::InvalidValue)
+        }
+    }
+
+    /// FastPollTimeout values must be non-zero and, when the product
+    /// advertises a FastPollTimeoutMax, not exceed it.
+    fn fast_poll_timeout_ok(&self, v: u16) -> bool {
+        let max = self.u32_attr(ATTR_FAST_POLL_TIMEOUT_MAX);
+        v != 0 && (max == 0 || v as u32 <= max)
+    }
+}
+
+/// Largest LongPollInterval / CheckInInterval (quarter-seconds, ZCL r8 §3.16.4).
+const MAX_POLL_INTERVAL: u32 = 0x006E_0000;
+
+/// Attribute writes go through the cluster so range/ordering rules are
+/// enforced (INVALID_VALUE), not just the data type.
+impl AttributeStoreMutAccess for PollControlCluster {
+    fn set(&mut self, id: AttributeId, value: ZclValue) -> Result<(), ZclStatus> {
+        AttributeStoreMutAccess::validate_set(self, id, &value)?;
+        self.store.set(id, value)
+    }
+    fn set_raw(&mut self, id: AttributeId, value: ZclValue) -> Result<(), ZclStatus> {
+        self.store.set_raw(id, value)
+    }
+    fn find(&self, id: AttributeId) -> Option<&AttributeDefinition> {
+        self.store.find(id)
+    }
+    fn validate_set(&self, id: AttributeId, value: &ZclValue) -> Result<(), ZclStatus> {
+        self.store.validate_set(id, value)?;
+        self.check_value(id, value)
     }
 }
 
@@ -182,9 +240,18 @@ impl Cluster for PollControlCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 let start_fast_polling = payload[0] != 0;
-                let fast_poll_timeout = u16::from_le_bytes([payload[1], payload[2]]);
+                let requested = u16::from_le_bytes([payload[1], payload[2]]);
                 if start_fast_polling {
-                    self.set_fast_polling(fast_poll_timeout);
+                    // §3.16.5.1: a zero timeout means "use the FastPollTimeout
+                    // attribute"; a non-zero one must respect FastPollTimeoutMax.
+                    let timeout = if requested == 0 {
+                        self.u32_attr(ATTR_FAST_POLL_TIMEOUT) as u16
+                    } else if self.fast_poll_timeout_ok(requested) {
+                        requested
+                    } else {
+                        return Err(ZclStatus::InvalidField);
+                    };
+                    self.set_fast_polling(timeout);
                 } else {
                     self.fast_polling = false;
                 }
@@ -199,9 +266,19 @@ impl Cluster for PollControlCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 let interval = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let _ = self
-                    .store
-                    .set_raw(ATTR_LONG_POLL_INTERVAL, ZclValue::U32(interval));
+                // §3.16.5.3: within 0x04..=0x6E0000, not below
+                // LongPollIntervalMin or ShortPollInterval, and not above
+                // a non-zero CheckInInterval.
+                let check_in = self.u32_attr(ATTR_CHECK_IN_INTERVAL);
+                if !(4..=MAX_POLL_INTERVAL).contains(&interval)
+                    || interval < self.u32_attr(ATTR_LONG_POLL_INTERVAL_MIN)
+                    || interval < self.u32_attr(ATTR_SHORT_POLL_INTERVAL)
+                    || (check_in != 0 && interval > check_in)
+                {
+                    return Err(ZclStatus::InvalidValue);
+                }
+                self.store
+                    .set_raw(ATTR_LONG_POLL_INTERVAL, ZclValue::U32(interval))?;
                 Ok(heapless::Vec::new())
             }
             CMD_SET_SHORT_POLL_INTERVAL => {
@@ -209,9 +286,12 @@ impl Cluster for PollControlCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 let interval = u16::from_le_bytes([payload[0], payload[1]]);
-                let _ = self
-                    .store
-                    .set_raw(ATTR_SHORT_POLL_INTERVAL, ZclValue::U16(interval));
+                // §3.16.5.4: non-zero and not above LongPollInterval.
+                if interval == 0 || interval as u32 > self.u32_attr(ATTR_LONG_POLL_INTERVAL) {
+                    return Err(ZclStatus::InvalidValue);
+                }
+                self.store
+                    .set_raw(ATTR_SHORT_POLL_INTERVAL, ZclValue::U16(interval))?;
                 Ok(heapless::Vec::new())
             }
             _ => Err(ZclStatus::UnsupClusterCommand),
@@ -238,7 +318,7 @@ impl Cluster for PollControlCluster {
     }
 
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
-        &mut self.store
+        self
     }
 
     fn reset_to_factory_defaults(&mut self) {
@@ -261,5 +341,93 @@ impl Cluster for PollControlCluster {
         self.fast_polling = false;
         self.ticks_since_checkin = 0;
         self.fast_poll_remaining = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn get(c: &PollControlCluster, id: AttributeId) -> ZclValue {
+        c.attributes().get(id).unwrap().clone()
+    }
+
+    #[test]
+    fn check_in_response_zero_timeout_uses_fast_poll_timeout_attribute() {
+        let mut c = PollControlCluster::new();
+        c.handle_command(CMD_CHECK_IN_RESPONSE, &[1, 0, 0]).unwrap();
+        assert!(c.is_fast_polling());
+        // Default FastPollTimeout is 40 quarter-seconds: ends after 40 ticks.
+        for _ in 0..39 {
+            c.tick();
+        }
+        assert!(c.is_fast_polling());
+        c.tick();
+        assert!(!c.is_fast_polling());
+        // A per-check-in timeout does not overwrite the attribute.
+        c.handle_command(CMD_CHECK_IN_RESPONSE, &[1, 8, 0]).unwrap();
+        assert_eq!(get(&c, ATTR_FAST_POLL_TIMEOUT), ZclValue::U16(40));
+    }
+
+    #[test]
+    fn fast_poll_timeout_max_is_enforced() {
+        let mut c = PollControlCluster::new();
+        c.store
+            .set_raw(ATTR_FAST_POLL_TIMEOUT_MAX, ZclValue::U16(100))
+            .unwrap();
+        assert_eq!(
+            c.handle_command(CMD_CHECK_IN_RESPONSE, &[1, 101, 0]),
+            Err(ZclStatus::InvalidField)
+        );
+        assert!(!c.is_fast_polling());
+        assert_eq!(
+            c.attributes_mut()
+                .set(ATTR_FAST_POLL_TIMEOUT, ZclValue::U16(101)),
+            Err(ZclStatus::InvalidValue)
+        );
+        assert_eq!(
+            c.attributes_mut()
+                .set(ATTR_FAST_POLL_TIMEOUT, ZclValue::U16(0)),
+            Err(ZclStatus::InvalidValue)
+        );
+        c.attributes_mut()
+            .set(ATTR_FAST_POLL_TIMEOUT, ZclValue::U16(100))
+            .unwrap();
+    }
+
+    #[test]
+    fn poll_interval_commands_validate_range_and_ordering() {
+        let mut c = PollControlCluster::new();
+        let long = |v: u32| v.to_le_bytes();
+        for bad in [
+            0u32, 3, 2,     /* < short (4) */
+            14401, /* > check-in */
+        ] {
+            assert_eq!(
+                c.handle_command(CMD_SET_LONG_POLL_INTERVAL, &long(bad)),
+                Err(ZclStatus::InvalidValue),
+                "{bad}"
+            );
+        }
+        c.handle_command(CMD_SET_LONG_POLL_INTERVAL, &long(8))
+            .unwrap();
+        assert_eq!(get(&c, ATTR_LONG_POLL_INTERVAL), ZclValue::U32(8));
+        for bad in [0u16, 9] {
+            assert_eq!(
+                c.handle_command(CMD_SET_SHORT_POLL_INTERVAL, &bad.to_le_bytes()),
+                Err(ZclStatus::InvalidValue)
+            );
+        }
+        c.handle_command(CMD_SET_SHORT_POLL_INTERVAL, &8u16.to_le_bytes())
+            .unwrap();
+        // CheckInInterval below LongPollInterval is rejected; 0 disables.
+        assert_eq!(
+            c.attributes_mut()
+                .set(ATTR_CHECK_IN_INTERVAL, ZclValue::U32(7)),
+            Err(ZclStatus::InvalidValue)
+        );
+        c.attributes_mut()
+            .set(ATTR_CHECK_IN_INTERVAL, ZclValue::U32(0))
+            .unwrap();
     }
 }

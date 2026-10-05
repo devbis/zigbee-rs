@@ -179,11 +179,67 @@ impl IasZoneCluster {
             .set_raw(ATTR_IAS_CIE_ADDRESS, ZclValue::IeeeAddr(ieee));
     }
 
+    /// Whether `src_ieee` is the enrolled CIE (`IAS_CIE_Address`).
+    ///
+    /// Only the CIE may enroll the zone: the dispatcher SHOULD call
+    /// [`Self::handle_enroll_response_from`] (or check this first) instead of
+    /// passing a Zone Enroll Response from any source to `handle_command`.
+    pub fn is_from_cie(&self, src_ieee: u64) -> bool {
+        let cie = self.get_cie_address();
+        cie != 0 && cie != u64::MAX && cie == src_ieee
+    }
+
+    /// Process a Zone Enroll Response, accepting it only from the CIE whose
+    /// address is in `IAS_CIE_Address`. Returns `Err(Failure)` and leaves the
+    /// enrollment state untouched otherwise.
+    pub fn handle_enroll_response_from(
+        &mut self,
+        src_ieee: u64,
+        payload: &[u8],
+    ) -> Result<(), ZclStatus> {
+        if !self.is_from_cie(src_ieee) {
+            return Err(ZclStatus::Failure);
+        }
+        self.handle_command(CMD_ZONE_ENROLL_RESPONSE, payload)
+            .map(|_| ())
+    }
+
+    fn sensitivity_supported(&self, level: u8) -> bool {
+        match self.store.get(ATTR_NUM_ZONE_SENSITIVITY_LEVELS) {
+            Some(ZclValue::U8(n)) => level < *n,
+            _ => level == 0,
+        }
+    }
+
     /// Get the CIE IEEE address.
     pub fn get_cie_address(&self) -> u64 {
         match self.store.get(ATTR_IAS_CIE_ADDRESS) {
             Some(ZclValue::IeeeAddr(v)) => *v,
             _ => 0,
+        }
+    }
+}
+
+impl AttributeStoreMutAccess for IasZoneCluster {
+    fn set(&mut self, id: AttributeId, value: ZclValue) -> Result<(), ZclStatus> {
+        AttributeStoreMutAccess::validate_set(self, id, &value)?;
+        self.store.set(id, value)
+    }
+    fn set_raw(&mut self, id: AttributeId, value: ZclValue) -> Result<(), ZclStatus> {
+        self.store.set_raw(id, value)
+    }
+    fn find(&self, id: AttributeId) -> Option<&AttributeDefinition> {
+        self.store.find(id)
+    }
+    fn validate_set(&self, id: AttributeId, value: &ZclValue) -> Result<(), ZclStatus> {
+        self.store.validate_set(id, value)?;
+        match (id, value) {
+            (ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL, ZclValue::U8(v))
+                if !self.sensitivity_supported(*v) =>
+            {
+                Err(ZclStatus::InvalidValue)
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -203,15 +259,16 @@ impl Cluster for IasZoneCluster {
                 if payload.len() < 2 {
                     return Err(ZclStatus::MalformedCommand);
                 }
-                let enroll_response_code = payload[0];
-                let zone_id = payload[1];
-                if enroll_response_code == 0x00 {
-                    // Success
-                    let _ = self
-                        .store
-                        .set_raw(ATTR_ZONE_STATE, ZclValue::Enum8(ZONE_STATE_ENROLLED));
-                    let _ = self.store.set_raw(ATTR_ZONE_ID, ZclValue::U8(zone_id));
-                }
+                // Success (0x00) enrolls with the given ZoneID; any other
+                // code (not supported / no enroll permit / too many zones)
+                // leaves the zone un-enrolled (ZCL r8 §8.2.2.3.1).
+                let (state, zone_id) = if payload[0] == 0x00 {
+                    (ZONE_STATE_ENROLLED, payload[1])
+                } else {
+                    (ZONE_STATE_NOT_ENROLLED, 0xFF)
+                };
+                let _ = self.store.set_raw(ATTR_ZONE_STATE, ZclValue::Enum8(state));
+                let _ = self.store.set_raw(ATTR_ZONE_ID, ZclValue::U8(zone_id));
                 Ok(heapless::Vec::new())
             }
             CMD_INITIATE_NORMAL_OP_MODE => Ok(heapless::Vec::new()),
@@ -221,11 +278,14 @@ impl Cluster for IasZoneCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 let _test_mode_duration = payload[0];
-                let current_zone_sensitivity = payload[1];
-                let _ = self.store.set_raw(
-                    ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL,
-                    ZclValue::U8(current_zone_sensitivity),
-                );
+                // Only supported sensitivity levels are applied; an
+                // unsupported level keeps the current one.
+                if self.sensitivity_supported(payload[1]) {
+                    let _ = self.store.set_raw(
+                        ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL,
+                        ZclValue::U8(payload[1]),
+                    );
+                }
                 Ok(heapless::Vec::new())
             }
             _ => Err(ZclStatus::UnsupClusterCommand),
@@ -251,7 +311,7 @@ impl Cluster for IasZoneCluster {
         &self.store
     }
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
-        &mut self.store
+        self
     }
 
     /// `ZoneState`/`ZoneID`/`IAS_CIE_Address` describe the CIE enrollment
@@ -265,5 +325,78 @@ impl Cluster for IasZoneCluster {
         let _ = self
             .store
             .set_raw(ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL, ZclValue::U8(0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CIE: u64 = 0x00AA_BBCC_DDEE_FF01;
+
+    fn state(z: &IasZoneCluster) -> (Option<&ZclValue>, Option<&ZclValue>) {
+        (
+            z.attributes().get(ATTR_ZONE_STATE),
+            z.attributes().get(ATTR_ZONE_ID),
+        )
+    }
+
+    #[test]
+    fn enroll_response_is_accepted_only_from_the_cie() {
+        let mut z = IasZoneCluster::new(ZONE_TYPE_CONTACT_SWITCH);
+        // No CIE address configured yet.
+        assert_eq!(
+            z.handle_enroll_response_from(CIE, &[0, 7]),
+            Err(ZclStatus::Failure)
+        );
+        z.set_cie_address(CIE);
+        assert_eq!(
+            z.handle_enroll_response_from(CIE + 1, &[0, 7]),
+            Err(ZclStatus::Failure)
+        );
+        assert!(!z.is_enrolled());
+        z.handle_enroll_response_from(CIE, &[0, 7]).unwrap();
+        assert!(z.is_enrolled());
+        assert_eq!(z.get_zone_id(), 7);
+    }
+
+    #[test]
+    fn failed_enroll_response_unenrolls() {
+        let mut z = IasZoneCluster::new(ZONE_TYPE_CONTACT_SWITCH);
+        z.handle_command(CMD_ZONE_ENROLL_RESPONSE, &[0, 7]).unwrap();
+        assert!(z.is_enrolled());
+        z.handle_command(CMD_ZONE_ENROLL_RESPONSE, &[0x02, 9])
+            .unwrap();
+        assert_eq!(
+            state(&z),
+            (
+                Some(&ZclValue::Enum8(ZONE_STATE_NOT_ENROLLED)),
+                Some(&ZclValue::U8(0xFF))
+            )
+        );
+    }
+
+    #[test]
+    fn sensitivity_level_is_limited_to_supported_levels() {
+        let mut z = IasZoneCluster::new(ZONE_TYPE_MOTION_SENSOR);
+        // Default: 2 levels supported (0, 1).
+        z.handle_command(CMD_INITIATE_TEST_MODE, &[10, 5]).unwrap();
+        assert_eq!(
+            z.attributes().get(ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL),
+            Some(&ZclValue::U8(0))
+        );
+        z.handle_command(CMD_INITIATE_TEST_MODE, &[10, 1]).unwrap();
+        assert_eq!(
+            z.attributes().get(ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL),
+            Some(&ZclValue::U8(1))
+        );
+        assert_eq!(
+            z.attributes_mut()
+                .set(ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL, ZclValue::U8(2)),
+            Err(ZclStatus::InvalidValue)
+        );
+        z.attributes_mut()
+            .set(ATTR_CURRENT_ZONE_SENSITIVITY_LEVEL, ZclValue::U8(0))
+            .unwrap();
     }
 }

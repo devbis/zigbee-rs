@@ -115,26 +115,38 @@ pub struct ReportAttributes {
 
 impl ReportAttributes {
     /// Serialize Report Attributes payload to ZCL wire format.
+    ///
+    /// Only complete records are written; serialization stops at the first
+    /// record that does not fit. Never panics.
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         let mut pos = 0;
         for rpt in &self.reports {
-            // Need at least 2 (id) + 1 (type) = 3 bytes
-            if pos + 3 > buf.len() {
+            let rest = &mut buf[pos..];
+            let Some(hdr) = rest.get_mut(..3) else { break };
+            hdr[..2].copy_from_slice(&rpt.id.0.to_le_bytes());
+            hdr[2] = rpt.data_type as u8;
+            let Some(n) = rpt.value.try_serialize(&mut rest[3..]) else {
                 break;
-            }
-            let b = rpt.id.0.to_le_bytes();
-            buf[pos] = b[0];
-            buf[pos + 1] = b[1];
-            pos += 2;
-            buf[pos] = rpt.data_type as u8;
-            pos += 1;
-            let remaining = &mut buf[pos..];
-            if remaining.is_empty() {
-                break;
-            }
-            pos += rpt.value.serialize(remaining);
+            };
+            pos += 3 + n;
         }
         pos
+    }
+
+    /// Number of leading reports that [`serialize`](Self::serialize) can fit
+    /// in `capacity` bytes. Callers can use this to avoid marking reports
+    /// as sent that were not transmitted.
+    pub fn records_fitting(&self, capacity: usize) -> usize {
+        let mut used = 0;
+        let mut count = 0;
+        for rpt in &self.reports {
+            used += 3 + rpt.value.wire_len();
+            if used > capacity {
+                break;
+            }
+            count += 1;
+        }
+        count
     }
 }
 
@@ -481,7 +493,6 @@ impl ReportingEngine {
 }
 
 /// Whether a data type is "analog" (supports reportable change).
-#[allow(dead_code)]
 fn is_analog_type(dt: ZclDataType) -> bool {
     data_types::is_analog_type(dt)
 }
@@ -549,61 +560,60 @@ impl ReadReportingConfigResponse {
     /// Serialize the response to ZCL payload bytes.
     /// Direction-aware: Send records get data_type/min/max/change,
     /// Receive records get timeout only (per ZCL spec §2.5.7.1.6).
+    ///
+    /// Only complete records are written: serialization stops at the first
+    /// record that does not fit, so the payload carries as many records as
+    /// fit and stays well-formed. Never panics.
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         let mut pos = 0;
         for rec in &self.records {
-            // Minimum: 1 (status) + 1 (direction) + 2 (attr_id) = 4 bytes
-            if pos + 4 > buf.len() {
-                break;
-            }
-            buf[pos] = rec.status as u8;
-            pos += 1;
-            buf[pos] = rec.direction as u8;
-            pos += 1;
-            let b = rec.attribute_id.0.to_le_bytes();
-            buf[pos] = b[0];
-            buf[pos + 1] = b[1];
-            pos += 2;
-
-            if rec.status == ZclStatus::Success {
-                if rec.direction == ReportDirection::Send {
-                    // Send direction: data_type(1) + min_interval(2) + max_interval(2) = 5 bytes min
-                    if let Some(ref cfg) = rec.config {
-                        if pos + 5 > buf.len() {
-                            break;
-                        }
-                        buf[pos] = cfg.data_type as u8;
-                        pos += 1;
-                        let b = cfg.min_interval.to_le_bytes();
-                        buf[pos] = b[0];
-                        buf[pos + 1] = b[1];
-                        pos += 2;
-                        let b = cfg.max_interval.to_le_bytes();
-                        buf[pos] = b[0];
-                        buf[pos + 1] = b[1];
-                        pos += 2;
-                        if let Some(ref change) = cfg.reportable_change {
-                            let remaining = &mut buf[pos..];
-                            if !remaining.is_empty() {
-                                pos += change.serialize(remaining);
-                            }
-                        }
-                    }
-                } else {
-                    // Receive direction: timeout(2) only
-                    if let Some(timeout) = rec.timeout {
-                        if pos + 2 > buf.len() {
-                            break;
-                        }
-                        let b = timeout.to_le_bytes();
-                        buf[pos] = b[0];
-                        buf[pos + 1] = b[1];
-                        pos += 2;
-                    }
-                }
+            match rec.serialize_into(&mut buf[pos..]) {
+                Some(n) => pos += n,
+                None => break,
             }
         }
         pos
+    }
+}
+
+impl ReadReportingConfigResponseRecord {
+    /// Serialize one complete record, or `None` if it does not fit.
+    fn serialize_into(&self, buf: &mut [u8]) -> Option<usize> {
+        let hdr = buf.get_mut(..4)?;
+        hdr[1] = self.direction as u8;
+        hdr[2..4].copy_from_slice(&self.attribute_id.0.to_le_bytes());
+        let mut status = self.status;
+        let mut pos = 4;
+        if status == ZclStatus::Success {
+            match (self.direction, &self.config, self.timeout) {
+                (ReportDirection::Send, Some(cfg), _) => {
+                    let b = buf.get_mut(4..9)?;
+                    b[0] = cfg.data_type as u8;
+                    b[1..3].copy_from_slice(&cfg.min_interval.to_le_bytes());
+                    b[3..5].copy_from_slice(&cfg.max_interval.to_le_bytes());
+                    pos = 9;
+                    // The reportable change field is present for analog
+                    // types only, and then it is mandatory.
+                    if is_analog_type(cfg.data_type) {
+                        match &cfg.reportable_change {
+                            Some(change) => pos += change.try_serialize(&mut buf[9..])?,
+                            None => {
+                                status = ZclStatus::Failure;
+                                pos = 4;
+                            }
+                        }
+                    }
+                }
+                (ReportDirection::Receive, _, Some(timeout)) => {
+                    buf.get_mut(4..6)?.copy_from_slice(&timeout.to_le_bytes());
+                    pos = 6;
+                }
+                // A success record without its body cannot be encoded.
+                _ => status = ZclStatus::Failure,
+            }
+        }
+        buf[0] = status as u8;
+        Some(pos)
     }
 }
 
@@ -803,6 +813,134 @@ mod tests {
                 config(MAX_REPORT_CONFIGS as u16),
             ),
             Err(ZclStatus::InsufficientSpace)
+        );
+    }
+
+    #[test]
+    fn report_attributes_serializes_complete_records_only() {
+        let s = ZclValue::CharString(heapless::Vec::from_slice(&[b'r'; 32]).unwrap());
+        let mut reports = heapless::Vec::new();
+        for id in 0..3u16 {
+            reports
+                .push(AttributeReport {
+                    id: AttributeId(id),
+                    data_type: ZclDataType::CharString,
+                    value: s.clone(),
+                })
+                .unwrap();
+        }
+        let rpt = ReportAttributes { reports };
+        for cap in 0..128 {
+            let mut buf = [0u8; 128];
+            let n = rpt.serialize(&mut buf[..cap]);
+            // 36 bytes per record (2 id + 1 type + 1 len + 32)
+            assert_eq!(n, (cap / 36).min(3) * 36, "cap {cap}");
+            assert_eq!(rpt.records_fitting(cap), n / 36);
+            for rec in buf[..n].chunks(36) {
+                assert_eq!(rec[2], ZclDataType::CharString as u8);
+                assert_eq!(rec[3], 32);
+            }
+        }
+    }
+
+    #[test]
+    fn read_reporting_config_response_never_panics_and_stays_well_formed() {
+        let mut records = heapless::Vec::new();
+        let mut cfg64 = config(1);
+        cfg64.data_type = ZclDataType::U64;
+        cfg64.reportable_change = Some(ZclValue::U64(5));
+        for (i, (dir, cfg, timeout)) in [
+            (ReportDirection::Send, Some(cfg64), None),
+            (ReportDirection::Receive, None, Some(30u16)),
+            (ReportDirection::Send, Some(config(2)), None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            records
+                .push(ReadReportingConfigResponseRecord {
+                    status: ZclStatus::Success,
+                    direction: dir,
+                    attribute_id: AttributeId(i as u16),
+                    config: cfg,
+                    timeout,
+                })
+                .unwrap();
+        }
+        let resp = ReadReportingConfigResponse { records };
+        // Record sizes: 4+5+8, 4+2, 4+5+2.
+        let ends = [17usize, 23, 34];
+        for cap in 0..48 {
+            let mut buf = [0u8; 48];
+            let n = resp.serialize(&mut buf[..cap]);
+            let expected = ends
+                .iter()
+                .copied()
+                .filter(|&e| e <= cap)
+                .max()
+                .unwrap_or(0);
+            assert_eq!(n, expected, "cap {cap}");
+        }
+    }
+
+    #[test]
+    fn read_reporting_config_success_without_body_is_failure_and_digital_has_no_change() {
+        let mut records = heapless::Vec::new();
+        records
+            .push(ReadReportingConfigResponseRecord {
+                status: ZclStatus::Success,
+                direction: ReportDirection::Send,
+                attribute_id: AttributeId(7),
+                config: None,
+                timeout: None,
+            })
+            .unwrap();
+        let mut digital = config(8);
+        digital.data_type = ZclDataType::Bool;
+        records
+            .push(ReadReportingConfigResponseRecord {
+                status: ZclStatus::Success,
+                direction: ReportDirection::Send,
+                attribute_id: AttributeId(8),
+                config: Some(digital),
+                timeout: None,
+            })
+            .unwrap();
+        // Analog type with no stored reportable change: cannot be encoded.
+        let mut analog = config(9);
+        analog.reportable_change = None;
+        records
+            .push(ReadReportingConfigResponseRecord {
+                status: ZclStatus::Success,
+                direction: ReportDirection::Send,
+                attribute_id: AttributeId(9),
+                config: Some(analog),
+                timeout: None,
+            })
+            .unwrap();
+        let mut buf = [0u8; 32];
+        let n = ReadReportingConfigResponse { records }.serialize(&mut buf);
+        assert_eq!(
+            &buf[..n],
+            &[
+                ZclStatus::Failure as u8,
+                0,
+                7,
+                0,
+                ZclStatus::Success as u8,
+                0,
+                8,
+                0,
+                ZclDataType::Bool as u8,
+                1,
+                0,
+                60,
+                0,
+                ZclStatus::Failure as u8,
+                0,
+                9,
+                0
+            ]
         );
     }
 }
