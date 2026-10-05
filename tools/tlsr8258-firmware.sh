@@ -7,6 +7,7 @@ TC32_TOOLCHAIN="${TC32_TOOLCHAIN:-$DEFAULT_TOOLCHAIN}"
 CARGO_BIN="${CARGO_BIN:-$TC32_TOOLCHAIN/bin/cargo}"
 LLVM_NM="${LLVM_NM:-$TC32_TOOLCHAIN/llvm/bin/llvm-nm}"
 LLVM_OBJCOPY="${LLVM_OBJCOPY:-$TC32_TOOLCHAIN/llvm/bin/llvm-objcopy}"
+LLVM_OBJDUMP="${LLVM_OBJDUMP:-$TC32_TOOLCHAIN/llvm/bin/llvm-objdump}"
 TLSRPGM="${TLSRPGM:-$HOME/TLSRPGM/TlsrPgm.py}"
 TELINK_PORT="${TELINK_PORT:-/dev/cu.usbserial-1410}"
 
@@ -18,6 +19,33 @@ usage() {
 require_file() {
     if [[ ! -e "$1" ]]; then
         echo "missing $2: $1" >&2
+        exit 1
+    fi
+}
+
+# The SRAM-resident flash command routines run while the MSPI bus is busy
+# programming/erasing, when XIP fetches from .text (>= 0x8000) would hang or
+# return garbage. Fail the build if any `tlsr8258_hal::flash::` function in
+# .ram_code branches to an address outside .ram_code or uses an indirect
+# branch other than a plain `tjex lr` return.
+verify_ram_flash_calls() {
+    local elf="$1"
+    local report
+    report=$("$LLVM_OBJDUMP" -d -C --no-show-raw-insn -j .ram_code "$elf" | awk '
+        /^[0-9a-f]+ <.*>:$/ { fn = $0; in_flash = (fn ~ /tlsr8258_hal::flash::/); next }
+        !in_flash { next }
+        /\ttj[a-z]*\t0x[0-9a-f]+/ {
+            match($0, /\ttj[a-z]*\t0x[0-9a-f]+/)
+            target = substr($0, RSTART, RLENGTH); sub(/.*0x0*/, "", target)
+            # Portable (no strtonum) test for target >= 0x8000.
+            if (length(target) > 4 || (length(target) == 4 && substr(target, 1, 1) >= "8"))
+                print fn " -> " $0
+            next
+        }
+        /\ttjex\t/ && !/\ttjex\tlr/ { print fn " indirect: " $0 }
+    ')
+    if [[ -n "$report" ]]; then
+        printf 'layout-check FAIL: SRAM flash routine leaves .ram_code:\n%s\n' "$report" >&2
         exit 1
     fi
 }
@@ -75,6 +103,7 @@ verify_layout() {
             "$ramcode_end" >&2
         exit 1
     fi
+    verify_ram_flash_calls "$elf"
     if (( ebss > svc_bottom )); then
         printf 'layout-check FAIL: .bss ends at 0x%X, stack starts at 0x%X\n' \
             "$ebss" "$svc_bottom" >&2
@@ -348,6 +377,7 @@ case "$command" in
         )
         require_file "$LLVM_OBJCOPY" "llvm-objcopy"
         require_file "$LLVM_NM" "llvm-nm"
+        require_file "$LLVM_OBJDUMP" "llvm-objdump"
         "$LLVM_OBJCOPY" -O binary "$elf" "$bin"
         verify_layout "$elf" "$bin" "$image_feature"
         if [[ "$command" == "flash" ]]; then

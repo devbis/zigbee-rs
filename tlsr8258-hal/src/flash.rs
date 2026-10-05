@@ -21,6 +21,8 @@ const FLASH_SECTOR_ERASE: u8 = 0x20;
 
 pub const PAGE_SIZE: usize = 256;
 pub const SECTOR_SIZE: u32 = 4096;
+/// End of the 24-bit address space reachable by the MSPI flash commands.
+const FLASH_ADDRESS_LIMIT: u32 = 0x0100_0000;
 
 pub const IEEE_SOURCE_FALLBACK: u8 = 0;
 pub const IEEE_SOURCE_FACTORY: u8 = 1;
@@ -162,19 +164,37 @@ impl NorFlashError for FlashError {
 
 /// Full-chip TLSR8258 NOR flash controller.
 ///
-/// Board crates provide the guaranteed flash capacity and expose bounded
-/// partitions to applications.
+/// This handle can program and erase every sector of the fitted device,
+/// including the boot vectors, the running image, Telink factory
+/// calibration/EUI data and every product journal. It is therefore only
+/// constructible through `unsafe`; products should hand persistence code a
+/// bounded [`FlashRegion`] instead.
 pub struct Tlsr8258Flash {
     capacity: usize,
 }
 
 impl Tlsr8258Flash {
-    pub const fn new(capacity: usize) -> Self {
+    /// Create a whole-chip flash handle.
+    ///
+    /// # Safety
+    ///
+    /// `capacity` must not exceed the fitted flash. The caller must own the
+    /// whole device for the lifetime of the handle (no concurrent
+    /// [`FlashRegion`] or other flash user) and must never erase or program
+    /// the vectors, the executing firmware image, factory/calibration data or
+    /// another owner's persistence partition through it.
+    pub const unsafe fn new(capacity: usize) -> Self {
         Self { capacity }
     }
 
-    pub const fn for_geometry(geometry: FlashGeometry) -> Self {
-        Self::new(geometry.capacity())
+    /// Create a whole-chip flash handle for a known factory geometry.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Tlsr8258Flash::new`].
+    pub const unsafe fn for_geometry(geometry: FlashGeometry) -> Self {
+        // SAFETY: forwarded to the caller.
+        unsafe { Self::new(geometry.capacity()) }
     }
 
     fn validate_range(&self, address: u32, length: usize) -> Result<(), FlashError> {
@@ -220,18 +240,135 @@ impl NorFlash for Tlsr8258Flash {
             return Err(FlashError::UnalignedSector);
         }
         self.validate_range(from, (to - from) as usize)?;
-        let mut address = from;
-        while address < to {
-            erase_sector(address)?;
-            address += SECTOR_SIZE;
-        }
-        Ok(())
+        // SAFETY: the range is inside the capacity this handle was granted
+        // by its `unsafe` constructor.
+        unsafe { erase_range(from, to) }
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
         self.validate_range(offset, bytes.len())?;
-        program(offset, bytes)
+        // SAFETY: as for `erase`.
+        unsafe { program(offset, bytes) }
     }
+}
+
+/// Exclusive, sector-aligned window `[start, start + size)` of the onboard
+/// flash.
+///
+/// Offsets passed to the [`NorFlash`] methods are relative to `start`; any
+/// access that would leave the window fails with
+/// [`FlashError::AddressOverflow`] before a flash command is issued, so code
+/// holding only a region cannot reach vectors, firmware, factory data or
+/// another partition.
+pub struct FlashRegion {
+    start: u32,
+    size: usize,
+}
+
+impl FlashRegion {
+    /// Create a bounded window over the onboard flash.
+    ///
+    /// Panics (at compile time when used in a `const` context) if `start` or
+    /// `size` is not a multiple of the 4 KiB erase sector, if `size` is zero
+    /// or if the window would wrap the 24-bit flash address space.
+    ///
+    /// # Safety
+    ///
+    /// The window must lie inside the fitted flash, must not overlap the
+    /// vectors, the firmware image or factory/calibration data, and must be
+    /// owned exclusively by this handle (no second region over the same
+    /// sectors and no concurrent [`Tlsr8258Flash`]).
+    pub const unsafe fn new(start: u32, size: usize) -> Self {
+        assert!(size != 0);
+        assert!(start & (SECTOR_SIZE - 1) == 0);
+        assert!(size & (SECTOR_SIZE as usize - 1) == 0);
+        assert!(start as usize + size <= FLASH_ADDRESS_LIMIT as usize);
+        Self { start, size }
+    }
+
+    /// Absolute flash address of offset 0.
+    pub const fn start(&self) -> u32 {
+        self.start
+    }
+
+    /// Window length in bytes.
+    pub const fn size(&self) -> usize {
+        self.size
+    }
+
+    fn physical(&self, offset: u32, length: usize) -> Result<u32, FlashError> {
+        region_physical(self.start, self.size, offset, length)
+    }
+}
+
+/// Translate a region-relative access into an absolute flash address,
+/// rejecting anything that leaves `[0, size)`.
+fn region_physical(start: u32, size: usize, offset: u32, length: usize) -> Result<u32, FlashError> {
+    (offset as usize)
+        .checked_add(length)
+        .filter(|end| *end <= size)
+        .ok_or(FlashError::AddressOverflow)?;
+    start.checked_add(offset).ok_or(FlashError::AddressOverflow)
+}
+
+impl ErrorType for FlashRegion {
+    type Error = FlashError;
+}
+
+impl ReadNorFlash for FlashRegion {
+    const READ_SIZE: usize = 1;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        let physical = self.physical(offset, bytes.len())?;
+        if read_bytes(physical, bytes) {
+            Ok(())
+        } else {
+            Err(FlashError::Timeout)
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.size
+    }
+}
+
+impl NorFlash for FlashRegion {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = SECTOR_SIZE as usize;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        if from >= to {
+            return Err(FlashError::AddressOverflow);
+        }
+        if from & (SECTOR_SIZE - 1) != 0 || to & (SECTOR_SIZE - 1) != 0 {
+            return Err(FlashError::UnalignedSector);
+        }
+        let physical_from = self.physical(from, (to - from) as usize)?;
+        // SAFETY: `physical` proved `[from, to)` lies inside this region,
+        // which its `unsafe` constructor granted exclusively to this handle.
+        unsafe { erase_range(physical_from, physical_from + (to - from)) }
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        let physical = self.physical(offset, bytes.len())?;
+        // SAFETY: as for `erase`.
+        unsafe { program(physical, bytes) }
+    }
+}
+
+/// Erase every sector in the sector-aligned range `[from, to)`.
+///
+/// # Safety
+///
+/// Same contract as [`erase_sector`] for every sector in the range.
+unsafe fn erase_range(from: u32, to: u32) -> Result<(), FlashError> {
+    let mut address = from;
+    while address < to {
+        // SAFETY: forwarded to the caller.
+        unsafe { erase_sector(address)? };
+        address += SECTOR_SIZE;
+    }
+    Ok(())
 }
 
 #[inline(always)]
@@ -554,14 +691,21 @@ fn ensure_safe_flash() -> Result<(), FlashError> {
 ///
 /// `data` must reside in TLSR8258 SRAM because flash is unavailable while
 /// each page is being programmed.
-pub fn program(mut address: u32, mut data: &[u8]) -> Result<(), FlashError> {
+///
+/// # Safety
+///
+/// Only the 24-bit address space is checked. The caller must own
+/// `[address, address + data.len())` and it must not contain the vectors,
+/// the executing image, factory/calibration data or another owner's
+/// partition. Prefer a bounded [`FlashRegion`].
+pub unsafe fn program(mut address: u32, mut data: &[u8]) -> Result<(), FlashError> {
     if data.is_empty() {
         return Ok(());
     }
     ensure_ram_buffer(data)?;
     address
         .checked_add(data.len() as u32)
-        .filter(|end| *end <= 0x0100_0000)
+        .filter(|end| *end <= FLASH_ADDRESS_LIMIT)
         .ok_or(FlashError::AddressOverflow)?;
 
     while !data.is_empty() {
@@ -581,13 +725,20 @@ pub fn program(mut address: u32, mut data: &[u8]) -> Result<(), FlashError> {
 }
 
 /// Erase one 4 KiB sector.
-pub fn erase_sector(address: u32) -> Result<(), FlashError> {
+///
+/// # Safety
+///
+/// Only the 24-bit address space is checked. The caller must own the sector
+/// and it must not contain the vectors, the executing image,
+/// factory/calibration data or another owner's partition. Prefer a bounded
+/// [`FlashRegion`].
+pub unsafe fn erase_sector(address: u32) -> Result<(), FlashError> {
     if address & (SECTOR_SIZE - 1) != 0 {
         return Err(FlashError::UnalignedSector);
     }
     if address
         .checked_add(SECTOR_SIZE)
-        .filter(|end| *end <= 0x0100_0000)
+        .filter(|end| *end <= FLASH_ADDRESS_LIMIT)
         .is_none()
     {
         return Err(FlashError::AddressOverflow);

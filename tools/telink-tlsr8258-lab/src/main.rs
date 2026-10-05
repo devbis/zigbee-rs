@@ -7127,7 +7127,10 @@ fn diag_pm_log(offset: u32, tag: u32, value0: u32, value1: u32) -> bool {
     record[4..8].copy_from_slice(&value0.to_le_bytes());
     record[8..12].copy_from_slice(&value1.to_le_bytes());
     record[12..16].copy_from_slice(&0xA55A_C33Cu32.to_le_bytes());
-    tlsr8258_hal::flash::program(PM_LOG_SECTOR + offset, &record).is_ok()
+    // SAFETY: the diag-pm lab image owns PM_LOG_SECTOR as a scratch log
+    // sector; no journal or production code runs in this image, and
+    // `offset` stays inside that sector.
+    unsafe { tlsr8258_hal::flash::program(PM_LOG_SECTOR + offset, &record) }.is_ok()
 }
 
 #[cfg(feature = "diag-pm")]
@@ -7207,7 +7210,8 @@ fn diag_pm_main() -> ! {
     }
 
     mark32(PM_BASE + 0x00, 0x504D_0003);
-    if tlsr8258_hal::flash::erase_sector(PM_LOG_SECTOR).is_err()
+    // SAFETY: see `diag_pm_log`; this lab image owns PM_LOG_SECTOR.
+    if unsafe { tlsr8258_hal::flash::erase_sector(PM_LOG_SECTOR) }.is_err()
         || !diag_pm_log(0, 0x504D_0003, SUSPEND_MS, TEST_CYCLES)
     {
         diag_pm_fail(0x070);
