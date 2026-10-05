@@ -2102,6 +2102,127 @@ mod resume_tests {
         assert_eq!(reset.tclk_counter_limit, preserved.tclk_counter_limit);
     }
 
+    /// A secured ZDP Bind_req binding cluster 0x0006 on endpoint 1 to the
+    /// coordinator's endpoint 1.
+    fn bind_req_aps_payload() -> ([u8; 48], usize) {
+        let header = zigbee_aps::frames::ApsHeader {
+            frame_control: zigbee_aps::frames::ApsFrameControl {
+                frame_type: zigbee_aps::frames::ApsFrameType::Data as u8,
+                delivery_mode: zigbee_aps::frames::ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: Some(0),
+            group_address: None,
+            cluster_id: Some(0x0021),
+            profile_id: Some(zigbee_zdo::ZDP_PROFILE_ID),
+            src_endpoint: Some(0),
+            aps_counter: 2,
+            extended_header: None,
+        };
+        let mut payload = [0u8; 48];
+        let mut len = header.serialize(&mut payload);
+        payload[len] = 0x21; // TSN
+        len += 1;
+        payload[len..len + 8].copy_from_slice(&IEEE_ADDRESS);
+        len += 8;
+        payload[len] = 1; // source endpoint
+        payload[len + 1..len + 3].copy_from_slice(&0x0006u16.to_le_bytes());
+        payload[len + 3] = 0x03; // 64-bit destination + endpoint
+        len += 4;
+        payload[len..len + 8].copy_from_slice(&COORDINATOR_IEEE);
+        len += 8;
+        payload[len] = 1; // destination endpoint
+        (payload, len + 1)
+    }
+
+    /// A device holding a prepared (not yet committed) Bind response.
+    fn device_with_pending_binding_response(
+        store: &mut RamSecurityStateStore,
+    ) -> ZigbeeDevice<MockMac> {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(store)).unwrap();
+        device.set_binding_persistence_enabled(true);
+        let (aps_payload, aps_len) = bind_req_aps_payload();
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &aps_payload[..aps_len],
+            1,
+            true,
+        );
+        block_on(device.process_incoming_with_security_store(&indication(frame), &mut [], store))
+            .unwrap();
+        assert!(device.binding_persistence_pending());
+        device
+    }
+
+    /// `factory_reset(None)` — what `UserAction::FactoryReset` runs from the
+    /// plain tick loop — tears down exactly as much as the store-backed reset,
+    /// marks the state dirty, and never lets the outgoing NWK counter regress.
+    #[test]
+    fn factory_reset_without_store_clears_network_state_and_keeps_counter_floor() {
+        let mut store = RamSecurityStateStore::new();
+        let mut device = device_with_pending_binding_response(&mut store);
+        device.queue_global_response(0x0000, 1, 1, 0x0006, 7, 0x01, &[0x00]);
+        assert!(!device.pending_responses.is_empty());
+        device.clear_state_dirty();
+        let floor = device.bdb().zdo().nwk().nib().outgoing_frame_counter;
+        assert!(floor > 0);
+
+        block_on(device.factory_reset(None));
+
+        assert!(!device.binding_persistence_pending());
+        assert!(device.pending_responses.is_empty());
+        assert!(device.state_dirty());
+        assert!(!device.is_joined());
+        assert_eq!(device.bdb().zdo().aps().security().key_count(), 0);
+        assert!(device.bdb().zdo().aps().binding_table().is_empty());
+        let nib = device.bdb().zdo().nwk().nib();
+        assert_eq!(nib.outgoing_frame_counter, floor);
+        assert_eq!(
+            nib.outgoing_frame_counter_limit, floor,
+            "no frame may be secured before a new reservation"
+        );
+    }
+
+    #[test]
+    fn store_backed_factory_reset_drops_pending_binding_response() {
+        let mut store = RamSecurityStateStore::new();
+        let mut device = device_with_pending_binding_response(&mut store);
+        let floor = device.bdb().zdo().nwk().nib().outgoing_frame_counter;
+
+        block_on(device.factory_reset_with_security_store(&mut store)).unwrap();
+
+        assert!(!device.binding_persistence_pending());
+        assert!(!device.state_dirty());
+        assert!(device.bdb().zdo().nwk().nib().outgoing_frame_counter >= floor);
+        assert!(!store.load().unwrap().unwrap().commissioned);
+    }
+
+    /// Legacy NV loses every network item except the outgoing-counter floor.
+    #[test]
+    fn legacy_nv_factory_reset_keeps_the_frame_counter_floor() {
+        use crate::nv_storage::{NvItemId, NvStorage};
+        let mut nv = crate::nv_storage::RamNvStorage::new();
+        nv.write(NvItemId::NwkFrameCounter, &0x1234u32.to_le_bytes())
+            .unwrap();
+        nv.write(NvItemId::BdbNodeIsOnNetwork, &[1]).unwrap();
+        nv.write(NvItemId::NwkKey, &NETWORK_KEY).unwrap();
+        let mut device = resumed_device(DeviceType::EndDevice);
+
+        block_on(device.factory_reset(Some(&mut nv)));
+
+        let mut buf = [0u8; 16];
+        assert_eq!(nv.read(NvItemId::NwkFrameCounter, &mut buf), Ok(4));
+        assert_eq!(&buf[..4], &0x1234u32.to_le_bytes());
+        assert!(nv.read(NvItemId::BdbNodeIsOnNetwork, &mut buf).is_err());
+        assert!(nv.read(NvItemId::NwkKey, &mut buf).is_err());
+    }
+
     #[test]
     fn nwk_replay_floor_survives_a_persisted_restart() {
         const FRAME_COUNTER: u32 = 0x1234;
@@ -8495,7 +8616,23 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 
     fn mark_left(&mut self) {
+        self.clear_network_runtime_state();
+        self.state_dirty = true;
+    }
+
+    /// Clear every piece of runtime state bound to the network being left.
+    ///
+    /// This is the single teardown shared by a local Leave, an accepted
+    /// Mgmt_Leave / NWK Leave, and both factory-reset paths, so none of them
+    /// can keep a stale binding response, deferred leave, queued ZCL response,
+    /// APS persistence transaction, key, or rejoin timer behind.
+    #[inline(never)]
+    fn clear_network_runtime_state(&mut self) {
         self.binding_persistence.response = None;
+        self.deferred_mgmt_leave = None;
+        self.trust_center_removal_pending = false;
+        // Responses were addressed on the network being left.
+        self.pending_responses.clear();
         self.bdb.attributes_mut().node_is_on_a_network = false;
         self.bdb.zdo_mut().nwk_mut().set_joined(false);
         let aps = self.bdb.zdo_mut().aps_mut();
@@ -8510,18 +8647,44 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.remote_reporting.clear();
         self.secure_rejoin_retry_at = None;
         R::ed_reset(self);
-        self.state_dirty = true;
+    }
+
+    /// Shared factory-reset core: BDB reset plus the full runtime teardown.
+    ///
+    /// NLME-RESET rebuilds the NIB, zeroing the outgoing NWK frame counter.
+    /// The counter reached so far is reinstalled as an exhausted reservation
+    /// (`current == limit`): nothing can be sent until commissioning reserves
+    /// a new window, and that reservation starts at or above this floor
+    /// (R22 §4.3.1.1 forbids reusing a counter value with a key), even when
+    /// no durable security store backs the reset.
+    #[inline(never)]
+    async fn factory_reset_stack(&mut self) -> Result<(), zigbee_bdb::BdbStatus> {
+        let counter_floor = self.bdb.zdo().nwk().nib().outgoing_frame_counter;
+        let result = self.bdb.factory_reset().await;
+        self.clear_network_runtime_state();
+        self.basic_cluster.reset_to_factory_defaults();
+        let nib = self.bdb.zdo_mut().nwk_mut().nib_mut();
+        if nib.outgoing_frame_counter < counter_floor {
+            let installed = nib.set_frame_counter_reservation(counter_floor, counter_floor);
+            debug_assert!(installed);
+        }
+        result
     }
 
     /// Factory reset: leave network, clear all state, wipe NV.
     ///
     /// After this the device is in a "fresh out of box" state and
-    /// must be commissioned again.
+    /// must be commissioned again. Runs the same teardown as
+    /// [`factory_reset_with_security_store`](Self::factory_reset_with_security_store)
+    /// and marks the state dirty so the application persists the reset.
+    ///
+    /// With legacy NV, every network item is removed except
+    /// `NwkFrameCounter`, which is kept as the outgoing-counter floor so a
+    /// later commissioning cannot reuse counter values.
     pub async fn factory_reset(&mut self, nv: Option<&mut dyn NvStorage>) {
         log::info!("[Runtime] Factory reset…");
 
-        // BDB factory_reset handles leave + state clearing
-        let _ = self.bdb.factory_reset().await;
+        let _ = self.factory_reset_stack().await;
 
         // Clear NV storage if provided
         if let Some(nv) = nv {
@@ -8533,7 +8696,6 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 NvItemId::NwkIeeeAddress,
                 NvItemId::NwkKey,
                 NvItemId::NwkKeySeqNum,
-                NvItemId::NwkFrameCounter,
                 NvItemId::NwkDepth,
                 NvItemId::NwkParentAddress,
                 NvItemId::NwkUpdateId,
@@ -8550,11 +8712,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             }
         }
 
-        self.basic_cluster.reset_to_factory_defaults();
-        self.reset_identify_clusters();
-        self.remote_reporting.clear();
-        self.secure_rejoin_retry_at = None;
-        R::ed_reset(self);
+        self.state_dirty = true;
         log::info!("[Runtime] Factory reset complete");
     }
 
@@ -10260,17 +10418,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     ) -> Result<(), event_loop::StartError> {
         self.factory_reset_security_state(store)
             .map_err(event_loop::StartError::PersistenceFailed)?;
-        self.bdb
-            .factory_reset()
-            .await
-            .map_err(event_loop::StartError::CommissioningFailed)?;
-        self.basic_cluster.reset_to_factory_defaults();
-        self.reset_identify_clusters();
-        self.remote_reporting.clear();
+        let result = self.factory_reset_stack().await;
+        // The reset state is already durable in `store`.
         self.state_dirty = false;
-        self.secure_rejoin_retry_at = None;
-        R::ed_reset(self);
-        Ok(())
+        result.map_err(event_loop::StartError::CommissioningFailed)
     }
 
     /// Process an incoming frame with crash-safe counter maintenance.
