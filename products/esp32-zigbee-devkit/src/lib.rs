@@ -23,7 +23,10 @@
 //! * [`esp_image`] — ESP application image header/chip-ID validation.
 //! * [`sha256`] — SHA-256, used to verify a staged image before activation.
 //! * [`ota`] — [`zigbee_runtime::firmware_writer::FirmwareWriter`] that stages
-//!   an OTA payload into the inactive application slot.
+//!   an OTA payload into the inactive application slot, plus the
+//!   pending-verification boot check, confirmation and rollback.
+//! * [`ota_boot`] — when a freshly installed image counts as proven on the
+//!   network, and the deadline after which it is rolled back.
 //! * [`firmware`] — firmware version helpers shared by the OTA and Basic
 //!   clusters.
 //!
@@ -63,6 +66,8 @@ pub mod firmware;
 pub mod layout;
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod ota;
+#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+pub mod ota_boot;
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod ota_transport;
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]

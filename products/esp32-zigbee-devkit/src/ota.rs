@@ -21,11 +21,20 @@
 //! 4. [`FirmwareWriter::verify`] re-reads and validates the complete ESP image
 //!    structure, chip compatibility, XOR checksum and appended SHA-256.
 //!    This is integrity checking, NOT secure-boot authentication.
-//! 5. [`FirmwareWriter::activate`] writes one 32-byte `otadata` entry into the
-//!    sector that does not hold the active entry and resets the chip. A power
-//!    failure leaves the previous entry intact and never erases the executing
-//!    firmware. An old preference may already refer to a failed image; it is
-//!    not proof of which fallback the bootloader will try on the next reset.
+//! 5. [`FirmwareWriter::activate`] writes one 32-byte `ESP_OTA_IMG_NEW`
+//!    `otadata` entry into the sector that does not hold the active entry and
+//!    resets the chip. A power failure leaves the previous entry intact and
+//!    never erases the executing firmware. An old preference may already refer
+//!    to a failed image; it is not proof of which fallback the bootloader will
+//!    try on the next reset.
+//! 6. The new image runs under pending verification: [`check_boot`] runs once
+//!    per boot, before the Zigbee stack, and [`confirm_boot`] marks the image
+//!    `VALID` once it has proven network operation. A second boot without
+//!    confirmation, or [`roll_back`] after the product's confirmation
+//!    deadline, reselects the previous slot. See [`crate::otadata`] for the
+//!    flash-level protocol and [`crate::ota_boot`] for the product policy.
+//!    No new image is staged while the running image is unconfirmed, because
+//!    that would overwrite the rollback target.
 
 use zigbee_runtime::firmware_writer::{FirmwareError, FirmwareWriter};
 
@@ -34,7 +43,10 @@ use crate::layout::{
     EXPECTED_PARTITIONS, OTA_SLOT_SIZE, OTADATA_OFFSET, PARTITION_ENTRY_SIZE,
     PARTITION_TABLE_OFFSET, SECTOR_SIZE, WORD_SIZE, ota_slot_offset, otadata_sector_offset,
 };
-use crate::otadata::{ENTRY_SIZE, OtaData, OtaSelectEntry};
+use crate::otadata::{
+    Activation, BOOT_MARK, BOOT_MARK_OFFSET, BootAction, ENTRY_SIZE, OtaData, OtaDataError,
+    OtaSelectEntry,
+};
 
 #[path = "running_image.rs"]
 mod running_image;
@@ -184,17 +196,7 @@ impl<F: OtaFlash> EspFirmwareWriter<F> {
         let activation = data
             .activation_for(self.target_slot)
             .map_err(|_| FirmwareError::ActivateFailed)?;
-        let address = otadata_sector_offset(activation.sector);
-        let encoded = activation.entry.encode();
-
-        self.flash.erase_sector(address)?;
-        self.flash.write(address, &encoded)?;
-
-        let mut readback = [0u8; ENTRY_SIZE];
-        self.flash.read(address, &mut readback)?;
-        if OtaSelectEntry::decode(&readback) != activation.entry {
-            return Err(FirmwareError::ActivateFailed);
-        }
+        program_entry(&mut self.flash, &activation)?;
 
         let confirmed = self.read_otadata()?;
         if confirmed.active_slot() != Some(self.target_slot) {
@@ -211,27 +213,11 @@ impl<F: OtaFlash> EspFirmwareWriter<F> {
     }
 
     fn read_otadata(&mut self) -> Result<OtaData, FirmwareError> {
-        let mut first = [0u8; ENTRY_SIZE];
-        let mut second = [0u8; ENTRY_SIZE];
-        self.flash.read(OTADATA_OFFSET, &mut first)?;
-        self.flash.read(OTADATA_OFFSET + SECTOR_SIZE, &mut second)?;
-        Ok(OtaData::decode([&first, &second]))
+        read_otadata(&mut self.flash)
     }
 
     fn validate_partition_table(&mut self) -> Result<(), FirmwareError> {
-        let mut entry = [0u8; PARTITION_ENTRY_SIZE];
-        for (index, expected) in EXPECTED_PARTITIONS.iter().copied().enumerate() {
-            let address = PARTITION_TABLE_OFFSET + (index * PARTITION_ENTRY_SIZE) as u32;
-            self.flash.read(address, &mut entry)?;
-            if !expected.matches(&entry) {
-                log::error!(
-                    "[ESP OTA] partition table entry {} does not match the required OTA layout",
-                    index
-                );
-                return Err(FirmwareError::HardwareError);
-            }
-        }
-        Ok(())
+        validate_partition_table(&mut self.flash)
     }
 
     fn check_running_image(&mut self) -> Result<(), RunningImageError> {
@@ -330,6 +316,12 @@ impl<F: OtaFlash> FirmwareWriter for EspFirmwareWriter<F> {
             log::error!("[ESP OTA] running-image evidence lost: {:?}", error);
             FirmwareError::HardwareError
         })?;
+        if self.read_otadata()?.running_unconfirmed(self.running_slot) {
+            // The other slot is the rollback target until this boot is
+            // confirmed; staging would overwrite it.
+            log::warn!("[ESP OTA] running image not yet confirmed; refusing to stage");
+            return Err(FirmwareError::HardwareError);
+        }
         self.state = State::Staging;
         log::info!(
             "[ESP OTA] staging into slot {} (running slot {})",
@@ -431,6 +423,192 @@ impl<F: OtaFlash> FirmwareWriter for EspFirmwareWriter<F> {
         }
         self.reset_staging();
         Ok(())
+    }
+}
+
+// ── otadata access and boot verification ───────────────────────────────────
+
+/// Read both redundant `otadata` entries.
+pub fn read_otadata<F: OtaFlash>(flash: &mut F) -> Result<OtaData, FirmwareError> {
+    let mut first = [0u8; ENTRY_SIZE];
+    let mut second = [0u8; ENTRY_SIZE];
+    flash.read(OTADATA_OFFSET, &mut first)?;
+    flash.read(OTADATA_OFFSET + SECTOR_SIZE, &mut second)?;
+    Ok(OtaData::decode([&first, &second]))
+}
+
+/// Check that the flashed partition table is the layout every `otadata` and
+/// slot address in this crate is derived from.
+fn validate_partition_table<F: OtaFlash>(flash: &mut F) -> Result<(), FirmwareError> {
+    let mut entry = [0u8; PARTITION_ENTRY_SIZE];
+    for (index, expected) in EXPECTED_PARTITIONS.iter().copied().enumerate() {
+        let address = PARTITION_TABLE_OFFSET + (index * PARTITION_ENTRY_SIZE) as u32;
+        flash.read(address, &mut entry)?;
+        if !expected.matches(&entry) {
+            log::error!(
+                "[ESP OTA] partition table entry {} does not match the required OTA layout",
+                index
+            );
+            return Err(FirmwareError::HardwareError);
+        }
+    }
+    Ok(())
+}
+
+/// Erase one `otadata` sector, program `activation` and read it back.
+fn program_entry<F: OtaFlash>(flash: &mut F, activation: &Activation) -> Result<(), FirmwareError> {
+    let address = otadata_sector_offset(activation.sector);
+    flash.erase_sector(address)?;
+    flash.write(address, &activation.entry.encode())?;
+
+    let mut readback = [0u8; ENTRY_SIZE];
+    flash.read(address, &mut readback)?;
+    if OtaSelectEntry::decode(&readback) != activation.entry {
+        return Err(FirmwareError::ActivateFailed);
+    }
+    Ok(())
+}
+
+/// Result of the once-per-boot `otadata` check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootCheck {
+    /// No unconfirmed image is running.
+    Confirmed,
+    /// This boot runs an unconfirmed image; call [`confirm_boot`] once it has
+    /// proven network operation.
+    PendingVerify {
+        /// Slot of the unconfirmed image.
+        slot: u8,
+    },
+    /// The previous boot of the unconfirmed image never confirmed; `slot`
+    /// (the previous image) is selected again. The caller must reset.
+    RolledBack {
+        /// Slot the bootloader will start after the reset.
+        slot: u8,
+    },
+    /// The bootloader fell back from an unconfirmed image to `slot`, which is
+    /// now recorded as the confirmed boot preference.
+    FallbackRecorded {
+        /// Slot that is executing.
+        slot: u8,
+    },
+}
+
+/// Why a boot check, confirmation or rollback could not complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootCheckError {
+    /// No executing-slot evidence: the check cannot know what it protects.
+    RunningImage(RunningImageError),
+    /// Flash, partition-table or read-back failure.
+    Flash(FirmwareError),
+    /// `otadata` cannot express the required selection.
+    OtaData(OtaDataError),
+}
+
+impl From<RunningImageError> for BootCheckError {
+    fn from(error: RunningImageError) -> Self {
+        Self::RunningImage(error)
+    }
+}
+
+impl From<FirmwareError> for BootCheckError {
+    fn from(error: FirmwareError) -> Self {
+        Self::Flash(error)
+    }
+}
+
+impl From<OtaDataError> for BootCheckError {
+    fn from(error: OtaDataError) -> Self {
+        Self::OtaData(error)
+    }
+}
+
+fn running_otadata<F: OtaFlash>(flash: &mut F) -> Result<(u8, OtaData), BootCheckError> {
+    let running = flash.running_slot()?;
+    if running >= crate::layout::OTA_SLOT_COUNT {
+        return Err(RunningImageError::OutsideOtaSlots.into());
+    }
+    validate_partition_table(flash)?;
+    Ok((running, read_otadata(flash)?))
+}
+
+/// Program a rollback: select the previous slot first (after which a power
+/// failure already boots it), then mark the abandoned entry `ABORTED`.
+fn apply_rollback<F: OtaFlash>(
+    flash: &mut F,
+    select: &Activation,
+    abandon: &Activation,
+) -> Result<u8, BootCheckError> {
+    program_entry(flash, select)?;
+    let slot = read_otadata(flash)?.active_slot();
+    let Some(slot) = slot.filter(|slot| select.entry.slot() == Some(*slot)) else {
+        return Err(FirmwareError::ActivateFailed.into());
+    };
+    // Selection no longer depends on this rewrite: the new entry has the
+    // higher sequence number. It only records the outcome for ESP-IDF tools.
+    if let Err(error) = program_entry(flash, abandon) {
+        log::warn!(
+            "[ESP OTA] could not mark rolled-back image aborted: {:?}",
+            error
+        );
+    }
+    Ok(slot)
+}
+
+/// Run the once-per-boot pending-verification step. Call it before the
+/// Zigbee stack starts; [`BootCheck::RolledBack`] requires a reset.
+pub fn check_boot<F: OtaFlash>(flash: &mut F) -> Result<BootCheck, BootCheckError> {
+    let (running, data) = running_otadata(flash)?;
+    match data.boot_action(running)? {
+        BootAction::None => Ok(BootCheck::Confirmed),
+        BootAction::MarkBootAttempt { sector } => {
+            // Only clears bits inside the unused `seq_label`; no erase.
+            flash.write(otadata_sector_offset(sector) + BOOT_MARK_OFFSET, &BOOT_MARK)?;
+            let marked = read_otadata(flash)?;
+            match marked.active_entry() {
+                Some((active, entry))
+                    if active == sector && entry.boot_attempted() && entry.is_unconfirmed() =>
+                {
+                    Ok(BootCheck::PendingVerify { slot: running })
+                }
+                _ => Err(FirmwareError::ActivateFailed.into()),
+            }
+        }
+        BootAction::RollBack { select, abandon } => {
+            let slot = apply_rollback(flash, &select, &abandon)?;
+            Ok(BootCheck::RolledBack { slot })
+        }
+        BootAction::AdoptRunning(adopt) => {
+            program_entry(flash, &adopt)?;
+            Ok(BootCheck::FallbackRecorded { slot: running })
+        }
+    }
+}
+
+/// Mark the running image `VALID`, cancelling rollback. Returns `true` when
+/// an unconfirmed entry was rewritten and `false` when nothing was pending.
+pub fn confirm_boot<F: OtaFlash>(flash: &mut F) -> Result<bool, BootCheckError> {
+    let (running, data) = running_otadata(flash)?;
+    let Some(confirmation) = data.confirmation(running) else {
+        return Ok(false);
+    };
+    program_entry(flash, &confirmation)?;
+    if read_otadata(flash)?.active_slot() != Some(running) {
+        return Err(FirmwareError::ActivateFailed.into());
+    }
+    Ok(true)
+}
+
+/// Abandon the running unconfirmed image and reselect the previous slot.
+/// Returns that slot, or `None` when the running image is already confirmed.
+/// The caller must reset after `Some`.
+pub fn roll_back<F: OtaFlash>(flash: &mut F) -> Result<Option<u8>, BootCheckError> {
+    let (running, data) = running_otadata(flash)?;
+    match data.rollback(running)? {
+        Some(BootAction::RollBack { select, abandon }) => {
+            apply_rollback(flash, &select, &abandon).map(Some)
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1095,6 +1273,170 @@ mod tests {
             writer.stage_activation(),
             Err(FirmwareError::ActivateFailed)
         );
+    }
+
+    /// Stage and activate an image from `running`, then "reset" into it.
+    fn upgraded_flash(running: u8) -> MockFlash {
+        let mut flash = MockFlash::with_otadata(running as u32 + 1, 0);
+        flash.running = Ok(running);
+        let mut writer = new_writer(flash);
+        stage(&mut writer, &esp_image(EXPECTED_CHIP_ID, 1024), 64).unwrap();
+        writer.stage_activation().unwrap();
+        let mut flash = writer.flash;
+        assert_eq!(
+            read_otadata(&mut flash)
+                .unwrap()
+                .active_entry()
+                .unwrap()
+                .1
+                .state,
+            crate::otadata::STATE_NEW,
+            "staged images start unconfirmed"
+        );
+        flash.running = Ok(1 - running);
+        flash.erased.clear();
+        flash.writes.clear();
+        flash
+    }
+
+    fn assert_no_slot_access(flash: &MockFlash) {
+        let in_slot = |address: u32| {
+            (OTA_0_OFFSET..OTA_0_OFFSET + OTA_SLOT_SIZE).contains(&address)
+                || (OTA_1_OFFSET..OTA_1_OFFSET + OTA_SLOT_SIZE).contains(&address)
+        };
+        assert!(flash.erased.iter().all(|address| !in_slot(*address)));
+        assert!(flash.writes.iter().all(|(address, _)| !in_slot(*address)));
+    }
+
+    #[test]
+    fn confirmed_boot_never_writes_otadata() {
+        for flash in [MockFlash::new(), MockFlash::with_otadata(1, 0)] {
+            let mut flash = flash;
+            assert_eq!(check_boot(&mut flash), Ok(BootCheck::Confirmed));
+            assert_eq!(confirm_boot(&mut flash), Ok(false));
+            assert_eq!(roll_back(&mut flash), Ok(None));
+            assert!(flash.erased.is_empty() && flash.writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn upgraded_image_is_pending_until_confirmed() {
+        for running in 0..2 {
+            let mut flash = upgraded_flash(running);
+            let new_slot = 1 - running;
+            assert_eq!(
+                check_boot(&mut flash),
+                Ok(BootCheck::PendingVerify { slot: new_slot })
+            );
+            assert!(flash.erased.is_empty(), "the boot mark needs no erase");
+            assert_eq!(flash.writes.len(), 1);
+
+            // The previous image is the rollback target: no staging over it.
+            let mut writer = new_writer(flash);
+            assert_eq!(writer.erase_slot(), Err(FirmwareError::HardwareError));
+            let mut flash = writer.flash;
+
+            assert_eq!(confirm_boot(&mut flash), Ok(true));
+            let data = read_otadata(&mut flash).unwrap();
+            let (_, entry) = data.active_entry().unwrap();
+            assert_eq!(entry.state, STATE_VALID);
+            assert_eq!(entry.slot(), Some(new_slot));
+            assert_eq!(confirm_boot(&mut flash), Ok(false), "idempotent");
+
+            // Later boots are plain confirmed boots, and OTA works again.
+            assert_eq!(check_boot(&mut flash), Ok(BootCheck::Confirmed));
+            assert_eq!(roll_back(&mut flash), Ok(None));
+            assert_no_slot_access(&flash);
+            let mut writer = new_writer(flash);
+            assert_eq!(writer.erase_slot(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn unconfirmed_image_rolls_back_on_the_next_boot() {
+        for running in 0..2 {
+            let mut flash = upgraded_flash(running);
+            let previous = flash
+                .slice(ota_slot_offset(running), OTA_SLOT_SIZE as usize)
+                .to_vec();
+            assert!(matches!(
+                check_boot(&mut flash),
+                Ok(BootCheck::PendingVerify { .. })
+            ));
+            // Reset without confirmation (crash, watchdog, power loss).
+            assert_eq!(
+                check_boot(&mut flash),
+                Ok(BootCheck::RolledBack { slot: running })
+            );
+            let data = read_otadata(&mut flash).unwrap();
+            assert_eq!(data.active_slot(), Some(running));
+            assert!(
+                data.entries
+                    .iter()
+                    .any(|entry| entry.state == crate::otadata::STATE_ABORTED),
+                "the abandoned entry is recorded as aborted"
+            );
+            assert_eq!(
+                flash.slice(ota_slot_offset(running), OTA_SLOT_SIZE as usize),
+                previous.as_slice()
+            );
+            assert_no_slot_access(&flash);
+
+            // The bootloader starts the previous image, which is confirmed.
+            flash.running = Ok(running);
+            assert_eq!(check_boot(&mut flash), Ok(BootCheck::Confirmed));
+            let mut writer = new_writer(flash);
+            assert_eq!(writer.erase_slot(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn confirmation_deadline_rolls_back_the_running_image() {
+        let mut flash = upgraded_flash(0);
+        assert!(matches!(
+            check_boot(&mut flash),
+            Ok(BootCheck::PendingVerify { slot: 1 })
+        ));
+        assert_eq!(roll_back(&mut flash), Ok(Some(0)));
+        assert_eq!(read_otadata(&mut flash).unwrap().active_slot(), Some(0));
+        assert_eq!(
+            confirm_boot(&mut flash),
+            Ok(false),
+            "nothing left to confirm"
+        );
+        assert_no_slot_access(&flash);
+    }
+
+    #[test]
+    fn bootloader_fallback_from_a_new_image_records_the_running_slot() {
+        let mut flash = upgraded_flash(0);
+        // The new slot-1 image failed bootloader validation; slot 0 runs.
+        flash.running = Ok(0);
+        assert_eq!(
+            check_boot(&mut flash),
+            Ok(BootCheck::FallbackRecorded { slot: 0 })
+        );
+        let data = read_otadata(&mut flash).unwrap();
+        assert_eq!(data.active_slot(), Some(0));
+        assert_eq!(data.active_entry().unwrap().1.state, STATE_VALID);
+        assert_eq!(check_boot(&mut flash), Ok(BootCheck::Confirmed));
+    }
+
+    #[test]
+    fn boot_check_requires_running_image_evidence_and_the_partition_table() {
+        let mut flash = upgraded_flash(0);
+        flash.running = Err(RunningImageError::Unavailable);
+        assert_eq!(
+            check_boot(&mut flash),
+            Err(BootCheckError::RunningImage(RunningImageError::Unavailable))
+        );
+        flash.running = Ok(1);
+        flash.data[PARTITION_TABLE_OFFSET as usize] ^= 0xFF;
+        assert_eq!(
+            check_boot(&mut flash),
+            Err(BootCheckError::Flash(FirmwareError::HardwareError))
+        );
+        assert!(flash.erased.is_empty() && flash.writes.is_empty());
     }
 
     /// Explicit opt-in, never silently passes without a real generated file:

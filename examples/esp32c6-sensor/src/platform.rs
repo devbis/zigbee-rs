@@ -50,7 +50,9 @@ impl EnvironmentSource for C6Environment<'_> {
 pub struct EspSupervisor;
 
 impl Supervisor for EspSupervisor {
-    fn heartbeat(&mut self) {}
+    fn heartbeat(&mut self) {
+        esp32_zigbee_devkit_product::ota_boot::poll();
+    }
 
     fn max_wait_ms(&self) -> Option<u32> {
         None
@@ -67,5 +69,6 @@ pub struct EspDiagnostics;
 impl Diagnostics for EspDiagnostics {
     fn record(&mut self, event: DiagnosticEvent) {
         esp_println::println!("[ESP32-C6] {:?}", event);
+        esp32_zigbee_devkit_product::ota_boot::observe(&event);
     }
 }
