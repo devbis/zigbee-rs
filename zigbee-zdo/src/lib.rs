@@ -42,6 +42,7 @@ use zigbee_nwk::nlme::{JoinMethod, NetworkDescriptor};
 use zigbee_nwk::{NwkLayer, NwkStatus};
 use zigbee_types::{ChannelMask, IeeeAddress, ShortAddress};
 
+use crate::binding_mgmt::{BindReq, BindTarget};
 use crate::descriptors::{NodeDescriptor, PowerDescriptor, SimpleDescriptor};
 
 // ── Well-known ZDP constants ────────────────────────────────────
@@ -128,7 +129,8 @@ pub enum ZdpStatus {
     NotSupported = 0x84,
     Timeout = 0x85,
     NoMatch = 0x86,
-    TableFull = 0x87,
+    /// R22 Table 2-138 `TABLE_FULL` (0x8C). `0x87` is reserved.
+    TableFull = 0x8C,
     NoEntry = 0x88,
     NoDescriptor = 0x89,
     /// APS status returned when remote Trust Center policy changes are disabled.
@@ -149,9 +151,9 @@ impl ZdpStatus {
             0x84 => Some(Self::NotSupported),
             0x85 => Some(Self::Timeout),
             0x86 => Some(Self::NoMatch),
-            0x87 => Some(Self::TableFull),
             0x88 => Some(Self::NoEntry),
             0x89 => Some(Self::NoDescriptor),
+            0x8C => Some(Self::TableFull),
             0xA3 => Some(Self::IllegalRequest),
             0xAA => Some(Self::TrustCenterPolicyNotSupported),
             _ => None,
@@ -225,6 +227,41 @@ pub const MAX_LOCAL_ENDPOINTS: usize = 4;
 ))]
 pub const MAX_LOCAL_ENDPOINTS: usize = 32;
 
+// ── ZDP frame budget ────────────────────────────────────────────
+
+/// IEEE 802.15.4 `aMaxPhyPacketSize`.
+const PHY_MAX_PACKET_SIZE: usize = 127;
+/// Intra-PAN MAC data frame with short source and destination addresses:
+/// frame control (2) + sequence (1) + PAN ID (2) + dst (2) + src (2) + FCS (2).
+const MAC_SHORT_DATA_OVERHEAD: usize = 11;
+/// NWK data header without optional fields (R22 3.3.1): frame control (2) +
+/// dst (2) + src (2) + radius (1) + sequence (1).
+const NWK_DATA_HEADER_LEN: usize = 8;
+/// NWK MIC at the mandatory security level 5 (MIC-32).
+const NWK_MIC_LEN: usize = 4;
+/// APS unicast data header (R22 2.2.5.1): frame control (1) + dst endpoint
+/// (1) + cluster (2) + profile (2) + src endpoint (1) + APS counter (1).
+const APS_UNICAST_DATA_HEADER_LEN: usize = 8;
+
+/// Largest ZDP ASDU (transaction sequence number included) that fits one
+/// unfragmented NWK-secured APS unicast without NWK source routing.
+///
+/// ZDP never uses APS security or APS fragmentation, so the budget is the PHY
+/// packet minus the MAC, NWK (header, auxiliary security header, MIC) and APS
+/// unicast data overhead: `127 - 11 - 8 - 14 - 4 - 8 = 82`.
+pub const ZDP_MAX_PAYLOAD: usize = PHY_MAX_PACKET_SIZE
+    - MAC_SHORT_DATA_OVERHEAD
+    - NWK_DATA_HEADER_LEN
+    - zigbee_nwk::security::NWK_AUX_HEADER_LEN
+    - NWK_MIC_LEN
+    - APS_UNICAST_DATA_HEADER_LEN;
+
+/// Worst-case NWK source-route subframe (relay count + relay index + relay
+/// list) a concentrator adds to a unicast data frame.
+pub const ZDP_SOURCE_ROUTE_RESERVE: usize = 2 + 2 * zigbee_nwk::routing::MAX_SOURCE_ROUTE_RELAYS;
+
+const _: () = assert!(ZDP_MAX_PAYLOAD == 82);
+
 /// Zigbee Device Object layer, generic over the MAC driver.
 ///
 /// Owns the APS layer and all ZDO-local state (descriptors, endpoint
@@ -234,6 +271,8 @@ pub struct ZdoLayer<M: MacDriver> {
     aps: ApsLayer<M>,
     /// ZDP transaction-sequence-number counter.
     seq: u8,
+    /// Whether `seq` has been seeded from per-device entropy.
+    seq_seeded: bool,
     /// Registered application endpoints with their simple descriptors.
     endpoints: heapless::Vec<SimpleDescriptor, MAX_LOCAL_ENDPOINTS>,
     /// This node's node descriptor.
@@ -276,6 +315,9 @@ struct PendingZdpResponse {
     tsn: u8,
     /// Expected response cluster ID.
     rsp_cluster: u16,
+    /// Destination the request was sent to. A unicast request only accepts
+    /// a response from that node; a broadcast request accepts any responder.
+    peer: ShortAddress,
     /// Response payload (copied when received).
     payload: heapless::Vec<u8, 128>,
     /// Whether the response has been received.
@@ -292,6 +334,7 @@ impl Default for PendingZdpResponse {
             active: false,
             tsn: 0,
             rsp_cluster: 0,
+            peer: ShortAddress::BROADCAST,
             payload: heapless::Vec::new(),
             completed: false,
             remaining_secs: 0,
@@ -306,6 +349,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         Self {
             aps,
             seq: 0,
+            seq_seeded: false,
             endpoints: heapless::Vec::new(),
             node_descriptor: NodeDescriptor::default(),
             power_descriptor: PowerDescriptor::default(),
@@ -332,6 +376,7 @@ impl<M: MacDriver> ZdoLayer<M> {
         unsafe {
             ApsLayer::write_into(core::ptr::addr_of_mut!((*slot).aps), mac, device_type);
             core::ptr::addr_of_mut!((*slot).seq).write(0);
+            core::ptr::addr_of_mut!((*slot).seq_seeded).write(false);
             core::ptr::addr_of_mut!((*slot).endpoints).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).node_descriptor).write(NodeDescriptor::default());
             core::ptr::addr_of_mut!((*slot).power_descriptor).write(PowerDescriptor::default());
@@ -353,7 +398,24 @@ impl<M: MacDriver> ZdoLayer<M> {
     // ── ZDP sequence number ─────────────────────────────────
 
     /// Allocate the next ZDP transaction-sequence number (wrapping).
+    ///
+    /// The first number is seeded from the IEEE address and the monotonic
+    /// clock so that a rebooted node does not replay the transaction numbers
+    /// of its previous run, which a peer could otherwise correlate with a
+    /// stale outstanding request.
     pub fn next_seq(&mut self) -> u8 {
+        if !self.seq_seeded {
+            self.seq_seeded = true;
+            let micros = self.aps.nwk().mac().monotonic_micros().to_le_bytes();
+            self.seq = self
+                .aps
+                .nwk()
+                .nib()
+                .ieee_address
+                .iter()
+                .chain(micros.iter())
+                .fold(self.seq, |acc, byte| acc.rotate_left(3) ^ byte);
+        }
         let s = self.seq;
         self.seq = self.seq.wrapping_add(1);
         s
@@ -376,13 +438,14 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     // ── Pending ZDP request-response ────────────────────────
 
-    /// Register a pending request, returns the slot index.
-    fn register_pending(&mut self, tsn: u8, rsp_cluster: u16) -> Option<usize> {
+    /// Register a pending request sent to `peer`, returns the slot index.
+    fn register_pending(&mut self, tsn: u8, rsp_cluster: u16, peer: ShortAddress) -> Option<usize> {
         for (i, slot) in self.pending_responses.iter_mut().enumerate() {
             if !slot.active {
                 slot.active = true;
                 slot.tsn = tsn;
                 slot.rsp_cluster = rsp_cluster;
+                slot.peer = peer;
                 slot.payload.clear();
                 slot.completed = false;
                 slot.remaining_secs = 0;
@@ -394,9 +457,36 @@ impl<M: MacDriver> ZdoLayer<M> {
 
     /// Try to deliver an incoming ZDP response to a pending request.
     /// Returns true if the response was consumed.
+    ///
+    /// This legacy entry point correlates on cluster and TSN only; frames
+    /// received from the network must use [`Self::deliver_response_from`] so
+    /// a third node cannot complete a unicast request by guessing its TSN.
     pub fn deliver_response(&mut self, cluster: u16, tsn: u8, payload: &[u8]) -> bool {
+        self.deliver_response_from(None, cluster, tsn, payload)
+    }
+
+    /// Deliver a ZDP response received from `source` (when known).
+    ///
+    /// A request that was unicast to a node only accepts a response whose NWK
+    /// source is that node; a broadcast request accepts any responder.
+    pub fn deliver_response_from(
+        &mut self,
+        source: Option<ShortAddress>,
+        cluster: u16,
+        tsn: u8,
+        payload: &[u8],
+    ) -> bool {
         for slot in &mut self.pending_responses {
-            if slot.active && !slot.completed && slot.rsp_cluster == cluster && slot.tsn == tsn {
+            let peer_matches = match source {
+                Some(source) => !crate::handler::is_unicast_short(slot.peer) || slot.peer == source,
+                None => true,
+            };
+            if slot.active
+                && !slot.completed
+                && slot.rsp_cluster == cluster
+                && slot.tsn == tsn
+                && peer_matches
+            {
                 slot.payload.clear();
                 for &b in payload {
                     let _ = slot.payload.push(b);
@@ -431,6 +521,26 @@ impl<M: MacDriver> ZdoLayer<M> {
         }
     }
 
+    /// Release every pending request slot.
+    ///
+    /// Used by commissioning resets (factory reset, leave, steering restart):
+    /// responses to requests issued on a previous network must never be
+    /// matched against new requests, and an abandoned request must not keep
+    /// one of the few slots allocated forever.
+    pub fn cancel_all_pending(&mut self) {
+        for slot in 0..MAX_PENDING_ZDP {
+            self.cancel_pending(slot);
+        }
+    }
+
+    /// Number of currently allocated pending request slots.
+    pub fn pending_count(&self) -> usize {
+        self.pending_responses
+            .iter()
+            .filter(|slot| slot.active)
+            .count()
+    }
+
     /// Route an incoming ZDP response into the pending client-request table.
     pub fn deliver_client_response(
         &mut self,
@@ -443,7 +553,12 @@ impl<M: MacDriver> ZdoLayer<M> {
             return false;
         }
 
-        self.deliver_response(
+        let source = match indication.src_address {
+            zigbee_aps::ApsAddress::Short(source) => Some(source),
+            _ => None,
+        };
+        self.deliver_response_from(
+            source,
             indication.cluster_id,
             indication.payload[0],
             &indication.payload[1..],
@@ -629,27 +744,47 @@ impl<M: MacDriver> ZdoLayer<M> {
             .map_err(|_| ZdpStatus::NotActive)
     }
 
-    /// Start a Node_Desc request and return its pending-response slot.
-    pub async fn start_node_desc_req(&mut self, dst: ShortAddress) -> Result<usize, ZdpStatus> {
+    /// Send a unicast ZDP request whose first byte is reserved for the TSN
+    /// and register it for response correlation.
+    ///
+    /// The pending slot is released again if the request cannot be sent, so a
+    /// failed transmission never leaks one of the [`MAX_PENDING_ZDP`] slots.
+    async fn start_request(
+        &mut self,
+        dst: ShortAddress,
+        request_cluster: u16,
+        response_cluster: u16,
+        frame: &mut [u8],
+    ) -> Result<(usize, u8), ZdpStatus> {
         let tsn = self.next_seq();
-        let mut buf = [0u8; 3];
-        buf[0] = tsn;
-        buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
-
+        frame[0] = tsn;
         let slot = self
-            .register_pending(tsn, NODE_DESC_RSP)
+            .register_pending(tsn, response_cluster, dst)
             .ok_or(ZdpStatus::TableFull)?;
-        log::debug!("[ZDO] Node_Desc_req dst=0x{:04X}", dst.0);
+        log::debug!(
+            "[ZDO] request cluster=0x{:04X} dst=0x{:04X} tsn={}",
+            request_cluster,
+            dst.0,
+            tsn
+        );
         if self
-            .send_zdp_unicast(dst, NODE_DESC_REQ, &buf)
+            .send_zdp_unicast(dst, request_cluster, frame)
             .await
             .is_err()
         {
             self.cancel_pending(slot);
             return Err(ZdpStatus::NotActive);
         }
+        Ok((slot, tsn))
+    }
 
-        Ok(slot)
+    /// Start a Node_Desc request and return its pending-response slot.
+    pub async fn start_node_desc_req(&mut self, dst: ShortAddress) -> Result<usize, ZdpStatus> {
+        let mut buf = [0u8; 3];
+        buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
+        self.start_request(dst, NODE_DESC_REQ, NODE_DESC_RSP, &mut buf)
+            .await
+            .map(|(slot, _)| slot)
     }
 
     /// Send Mgmt_Permit_Joining_req (ZDP cluster 0x0036).
@@ -703,28 +838,11 @@ impl<M: MacDriver> ZdoLayer<M> {
         dst: ShortAddress,
         endpoint: u8,
     ) -> Result<(usize, u8), ZdpStatus> {
-        let tsn = self.next_seq();
         let mut buf = [0u8; 4]; // TSN(1) + NWK_addr(2) + endpoint(1)
-        buf[0] = tsn;
         buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
         buf[3] = endpoint;
-        let slot = self
-            .register_pending(tsn, SIMPLE_DESC_RSP)
-            .ok_or(ZdpStatus::TableFull)?;
-        log::debug!(
-            "[ZDO] Simple_Desc_req (event-driven) dst=0x{:04X} ep={}",
-            dst.0,
-            endpoint,
-        );
-        if self
-            .send_zdp_unicast(dst, SIMPLE_DESC_REQ, &buf)
+        self.start_request(dst, SIMPLE_DESC_REQ, SIMPLE_DESC_RSP, &mut buf)
             .await
-            .is_err()
-        {
-            self.cancel_pending(slot);
-            return Err(ZdpStatus::NotActive);
-        }
-        Ok((slot, tsn))
     }
 
     /// Start an event-driven IEEE_addr_req (resolve NWK address → IEEE
@@ -738,26 +856,13 @@ impl<M: MacDriver> ZdoLayer<M> {
         &mut self,
         dst: ShortAddress,
     ) -> Result<(usize, u8), ZdpStatus> {
-        let tsn = self.next_seq();
         // TSN(1) + NWK_addr_of_interest(2) + request_type(1) + start_index(1)
         let mut buf = [0u8; 5];
-        buf[0] = tsn;
         buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
         buf[3] = crate::discovery::RequestType::Single as u8;
         buf[4] = 0; // start_index — unused for a Single request
-        let slot = self
-            .register_pending(tsn, IEEE_ADDR_RSP)
-            .ok_or(ZdpStatus::TableFull)?;
-        log::debug!("[ZDO] IEEE_addr_req dst=0x{:04X}", dst.0);
-        if self
-            .send_zdp_unicast(dst, IEEE_ADDR_REQ, &buf)
+        self.start_request(dst, IEEE_ADDR_REQ, IEEE_ADDR_RSP, &mut buf)
             .await
-            .is_err()
-        {
-            self.cancel_pending(slot);
-            return Err(ZdpStatus::NotActive);
-        }
-        Ok((slot, tsn))
     }
 
     /// Return the transaction-sequence number registered for a pending
@@ -771,72 +876,144 @@ impl<M: MacDriver> ZdoLayer<M> {
         }
     }
 
+    /// Start an event-driven Active_EP_req and return its pending-response
+    /// slot and transaction-sequence number.
+    pub async fn start_active_ep_req(
+        &mut self,
+        dst: ShortAddress,
+    ) -> Result<(usize, u8), ZdpStatus> {
+        let mut buf = [0u8; 3]; // TSN(1) + NWK_addr_of_interest(2)
+        buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
+        self.start_request(dst, ACTIVE_EP_REQ, ACTIVE_EP_RSP, &mut buf)
+            .await
+    }
+
     /// Request active endpoints from a remote node.
+    ///
+    /// **Legacy**: the response arrives asynchronously and cannot complete
+    /// inside this one-shot call, so the request is sent, its pending slot is
+    /// released and `Timeout` is returned. Use [`Self::start_active_ep_req`]
+    /// plus [`Self::take_response`] instead.
+    #[deprecated(note = "use start_active_ep_req plus take_response")]
     pub async fn active_ep_req(
         &mut self,
         dst: ShortAddress,
     ) -> Result<heapless::Vec<u8, 32>, ZdpStatus> {
-        let tsn = self.next_seq();
-        let mut buf = [0u8; 3]; // TSN(1) + addr(2)
-        buf[0] = tsn;
-        buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
-        log::debug!("[ZDO] Active_EP_req dst=0x{:04X}", dst.0);
-        let _slot = self.register_pending(tsn, ACTIVE_EP_RSP);
-        let _ = self.send_zdp_unicast(dst, ACTIVE_EP_REQ, &buf).await;
+        let (slot, _) = self.start_active_ep_req(dst).await?;
+        self.cancel_pending(slot);
         Err(ZdpStatus::Timeout)
+    }
+
+    /// Start an event-driven Bind_req (0x0021) and return its pending-response
+    /// slot and transaction-sequence number. The `Bind_rsp` status byte is
+    /// returned by [`Self::take_response`].
+    pub async fn start_bind_req(
+        &mut self,
+        dst: ShortAddress,
+        request: &BindReq,
+    ) -> Result<(usize, u8), ZdpStatus> {
+        self.start_binding_req(dst, BIND_REQ, BIND_RSP, request)
+            .await
+    }
+
+    /// Start an event-driven Unbind_req (0x0022) and return its
+    /// pending-response slot and transaction-sequence number.
+    pub async fn start_unbind_req(
+        &mut self,
+        dst: ShortAddress,
+        request: &BindReq,
+    ) -> Result<(usize, u8), ZdpStatus> {
+        self.start_binding_req(dst, UNBIND_REQ, UNBIND_RSP, request)
+            .await
+    }
+
+    async fn start_binding_req(
+        &mut self,
+        dst: ShortAddress,
+        request_cluster: u16,
+        response_cluster: u16,
+        request: &BindReq,
+    ) -> Result<(usize, u8), ZdpStatus> {
+        let mut buf = [0u8; 1 + 21]; // TSN(1) + largest Bind_req payload
+        let len = request
+            .serialize(&mut buf[1..])
+            .map_err(|_| ZdpStatus::InvRequestType)?;
+        self.start_request(dst, request_cluster, response_cluster, &mut buf[..1 + len])
+            .await
     }
 
     /// Create a binding on a remote device via Bind_req (0x0021).
     ///
-    /// Sends the request and registers it for response matching.
-    /// The response can be checked via `take_response()`.
-    /// Returns the pending slot index on success, or Err on send failure.
+    /// Fire-and-forget: the request carries the complete R22 2.4.3.2.2
+    /// payload (including `DstAddrMode`, `DstAddress` and `DstEndp`) but no
+    /// response slot is held, because this signature cannot hand one back.
+    /// Use [`Self::start_bind_req`] to observe the `Bind_rsp` status.
     pub async fn bind_req(
         &mut self,
         dst: ShortAddress,
         entry: &BindingEntry,
     ) -> Result<(), ZdpStatus> {
-        let tsn = self.next_seq();
-        let mut buf = [0u8; 32];
-        buf[0] = tsn;
-        buf[1..9].copy_from_slice(&entry.src_addr);
-        buf[9] = entry.src_endpoint;
-        buf[10..12].copy_from_slice(&entry.cluster_id.to_le_bytes());
-        log::debug!(
-            "[ZDO] Bind_req dst=0x{:04X} cluster=0x{:04X}",
-            dst.0,
-            entry.cluster_id,
-        );
-        let _slot = self.register_pending(tsn, BIND_RSP);
-        self.send_zdp_unicast(dst, BIND_REQ, &buf[..12])
-            .await
-            .map_err(|_| ZdpStatus::Timeout)
+        let (slot, _) = self
+            .start_bind_req(dst, &bind_req_from_entry(entry))
+            .await?;
+        self.cancel_pending(slot);
+        Ok(())
     }
 
     /// Remove a binding on a remote device via Unbind_req (0x0022).
+    ///
+    /// Fire-and-forget like [`Self::bind_req`]; use
+    /// [`Self::start_unbind_req`] to observe the `Unbind_rsp` status.
     pub async fn unbind_req(
         &mut self,
         dst: ShortAddress,
         entry: &BindingEntry,
     ) -> Result<(), ZdpStatus> {
-        let tsn = self.next_seq();
-        let mut buf = [0u8; 32];
-        buf[0] = tsn;
-        buf[1..9].copy_from_slice(&entry.src_addr);
-        buf[9] = entry.src_endpoint;
-        buf[10..12].copy_from_slice(&entry.cluster_id.to_le_bytes());
-        log::debug!(
-            "[ZDO] Unbind_req dst=0x{:04X} cluster=0x{:04X}",
-            dst.0,
-            entry.cluster_id,
-        );
-        let _slot = self.register_pending(tsn, UNBIND_RSP);
-        self.send_zdp_unicast(dst, UNBIND_REQ, &buf[..12])
+        let (slot, _) = self
+            .start_unbind_req(dst, &bind_req_from_entry(entry))
+            .await?;
+        self.cancel_pending(slot);
+        Ok(())
+    }
+
+    /// Start an event-driven Match_Desc_req and return its pending-response
+    /// slot and transaction-sequence number.
+    ///
+    /// Returns `InvRequestType` when the cluster lists cannot fit one ZDP
+    /// frame ([`ZDP_MAX_PAYLOAD`]).
+    pub async fn start_match_desc_req(
+        &mut self,
+        dst: ShortAddress,
+        profile_id: u16,
+        input_clusters: &[u16],
+        output_clusters: &[u16],
+    ) -> Result<(usize, u8), ZdpStatus> {
+        // TSN(1) + addr(2) + profile(2) + in count(1) + out count(1) + lists
+        let len = 7 + 2 * (input_clusters.len() + output_clusters.len());
+        if len > ZDP_MAX_PAYLOAD {
+            return Err(ZdpStatus::InvRequestType);
+        }
+        let mut buf = [0u8; ZDP_MAX_PAYLOAD];
+        buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
+        buf[3..5].copy_from_slice(&profile_id.to_le_bytes());
+        let mut off = 5;
+        for list in [input_clusters, output_clusters] {
+            buf[off] = list.len() as u8;
+            off += 1;
+            for &c in list {
+                buf[off..off + 2].copy_from_slice(&c.to_le_bytes());
+                off += 2;
+            }
+        }
+        self.start_request(dst, MATCH_DESC_REQ, MATCH_DESC_RSP, &mut buf[..off])
             .await
-            .map_err(|_| ZdpStatus::Timeout)
     }
 
     /// Send Match_Desc_req to discover endpoints with matching clusters.
+    ///
+    /// **Legacy**: like [`Self::active_ep_req`], this releases its pending
+    /// slot and returns `Timeout`. Use [`Self::start_match_desc_req`] instead.
+    #[deprecated(note = "use start_match_desc_req plus take_response")]
     pub async fn match_desc_req(
         &mut self,
         dst: ShortAddress,
@@ -844,35 +1021,10 @@ impl<M: MacDriver> ZdoLayer<M> {
         input_clusters: &[u16],
         output_clusters: &[u16],
     ) -> Result<heapless::Vec<u8, 32>, ZdpStatus> {
-        let tsn = self.next_seq();
-        let mut buf = [0u8; 64];
-        buf[0] = tsn;
-        buf[1..3].copy_from_slice(&dst.0.to_le_bytes());
-        buf[3..5].copy_from_slice(&profile_id.to_le_bytes());
-        buf[5] = input_clusters.len() as u8;
-        let mut off = 6;
-        for &c in input_clusters {
-            buf[off..off + 2].copy_from_slice(&c.to_le_bytes());
-            off += 2;
-        }
-        buf[off] = output_clusters.len() as u8;
-        off += 1;
-        for &c in output_clusters {
-            buf[off..off + 2].copy_from_slice(&c.to_le_bytes());
-            off += 2;
-        }
-        log::debug!(
-            "[ZDO] Match_Desc_req dst=0x{:04X} profile=0x{:04X} in={} out={}",
-            dst.0,
-            profile_id,
-            input_clusters.len(),
-            output_clusters.len(),
-        );
-        let _slot = self.register_pending(tsn, MATCH_DESC_RSP);
-        let _ = self
-            .send_zdp_unicast(dst, MATCH_DESC_REQ, &buf[..off])
-            .await;
-        // Response will be delivered asynchronously via handle_indication
+        let (slot, _) = self
+            .start_match_desc_req(dst, profile_id, input_clusters, output_clusters)
+            .await?;
+        self.cancel_pending(slot);
         Err(ZdpStatus::Timeout)
     }
 
@@ -1003,6 +1155,26 @@ impl<M: MacDriver> ZdoLayer<M> {
         self.nwk_mut()
             .nlme_reset(warm_start)
             .map_err(ZdpStatus::from)
+    }
+}
+
+/// Convert an APS binding entry into the ZDP Bind_req/Unbind_req payload.
+fn bind_req_from_entry(entry: &BindingEntry) -> BindReq {
+    let dst = match entry.dst {
+        zigbee_aps::binding::BindingDst::Group(group) => BindTarget::Group(group),
+        zigbee_aps::binding::BindingDst::Unicast {
+            dst_addr,
+            dst_endpoint,
+        } => BindTarget::Unicast {
+            dst_addr,
+            dst_endpoint,
+        },
+    };
+    BindReq {
+        src_addr: entry.src_addr,
+        src_endpoint: entry.src_endpoint,
+        cluster_id: entry.cluster_id,
+        dst,
     }
 }
 
