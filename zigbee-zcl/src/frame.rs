@@ -3,7 +3,7 @@
 //! A ZCL frame consists of a header (frame control, optional manufacturer code,
 //! sequence number, command ID) followed by a variable-length payload.
 
-use crate::{ClusterDirection, CommandId};
+use crate::{ClusterDirection, CommandId, ZclStatus};
 
 /// ZCL frame type encoded in bits 0–1 of frame control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,9 +45,48 @@ impl ZclFrameHeader {
     const FC_DISABLE_DEFAULT_RESPONSE: u8 = 1 << 4;
 
     /// Frame type (global vs. cluster-specific).
+    ///
+    /// Frames with a reserved frame type are rejected by [`ZclFrame::parse`];
+    /// for a hand-built header carrying reserved bits this returns
+    /// `ClusterSpecific` so the frame is never treated as a foundation
+    /// command. Use [`try_frame_type`](Self::try_frame_type) to detect them.
     pub fn frame_type(&self) -> ZclFrameType {
+        self.try_frame_type()
+            .unwrap_or(ZclFrameType::ClusterSpecific)
+    }
+
+    /// Frame type, or `None` for the reserved values 0b10/0b11.
+    pub fn try_frame_type(&self) -> Option<ZclFrameType> {
         ZclFrameType::from_u8(self.frame_control & Self::FC_FRAME_TYPE_MASK)
-            .unwrap_or(ZclFrameType::Global)
+    }
+
+    /// Status for a manufacturer-specific frame the receiver does not
+    /// implement (ZCL r8 §2.5.12.4): `UNSUP_MANUF_GENERAL_COMMAND` for global
+    /// frames, `UNSUP_MANUF_CLUSTER_COMMAND` for cluster-specific ones.
+    /// Returns `None` for standard (non-manufacturer-specific) frames.
+    ///
+    /// Dispatchers without manufacturer extensions must answer such frames
+    /// with this status instead of processing them as standard commands.
+    pub fn manufacturer_specific_unsupported_status(&self) -> Option<ZclStatus> {
+        if !self.is_manufacturer_specific() {
+            return None;
+        }
+        Some(match self.frame_type() {
+            ZclFrameType::Global => ZclStatus::UnsupManufacturerGeneralCommand,
+            ZclFrameType::ClusterSpecific => ZclStatus::UnsupManufacturerClusterCommand,
+        })
+    }
+
+    /// Whether a Default Response carrying `status` must be sent for this
+    /// received command (ZCL r8 §2.5.12.2 / §2.4.1.1.4).
+    ///
+    /// The disable-default-response bit only suppresses *successful* Default
+    /// Responses: an error status is always reported. A Default Response is
+    /// never sent in reply to a Default Response.
+    pub fn default_response_required(&self, status: ZclStatus) -> bool {
+        let is_default_rsp = self.frame_type() == ZclFrameType::Global
+            && self.command_id.0 == crate::foundation::FoundationCommandId::DefaultResponse as u8;
+        !is_default_rsp && (status != ZclStatus::Success || !self.disable_default_response())
     }
 
     /// Whether the manufacturer code field is present.
@@ -120,6 +159,9 @@ impl ZclFrame {
         }
 
         let frame_control = data[0];
+        if ZclFrameType::from_u8(frame_control).is_none() {
+            return Err(ZclFrameError::InvalidFrameType);
+        }
         let manufacturer_specific = frame_control & ZclFrameHeader::FC_MANUFACTURER_SPECIFIC != 0;
 
         let min_header = if manufacturer_specific { 5 } else { 3 };
@@ -234,5 +276,61 @@ impl ZclFrame {
             },
             payload: heapless::Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserved_frame_types_are_rejected() {
+        for fc in [0x02u8, 0x03, 0x12, 0x1B] {
+            assert_eq!(
+                ZclFrame::parse(&[fc, 1, 0x00]).err(),
+                Some(ZclFrameError::InvalidFrameType)
+            );
+        }
+        let f = ZclFrame::parse(&[0x00, 1, 0x00]).unwrap();
+        assert_eq!(f.header.try_frame_type(), Some(ZclFrameType::Global));
+        let hand_built = ZclFrameHeader {
+            frame_control: 0x02,
+            manufacturer_code: None,
+            seq_number: 0,
+            command_id: CommandId(0),
+        };
+        assert_eq!(hand_built.try_frame_type(), None);
+        assert_eq!(hand_built.frame_type(), ZclFrameType::ClusterSpecific);
+    }
+
+    #[test]
+    fn manufacturer_specific_frames_report_unsupported_status() {
+        let g = ZclFrame::parse(&[0x04, 0x34, 0x12, 1, 0x00]).unwrap();
+        assert_eq!(g.header.manufacturer_code, Some(0x1234));
+        assert_eq!(
+            g.header.manufacturer_specific_unsupported_status(),
+            Some(ZclStatus::UnsupManufacturerGeneralCommand)
+        );
+        let c = ZclFrame::parse(&[0x05, 0x34, 0x12, 1, 0x00]).unwrap();
+        assert_eq!(
+            c.header.manufacturer_specific_unsupported_status(),
+            Some(ZclStatus::UnsupManufacturerClusterCommand)
+        );
+        let std = ZclFrame::parse(&[0x01, 1, 0x00]).unwrap();
+        assert_eq!(std.header.manufacturer_specific_unsupported_status(), None);
+    }
+
+    #[test]
+    fn disable_default_response_only_suppresses_success() {
+        let ddr = ZclFrame::parse(&[0x11, 1, 0x00]).unwrap().header;
+        assert!(!ddr.default_response_required(ZclStatus::Success));
+        assert!(ddr.default_response_required(ZclStatus::UnsupClusterCommand));
+        let plain = ZclFrame::parse(&[0x01, 1, 0x00]).unwrap().header;
+        assert!(plain.default_response_required(ZclStatus::Success));
+        // Never answer a Default Response with a Default Response.
+        let dr = ZclFrame::parse(&[0x00, 1, 0x0B, 0x00, 0x81])
+            .unwrap()
+            .header;
+        assert!(!dr.default_response_required(ZclStatus::Failure));
     }
 }
