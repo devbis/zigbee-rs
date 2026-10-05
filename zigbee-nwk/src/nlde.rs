@@ -1095,11 +1095,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// floor have been committed, in that order. Only then release relays.
     pub async fn complete_lifecycle_persistence(&mut self) {
         if let Some((replay, _)) = self.pending_lifecycle_replay.take() {
-            self.security.commit_frame_counter_for_key(
-                &replay.source,
-                replay.key_sequence,
-                replay.counter,
-            );
+            self.commit_replay_floor(replay);
             self.security.activation_pending = false;
         }
         if let Some((source, sequence)) = self.pending_lifecycle_btr.take() {
@@ -1156,12 +1152,29 @@ impl<M: MacDriver> NwkLayer<M> {
             log::error!("[NWK] Durable replay-counter commit failed");
             return false;
         }
-        self.security.commit_frame_counter_for_key(
+        self.commit_replay_floor(replay);
+        true
+    }
+
+    /// Record a verified incoming counter. When the replay table is full the
+    /// least-recently-heard source is evicted, never our parent or a child
+    /// while any other entry can go (see `commit_frame_counter_for_key_protecting`).
+    fn commit_replay_floor(&mut self, replay: crate::security::NwkReplayCounter) {
+        let neighbors = &self.neighbors;
+        self.security.commit_frame_counter_for_key_protecting(
             &replay.source,
             replay.key_sequence,
             replay.counter,
+            |ieee| {
+                neighbors.find_by_ieee(ieee).is_some_and(|entry| {
+                    matches!(
+                        entry.relationship,
+                        crate::neighbor::Relationship::Parent
+                            | crate::neighbor::Relationship::Child
+                    )
+                })
+            },
         );
-        true
     }
 
     fn defer_incoming_replay(
