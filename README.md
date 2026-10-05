@@ -213,8 +213,9 @@ sensor or router behavior is moved to a new MCU.
 ## Current targets
 
 “Build” means the pinned release image compiles and passes its layout checks;
-it is not a hardware claim. The exact 2026-08-27 image measurements are
-build/layout-tested only. Hardware evidence in the last column is prior
+it is not a hardware claim. Image measurements, which are build/layout-tested
+only, are maintained on the book's
+[Firmware Size](docs/book/src/advanced/firmware-size.md) page. Hardware evidence in the last column is prior
 path-level evidence unless an exact-image rerun is explicitly named; this
 worktree records no such rerun for the current byte-for-byte images.
 
@@ -226,15 +227,16 @@ worktree records no such rerun for the current byte-for-byte images.
 | ESP32-C6 | environmental sleepy End Device + OTA | yes | prior C6 evidence covers commissioning/reporting and OTA to 18.3%; complete activation remains open |
 | ESP32-H2 | environmental sleepy End Device + OTA | yes | prior H2 evidence covers v1→v2 activation, reboot, and retained commissioned state |
 | BL702 XT-ZB1 | environmental sleepy End Device | yes | prior path evidence covers radio/commissioning/interview; destructive flash persistence remains open |
-| PHY6222/PHY6252 EVK | environmental sleepy End Device | yes | PHY6222 occupies 130,752 B of its physical 130,816 B XIP slot (64 B free); PHY6252 failed-link span is 130,912 B (96 B over); complete hardware path remains unverified |
+| PHY6222/PHY6252 EVK | environmental sleepy End Device | PHY6222 yes; PHY6252 no (96 B over XIP slot) | PHY6222 occupies 130,752 B of its physical 130,816 B XIP slot (64 B free); PHY6252 failed-link span is 130,912 B (96 B over); complete hardware path remains unverified |
 | CC2340R5 | environmental sleepy End Device | yes | pinned-SDK and fallback compile/link paths pass; radio HIL and entropy remain open |
 | EFR32MG1P TRÅDFRI | environmental sleepy End Device | yes | prior path evidence covers commissioning through EM2; real OTA install remains open |
 | EFR32MG21 BRD4181A | environmental sleepy End Device | yes | complete hardware path remains HIL-unverified |
 | TLSR8258 TB-04 | environmental sleepy End Device | yes | prior evidence covers the SUSPEND primitive; repeated application/network acceptance remains open |
 | TLSR8258 TB-04 | child-capable router | yes | prior evidence covers join/restart/Link Status/relay; corrected-image child acceptance remains open |
 
-See [BUILD.md](BUILD.md) for pinned commands, measured images, partition
-boundaries, and exact remaining gates.
+See [BUILD.md](BUILD.md) for pinned commands, partition boundaries, and exact
+remaining gates, and
+[Firmware Size](docs/book/src/advanced/firmware-size.md) for measured images.
 
 Firmware byte counts remain reported, but artificial regression budgets no
 longer fail builds. Real Flash/RAM limits, protected partitions, OTA-slot

@@ -43,8 +43,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: tc32-${{ github.ref }}
-  cancel-in-progress: true
+  group: tc32-${{ (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
 
 env:
   TC32_TOOLCHAIN_TAG: tc32-1.98.1-20261003-31a272
@@ -66,20 +66,30 @@ jobs:
           toolchain: ${{ env.HOST_RUST_TOOLCHAIN }}
           components: clippy
 
-      - name: Cache pinned TC32 toolchain
+      # Cache the release archive rather than the extracted tree so the pinned
+      # SHA-256 is re-verified against the exact bytes on every run,
+      # including cache hits.
+      - name: Cache pinned TC32 toolchain archive
         id: cache-tc32-toolchain
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ env.TC32_TOOLCHAIN }}
-          key: tc32-toolchain-linux-amd64-${{ env.TC32_TOOLCHAIN_SHA256 }}
+          path: ${{ runner.temp }}/tc32-archive
+          key: tc32-toolchain-archive-linux-amd64-${{ env.TC32_TOOLCHAIN_SHA256 }}
 
-      - name: Install pinned TC32 toolchain
+      - name: Download pinned TC32 toolchain
         if: steps.cache-tc32-toolchain.outputs.cache-hit != 'true'
         run: |
+          mkdir -p "$RUNNER_TEMP/tc32-archive"
+          curl -fL --retry 3 "$TC32_TOOLCHAIN_URL" \
+            -o "$RUNNER_TEMP/tc32-archive/tc32.tar.gz"
+
+      - name: Verify and install pinned TC32 toolchain
+        run: |
+          ARCHIVE="$RUNNER_TEMP/tc32-archive/tc32.tar.gz"
+          echo "$TC32_TOOLCHAIN_SHA256  $ARCHIVE" | sha256sum -c -
+          rm -rf "$TC32_TOOLCHAIN"
           mkdir -p "$TC32_TOOLCHAIN"
-          curl -fL --retry 3 "$TC32_TOOLCHAIN_URL" -o /tmp/tc32.tar.gz
-          echo "$TC32_TOOLCHAIN_SHA256  /tmp/tc32.tar.gz" | sha256sum -c -
-          tar -xzf /tmp/tc32.tar.gz --strip-components=1 -C "$TC32_TOOLCHAIN"
+          tar -xzf "$ARCHIVE" --strip-components=1 -C "$TC32_TOOLCHAIN"
 
       - name: Verify pinned TC32 toolchain
         run: |
@@ -284,3 +294,7 @@ jobs:
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path boards/tlsr8258-tb04/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-router/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-radio/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path tlsr8258-rt/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path products/tlsr8258-tb04/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-sensor/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path tools/telink-tlsr8258-lab/Cargo.toml -- --check

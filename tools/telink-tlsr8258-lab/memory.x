@@ -13,11 +13,13 @@
  */
 MEMORY
 {
-    /* Keep the security journal and factory/configuration area out of the
-     * linked image:
+    /* Keep the production NV journals and factory/configuration area out of
+     * the linked image, so a lab image cannot erase a TB-04's state:
+     *   0x70000..0x72000 APS binding/group journal
+     *   0x72000..0x74000 child-table journal
      *   0x74000..0x76000 security-state journal
      *   0x76000..0x80000 factory/configuration data */
-    FLASH : ORIGIN = 0x00000000, LENGTH = 0x74000
+    FLASH : ORIGIN = 0x00000000, LENGTH = 0x70000
     RAM   : ORIGIN = 0x00840000, LENGTH = 0x10000
 }
 
@@ -143,6 +145,7 @@ SECTIONS
     _bin_size_ = _code_size_ + SIZEOF(.data);
     _bin_size_div_16 = (_bin_size_ + 15) / 16;
     _etext = _dstored_;
+    _aps_nv_start_ = 0x70000;
     _security_nv_start_ = 0x74000;
     _security_nv_end_ = 0x76000;
 
@@ -171,8 +174,8 @@ SECTIONS
         "ERROR: .rf_dma overlaps the TLSR8258 I-cache tag/data reservation");
     _assert_dma_under_stack = ASSERT(_rf_dma_end_ <= _svc_stack_bottom,
         "ERROR: .rf_dma extends into the SVC stack region");
-    _assert_image_below_security_nv = ASSERT(_bin_size_ <= _security_nv_start_,
-        "ERROR: firmware image overlaps security journal at 0x74000");
+    _assert_image_below_aps_nv = ASSERT(_bin_size_ <= _aps_nv_start_,
+        "ERROR: firmware image overlaps APS-table journal at 0x70000");
 
     /DISCARD/ :
     {

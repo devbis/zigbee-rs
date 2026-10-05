@@ -25,3 +25,9 @@ applications should use:
 
 `sensor` is the legacy manual-stack regression image. It is retained only for
 comparison with earlier hardware captures.
+
+Every lab layout (`memory.x`, `memory-pm.x`, `memory-retention.x`) links
+against the production TB-04 application boundary at `0x70000`, and the
+post-link check fails any `.bin` that reaches it. Flashing a lab image therefore
+cannot overwrite the APS (`0x70000`), child-table (`0x72000`) or security
+(`0x74000`) journals or the factory data at `0x76000`.

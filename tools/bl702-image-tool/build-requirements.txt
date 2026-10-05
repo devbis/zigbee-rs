@@ -1,0 +1,7 @@
+# Build backend for the source-only bflb-mcu-tool and pycklink distributions.
+# Install first with:
+#   python3 -m pip install --require-hashes --no-deps -r tools/bl702-image-tool/build-requirements.txt
+# Hashes cover every file PyPI publishes for the pinned release.
+setuptools==84.0.0 \
+    --hash=sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670 \
+    --hash=sha256:f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73
