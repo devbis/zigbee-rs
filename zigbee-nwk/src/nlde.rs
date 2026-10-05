@@ -1309,10 +1309,19 @@ impl<M: MacDriver> NwkLayer<M> {
         // before it is relayed or rebroadcast on our behalf and before any
         // command dispatch — rather than at the local-delivery gate below,
         // which a frame addressed elsewhere never reaches.
-        if !is_data && !is_command {
+        //
+        // NWK multicast (R22 §3.6.6) is not supported: this stack runs with
+        // nwkUseMulticast = FALSE and delivers APS group traffic as NWK
+        // broadcasts. The destination of a multicast frame is a *group ID*,
+        // never a device, so it must not be delivered as a unicast to a
+        // device whose short address happens to match, nor relayed as a
+        // unicast toward that "address" (or the parent): without member-mode
+        // support the frame is dropped.
+        if (!is_data && !is_command) || header.frame_control.multicast {
             log::debug!(
-                "[NWK] Dropping unsupported NWK frame type {} from 0x{:04X}",
+                "[NWK] Dropping unsupported NWK frame (type {}, multicast {}) from 0x{:04X}",
                 frame_type,
+                header.frame_control.multicast,
                 src.0
             );
             return None;
@@ -5766,6 +5775,46 @@ mod tests {
         assert!(
             nwk.pending_route_replies.is_empty(),
             "a reply addressed to us is not forwarded further"
+        );
+    }
+
+    // ── NWK multicast (R22 §3.6.6) ───────────────────────────
+
+    fn multicast_to(group: ShortAddress) -> heapless::Vec<u8, 128> {
+        let mut header = frame(NwkFrameType::Data, PEER, group);
+        header.frame_control.multicast = true;
+        header.multicast_control = Some(0x09); // non-member mode, radius 1
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &[0x6D], &mut buf);
+        heapless::Vec::from_slice(&buf[..len]).expect("the frame fits")
+    }
+
+    #[test]
+    fn a_multicast_frame_is_never_taken_for_a_unicast_to_a_matching_address() {
+        for device_type in [DeviceType::EndDevice, DeviceType::Router] {
+            let mut nwk = node(device_type, OUR_ADDR);
+            // The group ID numerically equals our own short address.
+            let bytes = multicast_to(OUR_ADDR);
+            assert!(block_on(nwk.process_incoming_nwk_frame(&bytes, 200)).is_none());
+            assert!(nwk.mac.tx_history().is_empty());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_router_never_unicasts_a_multicast_frame_to_its_group_id() {
+        const GROUP: ShortAddress = ShortAddress(0x4321);
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        // A neighbour and a route that happen to match the group ID, and a
+        // parent to fall back on.
+        neighbour_with_cost(&mut router, GROUP, 1);
+        router.routing.update_route(FAR, NEXT_HOP, 1).unwrap();
+        let bytes = multicast_to(GROUP);
+        assert!(block_on(router.process_incoming_nwk_frame(&bytes, 200)).is_none());
+        block_on(router.process_pending_routing());
+        assert!(
+            router.mac.tx_history().is_empty(),
+            "the frame is neither unicast to the group ID nor handed to the parent"
         );
     }
 
