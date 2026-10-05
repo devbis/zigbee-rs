@@ -35,6 +35,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod address_map;
 pub mod conflict;
 pub mod frames;
 pub mod indirect;
@@ -299,6 +300,9 @@ pub struct NwkLayer<M: MacDriver> {
     mac: M,
     nib: nib::Nib,
     neighbors: neighbor::NeighborTable,
+    /// `nwkAddressMap`: IEEE ↔ short pairs for devices anywhere in the
+    /// network. Never consulted as evidence that a device is one hop away.
+    address_map: address_map::AddressMap,
     routing: routing::RoutingTable,
     btr: routing::BtrTable,
     security: security::NwkSecurity,
@@ -405,6 +409,7 @@ impl<M: MacDriver> NwkLayer<M> {
             mac,
             nib: nib::Nib::new(),
             neighbors: neighbor::NeighborTable::new(),
+            address_map: address_map::AddressMap::new(),
             routing: routing::RoutingTable::new(),
             btr: routing::BtrTable::new(),
             security: security::NwkSecurity::new(),
@@ -462,6 +467,7 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).mac).write(mac);
             core::ptr::addr_of_mut!((*slot).nib).write(nib::Nib::new());
             core::ptr::addr_of_mut!((*slot).neighbors).write(neighbor::NeighborTable::new());
+            core::ptr::addr_of_mut!((*slot).address_map).write(address_map::AddressMap::new());
             core::ptr::addr_of_mut!((*slot).routing).write(routing::RoutingTable::new());
             core::ptr::addr_of_mut!((*slot).btr).write(routing::BtrTable::new());
             core::ptr::addr_of_mut!((*slot).security).write(security::NwkSecurity::new());
@@ -674,6 +680,7 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Remove a device that sent a NWK Leave indication.
     pub fn remove_neighbor(&mut self, address: ShortAddress) {
         self.neighbors.remove(address);
+        self.address_map.remove(address);
     }
 
     /// Read-only access to the routing table.
@@ -681,23 +688,77 @@ impl<M: MacDriver> NwkLayer<M> {
         &self.routing
     }
 
-    /// Look up a short address by IEEE address from the neighbor table.
-    pub fn find_short_by_ieee(&self, ieee: &IeeeAddress) -> Option<ShortAddress> {
-        self.neighbors.find_by_ieee(ieee).map(|e| e.network_address)
+    /// Read-only access to the NWK address map (`nwkAddressMap`).
+    pub fn address_map(&self) -> &address_map::AddressMap {
+        &self.address_map
     }
 
-    /// Look up an IEEE address by short address from the neighbor table.
+    /// Look up a short address by IEEE address: one-hop neighbors first, then
+    /// the network-wide address map.
+    pub fn find_short_by_ieee(&self, ieee: &IeeeAddress) -> Option<ShortAddress> {
+        self.neighbors
+            .find_by_ieee(ieee)
+            .map(|e| e.network_address)
+            .or_else(|| self.address_map.short_of(ieee))
+    }
+
+    /// Look up an IEEE address by short address: one-hop neighbors first, then
+    /// the network-wide address map.
     pub fn find_ieee_by_short(&self, short: ShortAddress) -> Option<IeeeAddress> {
-        for entry in self.neighbors.iter() {
-            if entry.network_address == short {
-                return Some(entry.ieee_address);
+        self.neighbors
+            .find_by_short(short)
+            .map(|e| e.ieee_address)
+            .or_else(|| self.address_map.ieee_of(short))
+    }
+
+    /// Record an IEEE ↔ short pairing in the NWK address map.
+    ///
+    /// This is the right sink for identity learned about a device that may be
+    /// any number of hops away (a `Device_annce`, a relayed frame's source
+    /// IEEE address). On a routing build it never creates a neighbor table
+    /// entry, so it can never make a multi-hop device look directly
+    /// reachable. An existing non-parent/non-child neighbor entry for the same
+    /// IEEE address follows the device to its new short address; parent and
+    /// child entries are only changed through join, rejoin and conflict
+    /// processing.
+    ///
+    /// A build without the `router` feature sends every unicast to its parent
+    /// and never routes on its neighbor table, so its small neighbor cache
+    /// keeps doubling as the identity cache (no separate map is linked). The
+    /// parent mapping is still never rewritten from here.
+    pub fn update_address_map(&mut self, nwk_addr: ShortAddress, ieee_addr: IeeeAddress) {
+        #[cfg(feature = "router")]
+        {
+            self.address_map.update(nwk_addr, ieee_addr);
+            if let Some(entry) = self.neighbors.find_by_ieee_mut(&ieee_addr)
+                && !matches!(
+                    entry.relationship,
+                    neighbor::Relationship::Parent
+                        | neighbor::Relationship::Child
+                        | neighbor::Relationship::UnauthenticatedChild
+                )
+            {
+                entry.network_address = nwk_addr;
             }
         }
-        None
+        #[cfg(not(feature = "router"))]
+        {
+            if self.neighbors.parent().is_some_and(|parent| {
+                parent.network_address == nwk_addr || parent.ieee_address == ieee_addr
+            }) {
+                return;
+            }
+            self.update_neighbor_address(nwk_addr, ieee_addr);
+        }
     }
 
-    /// Update or insert a neighbor entry when a Device_annce is received.
-    /// This keeps the NWK address → IEEE address mapping current.
+    /// Insert or refresh a **one-hop neighbor** entry for `nwk_addr`.
+    ///
+    /// Only call this for a device known to be directly reachable (it creates
+    /// a neighbor table entry used for direct MAC delivery). Identity learned
+    /// about a possibly remote device — e.g. from a `Device_annce` — belongs
+    /// in the address map: use [`Self::note_announced_address`] or
+    /// [`Self::update_address_map`].
     pub fn update_neighbor_address(&mut self, nwk_addr: ShortAddress, ieee_addr: IeeeAddress) {
         // Try to update existing entry by NWK addr or IEEE addr
         for entry in self.neighbors.iter_mut_all() {
@@ -734,6 +795,7 @@ impl<M: MacDriver> NwkLayer<M> {
         }
         entry.network_address = new_address;
         self.routing.remove(old_address);
+        self.address_map.update(new_address, ieee_address);
         true
     }
 
@@ -751,16 +813,20 @@ impl<M: MacDriver> NwkLayer<M> {
     /// collects it with [`take_command_outcome`](Self::take_command_outcome)
     /// exactly as it does for a NWK command.
     ///
-    /// An announcement that arrived unauthenticated on a secured network is
-    /// recorded exactly as before but is never read as a conflict: an
-    /// unsecured unicast is accepted so pre-key commissioning traffic can
-    /// arrive, and a device with no keys must not be able to make anybody
-    /// change address or rejoin. The private `rx_authenticated` flag describes the frame
-    /// this announcement was carried in — ZDO processing runs inside the same
-    /// receive pass that set it.
+    /// The announcement only ever updates the address map: a device that
+    /// announces itself may be any number of hops away, so on a routing build
+    /// it never becomes a neighbor table entry, and it never rewrites a
+    /// parent or child mapping (see [`Self::update_address_map`]).
+    ///
+    /// On a secured network an announcement that arrived unauthenticated is
+    /// ignored entirely: an unsecured unicast is accepted so pre-key
+    /// commissioning traffic can arrive, and a device with no keys must be
+    /// able neither to poison the address map nor to make anybody change
+    /// address or rejoin. The private `rx_authenticated` flag describes the
+    /// frame this announcement was carried in — ZDO processing runs inside
+    /// the same receive pass that set it.
     pub fn note_announced_address(&mut self, address: ShortAddress, ieee: IeeeAddress) {
         if self.nib.security_enabled && !self.rx_authenticated {
-            self.update_neighbor_address(address, ieee);
             return;
         }
         if let conflict::AddressCheck::Conflict { outcome } =
@@ -771,7 +837,9 @@ impl<M: MacDriver> NwkLayer<M> {
             }
             return;
         }
-        self.update_neighbor_address(address, ieee);
+        if nlde::is_unicast_address(address) {
+            self.update_address_map(address, ieee);
+        }
     }
 
     /// Age the neighbour cache on a non-routing end device.

@@ -158,15 +158,14 @@ impl<M: MacDriver> NwkLayer<M> {
 
         #[cfg(feature = "router")]
         {
-            let known = self
-                .neighbors
-                .find_by_short(address)
-                .map(|entry| entry.ieee_address);
+            let known = self.find_ieee_by_short(address);
             match known {
                 Some(NULL_IEEE) | None => {
                     // Nothing recorded yet — learn the mapping. This is what makes
                     // the *next* statement of identity able to detect a conflict.
-                    self.update_neighbor_address(address, ieee);
+                    // It goes to the address map only: the device may be any
+                    // number of hops away (R22 §3.6.1.5 vs. nwkAddressMap).
+                    self.update_address_map(address, ieee);
                     AddressCheck::Consistent
                 }
                 Some(existing) if existing == ieee => AddressCheck::Consistent,

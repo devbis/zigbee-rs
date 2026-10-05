@@ -1897,7 +1897,13 @@ impl<M: MacDriver> NwkLayer<M> {
                     .ok_or(NwkStatus::RouteError)?
             }
         } else {
-            self.resolve_next_hop(header.dst_addr)?
+            match self.resolve_next_hop(header.dst_addr) {
+                Ok(next_hop) => next_hop,
+                Err(status) => {
+                    self.handle_unroutable_relay(header).await;
+                    return Err(status);
+                }
+            }
         };
 
         // A parent forwarding its direct end-device child's data over a
@@ -1996,6 +2002,35 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         Ok(())
+    }
+
+    /// R22 §3.6.3.3: a router asked to relay a unicast it has no route for
+    /// initiates route discovery when the frame permits it; otherwise (or if
+    /// discovery cannot start) it tells the originator with a Network Status
+    /// "no route available" so the originator can repair the route itself.
+    /// The frame is not buffered pending discovery; the originator's
+    /// retransmission uses the repaired route.
+    #[cfg(feature = "router")]
+    async fn handle_unroutable_relay(&mut self, header: &NwkHeader) {
+        let destination = header.dst_addr;
+        if !is_unicast_address(destination) || header.src_addr == self.nib.network_address {
+            return;
+        }
+        if header.frame_control.discover_route != 0
+            && (self.routing.has_active_discovery(destination)
+                || self.discover_route(destination).await.is_ok())
+        {
+            return;
+        }
+        let pending = crate::PendingNetworkStatus {
+            destination: header.src_addr,
+            status_code: crate::frames::NetworkStatusCommand::NO_ROUTE_AVAILABLE,
+            failed_destination: destination,
+            next_hop: None,
+        };
+        if self.pending_route_errors.push(pending).is_err() {
+            log::warn!("[NWK] Network Status queue full");
+        }
     }
 
     /// Whether `addr` is a child of ours that sleeps, and therefore can only
@@ -2339,63 +2374,53 @@ impl<M: MacDriver> NwkLayer<M> {
 
     /// Resolve the MAC next hop for a given NWK destination.
     ///
-    /// Strategy:
-    /// 1. If destination is a neighbor → send directly
-    /// 2. If destination is in routing table → use next_hop
-    /// 3. If we're an end device → send to parent
-    /// 4. For broadcast → send to all neighbors (simplified: send to parent)
+    /// * An end device hands every frame — unicast or broadcast — to its
+    ///   parent (R22 §3.6.3.3 / §3.6.5).
+    /// * A router sends broadcasts as MAC broadcasts, unicasts straight to a
+    ///   destination in its neighbor table (devices heard directly, including
+    ///   its children, R22 §3.6.1.5) and otherwise along an active routing
+    ///   table entry.
+    /// * Anything else is unroutable (`RouteError`): the caller starts route
+    ///   discovery or reports the failure. Knowing a device's address pair
+    ///   (address map) is never evidence that it is one hop away, and
+    ///   stochastic addressing has no tree to fall back on.
+    #[inline(never)]
     pub(crate) fn resolve_next_hop(
         &self,
         destination: ShortAddress,
     ) -> Result<ShortAddress, NwkStatus> {
-        // Broadcast: send to parent (end device) or all neighbors (router)
         if is_nwk_broadcast(destination) {
             if self.device_type == DeviceType::EndDevice {
                 return Ok(self.nib.parent_address);
             }
-            // Routers broadcast via MAC broadcast
             return Ok(ShortAddress::BROADCAST);
         }
-
         // Reserved (0xFFF8..=0xFFFA) or unassigned (0xFFFE): neither a device
         // nor a broadcast group. Refuse explicitly instead of flooding an
         // undefined address as a MAC broadcast.
         if !is_unicast_address(destination) {
             return Err(NwkStatus::InvalidParameter);
         }
-
-        // Direct neighbor?
+        if !cfg!(feature = "router") || self.device_type == DeviceType::EndDevice {
+            let parent = self.nib.parent_address;
+            return if is_unicast_address(parent) {
+                Ok(parent)
+            } else {
+                Err(NwkStatus::RouteError)
+            };
+        }
         if self.neighbors.find_by_short(destination).is_some() {
             return Ok(destination);
         }
-
-        // Routing table lookup
-        if let Some(next) = self.routing.next_hop(destination) {
-            return Ok(next);
+        if let Some(next_hop) = self.routing.next_hop(destination) {
+            return Ok(next_hop);
         }
-
-        // End device fallback: always route through parent
-        if self.device_type == DeviceType::EndDevice {
-            return Ok(self.nib.parent_address);
+        // The parent we joined through was one hop away; a restored image may
+        // not have re-learned it into the neighbor table yet.
+        if destination == self.nib.parent_address {
+            return Ok(destination);
         }
-
-        // Tree routing fallback
-        if let Some(next) = self.routing.tree_route(
-            self.nib.network_address,
-            destination,
-            self.nib.depth,
-            self.nib.max_routers,
-            self.nib.max_depth,
-        ) {
-            return Ok(next);
-        }
-
-        // Route to parent as last resort
-        if self.nib.parent_address.0 != 0xFFFF {
-            Ok(self.nib.parent_address)
-        } else {
-            Err(NwkStatus::RouteError)
-        }
+        Err(NwkStatus::RouteError)
     }
 
     // ── NWK Command Dispatch ─────────────────────────────────
@@ -6627,6 +6652,171 @@ mod tests {
         assert!(
             !nwk.indirect_queue().has_pending(FAR),
             "an announced neighbour must not be parked in the indirect queue"
+        );
+    }
+
+    // ── Address map versus neighbor table (R22 §3.6.1.5) ─────
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_announced_device_lands_in_the_address_map_not_the_neighbor_table() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        let ieee = [9u8; 8];
+
+        nwk.note_announced_address(FAR, ieee);
+
+        assert!(
+            nwk.neighbor_table().find_by_short(FAR).is_none(),
+            "an announcing device may be any number of hops away"
+        );
+        assert_eq!(nwk.address_map().ieee_of(FAR), Some(ieee));
+        assert_eq!(nwk.find_short_by_ieee(&ieee), Some(FAR));
+        assert_eq!(nwk.find_ieee_by_short(FAR), Some(ieee));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relayed_source_ieee_never_makes_the_originator_a_neighbour() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.nib.ieee_address = [0x11; 8];
+        let mut header = frame(NwkFrameType::Data, FAR, OUR_ADDR);
+        header.frame_control.src_ieee_present = true;
+        header.src_ieee = Some([0x22; 8]);
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &[0x01], &mut buf);
+
+        // The frame was relayed to us by PEER: FAR is not one hop away.
+        assert!(
+            block_on(nwk.process_incoming_nwk_frame_from(&buf[..len], 42, Some(PEER))).is_some()
+        );
+
+        assert!(nwk.neighbor_table().find_by_short(FAR).is_none());
+        assert_eq!(nwk.find_ieee_by_short(FAR), Some([0x22; 8]));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_known_but_multi_hop_destination_is_discovered_not_sent_direct() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.nib.parent_address = ShortAddress(0xFFFF);
+        nwk.note_announced_address(FAR, [9u8; 8]);
+
+        let result = block_on(nwk.nlde_data_request(FAR, 30, &[0x01], false, true));
+
+        assert_eq!(result.err(), Some(NwkStatus::RouteDiscoveryFailed));
+        assert!(nwk.routing.has_active_discovery(FAR));
+        let history = nwk.mac.tx_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            tx_short_dst(&history[0]),
+            Some(ShortAddress::BROADCAST),
+            "only the route request goes out; nothing is unicast to FAR"
+        );
+        assert_eq!(tx_frame(&history[0]).1, NwkCommandId::RouteRequest as u8);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_router_reaches_its_parent_before_relearning_it_as_a_neighbour() {
+        // A restored router may not have its parent in the neighbor table yet;
+        // the parent it joined through is still one hop away.
+        let nwk = node(DeviceType::Router, OUR_ADDR);
+        assert!(
+            nwk.neighbor_table()
+                .find_by_short(ShortAddress(0x0000))
+                .is_none()
+        );
+        assert_eq!(
+            nwk.resolve_next_hop(ShortAddress(0x0000)),
+            Ok(ShortAddress(0x0000))
+        );
+        assert_eq!(nwk.resolve_next_hop(FAR), Err(NwkStatus::RouteError));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_router_relaying_to_an_unroutable_destination_discovers_or_reports() {
+        // discover_route set: the relay starts discovery itself.
+        let mut relay = node(DeviceType::Router, OUR_ADDR);
+        let mut header = frame(NwkFrameType::Data, PEER, FAR);
+        header.frame_control.discover_route = 1;
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &[0x01], &mut buf);
+        assert!(block_on(relay.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+        assert!(relay.routing.has_active_discovery(FAR));
+        assert!(relay.pending_route_errors.is_empty());
+
+        // discover_route clear: the originator learns there is no route.
+        let mut relay = node(DeviceType::Router, OUR_ADDR);
+        let len = encode(&frame(NwkFrameType::Data, PEER, FAR), &[0x01], &mut buf);
+        assert!(block_on(relay.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+        assert!(!relay.routing.has_active_discovery(FAR));
+        assert!(
+            relay
+                .mac
+                .tx_history()
+                .iter()
+                .all(|record| tx_short_dst(record) != Some(ShortAddress(0x0000))),
+            "an unroutable relay never falls back to the parent"
+        );
+        assert_eq!(relay.pending_route_errors.len(), 1);
+        assert_eq!(relay.pending_route_errors[0].destination, PEER);
+        assert_eq!(relay.pending_route_errors[0].failed_destination, FAR);
+        assert_eq!(
+            relay.pending_route_errors[0].status_code,
+            crate::frames::NetworkStatusCommand::NO_ROUTE_AVAILABLE
+        );
+    }
+
+    #[test]
+    fn an_unauthenticated_announce_is_ignored_on_a_secured_network() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.nib.security_enabled = true;
+
+        nwk.note_announced_address(FAR, [9u8; 8]);
+
+        assert_eq!(nwk.find_ieee_by_short(FAR), None);
+        assert!(nwk.take_command_outcome().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_announce_never_rewrites_a_child_mapping() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.nib.permit_joining = true;
+        let child_ieee = [7u8; 8];
+        let child = nwk
+            .handle_child_association(child_ieee, 0x80)
+            .expect("the child associates");
+
+        nwk.note_announced_address(FAR, child_ieee);
+
+        let entry = nwk
+            .neighbor_table()
+            .find_by_ieee(&child_ieee)
+            .expect("the child stays in the neighbor table");
+        assert_eq!(
+            entry.network_address, child,
+            "only join/rejoin/conflict processing may move a child"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn an_end_device_announce_never_rewrites_the_parent_mapping() {
+        let mut nwk = node(DeviceType::EndDevice, OUR_ADDR);
+        let parent_ieee = [0xAA; 8];
+        let mut parent =
+            crate::neighbor::NeighborEntry::new_from_annce(ShortAddress(0x0000), parent_ieee);
+        parent.relationship = crate::neighbor::Relationship::Parent;
+        parent.active = true;
+        nwk.neighbors.add_or_update(parent).unwrap();
+
+        nwk.note_announced_address(FAR, parent_ieee);
+
+        assert_eq!(
+            nwk.find_short_by_ieee(&parent_ieee),
+            Some(ShortAddress(0x0000))
         );
     }
 

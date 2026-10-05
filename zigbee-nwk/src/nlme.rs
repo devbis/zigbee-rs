@@ -1481,6 +1481,7 @@ impl<M: MacDriver> NwkLayer<M> {
     fn finish_leave(&mut self, rejoin: bool) {
         self.joined = false;
         self.neighbors = crate::neighbor::NeighborTable::new();
+        self.address_map.clear();
         self.routing = crate::routing::RoutingTable::new();
         // Conflict work belongs to the network being left: an address-conflict
         // announcement names an address this device no longer holds, and a
@@ -1727,6 +1728,7 @@ impl<M: MacDriver> NwkLayer<M> {
         if !warm_start {
             self.nib = Nib::new();
             self.neighbors = crate::neighbor::NeighborTable::new();
+            self.address_map.clear();
             self.routing = crate::routing::RoutingTable::new();
             self.security = crate::security::NwkSecurity::new();
             self.joined = false;
