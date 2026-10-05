@@ -173,6 +173,11 @@ Independent diagnostics remain under `tools/telink-tlsr8258-lab`:
 ./scripts/tlsr8258.sh build diag-retention
 ```
 
+The lab images and the standalone `examples/telink-tlsr8258-radio` harness
+link against the same `0x70000` application boundary as the product and fail
+their post-link checks at it, so flashing a diagnostic cannot overwrite the
+journals or factory data listed above.
+
 ## Validation
 
 The recorded sensor images passed build/layout checks. The refreshed router
