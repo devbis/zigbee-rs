@@ -91,6 +91,31 @@ impl OnOffCluster {
         let _ = self.store.set_raw(ATTR_ON_OFF, ZclValue::Bool(on));
     }
 
+    fn u16_attr(&self, id: AttributeId) -> u16 {
+        match self.store.get(id) {
+            Some(ZclValue::U16(v)) => *v,
+            _ => 0,
+        }
+    }
+
+    /// Off semantics (ZCL r8 §3.8.2.3.1): OnOff = FALSE and OnTime = 0.
+    fn turn_off(&mut self) {
+        self.set_on_off(false);
+        let _ = self.store.set_raw(ATTR_ON_TIME, ZclValue::U16(0));
+    }
+
+    /// On semantics (ZCL r8 §3.8.2.3.2): OnOff = TRUE, GlobalSceneControl =
+    /// TRUE, and OffWaitTime is cleared when OnTime is 0.
+    fn turn_on(&mut self) {
+        self.set_on_off(true);
+        let _ = self
+            .store
+            .set_raw(ATTR_GLOBAL_SCENE_CONTROL, ZclValue::Bool(true));
+        if self.u16_attr(ATTR_ON_TIME) == 0 {
+            let _ = self.store.set_raw(ATTR_OFF_WAIT_TIME, ZclValue::U16(0));
+        }
+    }
+
     /// Tick the On/Off cluster timers (call every 100ms = 1/10th second).
     ///
     /// OnTime and OffWaitTime are in 1/10th seconds per ZCL spec.
@@ -154,6 +179,28 @@ impl OnOffCluster {
     }
 }
 
+/// Attribute writes go through the cluster so StartUpOnOff is restricted to
+/// its defined values (0x00 Off, 0x01 On, 0x02 Toggle, 0xFF Previous).
+impl AttributeStoreMutAccess for OnOffCluster {
+    fn set(&mut self, id: AttributeId, value: ZclValue) -> Result<(), ZclStatus> {
+        AttributeStoreMutAccess::validate_set(self, id, &value)?;
+        self.store.set(id, value)
+    }
+    fn set_raw(&mut self, id: AttributeId, value: ZclValue) -> Result<(), ZclStatus> {
+        self.store.set_raw(id, value)
+    }
+    fn find(&self, id: AttributeId) -> Option<&AttributeDefinition> {
+        self.store.find(id)
+    }
+    fn validate_set(&self, id: AttributeId, value: &ZclValue) -> Result<(), ZclStatus> {
+        self.store.validate_set(id, value)?;
+        match (id, value) {
+            (ATTR_START_UP_ON_OFF, ZclValue::Enum8(0x03..=0xFE)) => Err(ZclStatus::InvalidValue),
+            _ => Ok(()),
+        }
+    }
+}
+
 impl Cluster for OnOffCluster {
     fn cluster_id(&self) -> ClusterId {
         ClusterId::ON_OFF
@@ -166,16 +213,19 @@ impl Cluster for OnOffCluster {
     ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
         match cmd_id {
             CMD_OFF => {
-                self.set_on_off(false);
+                self.turn_off();
                 Ok(heapless::Vec::new())
             }
             CMD_ON => {
-                self.set_on_off(true);
+                self.turn_on();
                 Ok(heapless::Vec::new())
             }
             CMD_TOGGLE => {
-                let new_state = !self.is_on();
-                self.set_on_off(new_state);
+                if self.is_on() {
+                    self.turn_off();
+                } else {
+                    self.turn_on();
+                }
                 Ok(heapless::Vec::new())
             }
             CMD_OFF_WITH_EFFECT => {
@@ -183,17 +233,19 @@ impl Cluster for OnOffCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 // Effect ID (u8) + Effect Variant (u8) — we just turn off.
-                self.set_on_off(false);
-                let _ = self
-                    .store
-                    .set_raw(ATTR_GLOBAL_SCENE_CONTROL, ZclValue::Bool(false));
+                self.store
+                    .set_raw(ATTR_GLOBAL_SCENE_CONTROL, ZclValue::Bool(false))?;
+                self.turn_off();
                 Ok(heapless::Vec::new())
             }
             CMD_ON_WITH_RECALL_GLOBAL_SCENE => {
-                self.set_on_off(true);
-                let _ = self
-                    .store
-                    .set_raw(ATTR_GLOBAL_SCENE_CONTROL, ZclValue::Bool(true));
+                // §3.8.2.3.5: discarded while GlobalSceneControl is TRUE.
+                if !matches!(
+                    self.store.get(ATTR_GLOBAL_SCENE_CONTROL),
+                    Some(ZclValue::Bool(true))
+                ) {
+                    self.turn_on();
+                }
                 Ok(heapless::Vec::new())
             }
             CMD_ON_WITH_TIMED_OFF => {
@@ -203,15 +255,23 @@ impl Cluster for OnOffCluster {
                 let on_off_control = payload[0];
                 let on_time = u16::from_le_bytes([payload[1], payload[2]]);
                 let off_wait = u16::from_le_bytes([payload[3], payload[4]]);
-                // Bit 0 of OnOffControl: "Accept Only When On"
+                // §3.8.2.3.6. Bit 0 of OnOffControl: "Accept Only When On".
                 if on_off_control & 0x01 != 0 && !self.is_on() {
                     return Ok(heapless::Vec::new());
                 }
-                self.set_on_off(true);
-                let _ = self.store.set_raw(ATTR_ON_TIME, ZclValue::U16(on_time));
-                let _ = self
-                    .store
-                    .set_raw(ATTR_OFF_WAIT_TIME, ZclValue::U16(off_wait));
+                let cur_wait = self.u16_attr(ATTR_OFF_WAIT_TIME);
+                if !self.is_on() && cur_wait > 0 {
+                    // Delayed-off guard: only shorten the remaining wait.
+                    self.store
+                        .set_raw(ATTR_OFF_WAIT_TIME, ZclValue::U16(cur_wait.min(off_wait)))?;
+                } else {
+                    let cur_on = self.u16_attr(ATTR_ON_TIME);
+                    self.turn_on();
+                    self.store
+                        .set_raw(ATTR_ON_TIME, ZclValue::U16(cur_on.max(on_time)))?;
+                    self.store
+                        .set_raw(ATTR_OFF_WAIT_TIME, ZclValue::U16(off_wait))?;
+                }
                 Ok(heapless::Vec::new())
             }
             _ => Err(ZclStatus::UnsupClusterCommand),
@@ -223,7 +283,7 @@ impl Cluster for OnOffCluster {
     }
 
     fn attributes_mut(&mut self) -> &mut dyn AttributeStoreMutAccess {
-        &mut self.store
+        self
     }
 
     fn received_commands(&self) -> heapless::Vec<u8, 32> {
@@ -255,13 +315,19 @@ mod tests {
     fn reset_restores_nonzero_defaults_and_clears_timers() {
         let mut cluster = OnOffCluster::new();
         cluster.handle_command(CMD_ON, &[]).unwrap();
-        cluster
-            .handle_command(CMD_OFF_WITH_EFFECT, &[0x00, 0x00])
-            .unwrap();
+        // On With Timed Off sets GlobalSceneControl (OnOff becomes TRUE);
+        // Off With Effect then clears it while OffWaitTime keeps running.
         cluster
             .handle_command(CMD_ON_WITH_TIMED_OFF, &[0x00, 0x0A, 0x00, 0x05, 0x00])
             .unwrap();
-        assert!(cluster.is_on());
+        cluster
+            .handle_command(CMD_OFF_WITH_EFFECT, &[0x00, 0x00])
+            .unwrap();
+        assert!(!cluster.is_on());
+        assert_eq!(
+            cluster.attributes().get(ATTR_OFF_WAIT_TIME),
+            Some(&ZclValue::U16(5))
+        );
         assert_eq!(
             cluster.attributes().get(ATTR_GLOBAL_SCENE_CONTROL),
             Some(&ZclValue::Bool(false))
@@ -306,5 +372,77 @@ mod tests {
             cluster.attributes().get(ATTR_OFF_WAIT_TIME),
             Some(&ZclValue::U16(4))
         );
+    }
+
+    fn u16(c: &OnOffCluster, id: AttributeId) -> u16 {
+        c.u16_attr(id)
+    }
+
+    fn timed(c: &mut OnOffCluster, ctrl: u8, on: u16, wait: u16) {
+        let mut p = [ctrl, 0, 0, 0, 0];
+        p[1..3].copy_from_slice(&on.to_le_bytes());
+        p[3..5].copy_from_slice(&wait.to_le_bytes());
+        c.handle_command(CMD_ON_WITH_TIMED_OFF, &p).unwrap();
+    }
+
+    #[test]
+    fn off_clears_on_time_and_on_clears_off_wait_when_on_time_is_zero() {
+        let mut c = OnOffCluster::new();
+        timed(&mut c, 0, 50, 30);
+        assert_eq!(
+            (u16(&c, ATTR_ON_TIME), u16(&c, ATTR_OFF_WAIT_TIME)),
+            (50, 30)
+        );
+        c.handle_command(CMD_OFF, &[]).unwrap();
+        assert!(!c.is_on());
+        assert_eq!(u16(&c, ATTR_ON_TIME), 0);
+        assert_eq!(u16(&c, ATTR_OFF_WAIT_TIME), 30);
+        c.handle_command(CMD_ON, &[]).unwrap();
+        assert_eq!(u16(&c, ATTR_OFF_WAIT_TIME), 0);
+        // Toggle to off also clears OnTime.
+        timed(&mut c, 0, 50, 30);
+        c.handle_command(CMD_TOGGLE, &[]).unwrap();
+        assert_eq!(u16(&c, ATTR_ON_TIME), 0);
+    }
+
+    #[test]
+    fn on_with_timed_off_follows_the_spec_rules() {
+        let mut c = OnOffCluster::new();
+        // Accept-only-when-on while off: discarded.
+        timed(&mut c, 1, 50, 30);
+        assert!(!c.is_on());
+        assert_eq!(u16(&c, ATTR_ON_TIME), 0);
+        // OnTime = max(current, new).
+        timed(&mut c, 0, 50, 30);
+        timed(&mut c, 0, 20, 10);
+        assert!(c.is_on());
+        assert_eq!(
+            (u16(&c, ATTR_ON_TIME), u16(&c, ATTR_OFF_WAIT_TIME)),
+            (50, 10)
+        );
+        // Off with OffWaitTime > 0: only shorten the wait, stay off.
+        c.handle_command(CMD_OFF, &[]).unwrap();
+        timed(&mut c, 0, 70, 40);
+        assert!(!c.is_on());
+        assert_eq!(u16(&c, ATTR_OFF_WAIT_TIME), 10);
+        timed(&mut c, 0, 70, 5);
+        assert_eq!(u16(&c, ATTR_OFF_WAIT_TIME), 5);
+    }
+
+    #[test]
+    fn start_up_on_off_rejects_reserved_values() {
+        let mut c = OnOffCluster::new();
+        for v in [0x00, 0x01, 0x02, 0xFF] {
+            c.attributes_mut()
+                .set(ATTR_START_UP_ON_OFF, ZclValue::Enum8(v))
+                .unwrap();
+        }
+        for v in [0x03, 0x80, 0xFE] {
+            assert_eq!(
+                c.attributes_mut()
+                    .set(ATTR_START_UP_ON_OFF, ZclValue::Enum8(v)),
+                Err(ZclStatus::InvalidValue)
+            );
+        }
     }
 }
