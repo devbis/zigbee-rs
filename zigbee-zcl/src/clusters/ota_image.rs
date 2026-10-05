@@ -14,7 +14,7 @@ pub const OTA_HEADER_MIN_SIZE: usize = 56;
 pub struct OtaHeaderFieldControl {
     /// Security credential version present.
     pub security_credential: bool,
-    /// Device-specific file (hardware version range present).
+    /// Device-specific file (8-byte Upgrade File Destination present).
     pub device_specific: bool,
     /// Hardware version range present.
     pub hardware_versions: bool,
@@ -70,6 +70,8 @@ pub struct OtaImageHeader {
     // Optional fields
     /// Security credential version (if field_control bit 0 set).
     pub security_credential_version: Option<u8>,
+    /// Upgrade File Destination IEEE address (if field_control bit 1 set).
+    pub upgrade_file_destination: Option<u64>,
     /// Minimum hardware version (if field_control bit 2 set).
     pub min_hardware_version: Option<u16>,
     /// Maximum hardware version (if field_control bit 2 set).
@@ -175,6 +177,20 @@ impl OtaImageHeader {
             None
         };
 
+        // Table 11-2: the optional fields follow in field-control bit order —
+        // credential version (bit 0), destination (bit 1), HW versions (bit 2).
+        let upgrade_file_destination = if field_control.device_specific {
+            let b = data
+                .get(offset..offset + 8)
+                .ok_or(OtaImageError::TooShort)?;
+            offset += 8;
+            let mut ieee = [0u8; 8];
+            ieee.copy_from_slice(b);
+            Some(u64::from_le_bytes(ieee))
+        } else {
+            None
+        };
+
         let (min_hardware_version, max_hardware_version) = if field_control.hardware_versions {
             if data.len() < offset + 4 {
                 return Err(OtaImageError::TooShort);
@@ -204,6 +220,7 @@ impl OtaImageHeader {
                 header_string,
                 total_image_size,
                 security_credential_version,
+                upgrade_file_destination,
                 min_hardware_version,
                 max_hardware_version,
             },
