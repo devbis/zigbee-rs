@@ -28,33 +28,9 @@ use zigbee_zcl::foundation::reporting::{
 };
 
 /// Exact ZCL wire length of `value` (as written by [`ZclValue::serialize`]).
-///
-/// The match is exhaustive on purpose: a new value variant fails to compile
-/// here instead of silently being sized wrong.
+#[inline]
 pub(crate) fn zcl_value_wire_len(value: &ZclValue) -> usize {
-    match value {
-        ZclValue::NoData => 0,
-        ZclValue::Bool(_)
-        | ZclValue::Bitmap8(_)
-        | ZclValue::U8(_)
-        | ZclValue::I8(_)
-        | ZclValue::Enum8(_) => 1,
-        ZclValue::Bitmap16(_) | ZclValue::U16(_) | ZclValue::I16(_) | ZclValue::Enum16(_) => 2,
-        ZclValue::U24(_) => 3,
-        ZclValue::Bitmap32(_)
-        | ZclValue::U32(_)
-        | ZclValue::I32(_)
-        | ZclValue::Float32(_)
-        | ZclValue::UtcTime(_) => 4,
-        ZclValue::U48(_) => 6,
-        ZclValue::Bitmap64(_)
-        | ZclValue::U64(_)
-        | ZclValue::I64(_)
-        | ZclValue::Float64(_)
-        | ZclValue::IeeeAddr(_) => 8,
-        ZclValue::OctetString(v) | ZclValue::CharString(v) => 1 + v.len(),
-        ZclValue::SecurityKey128(_) => 16,
-    }
+    value.wire_len()
 }
 
 /// Write `value` into `buf[pos..]` only when it fits; returns the new position.
