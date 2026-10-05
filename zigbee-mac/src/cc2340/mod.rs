@@ -23,6 +23,25 @@
 //! Raw TX/RX is implemented but still requires validation on CC2340R5
 //! hardware. CCA, hardware filtering/auto-ACK, IRQ completion, dynamic
 //! temperature compensation, and production power management remain pending.
+//!
+//! # Software acknowledgement
+//!
+//! The PBE runs with auto-ACK disabled, so the MAC does both halves of the
+//! IEEE 802.15.4 acknowledgement exchange in software:
+//!
+//! * **Outgoing:** an ACK-requested frame is followed by an RX window of
+//!   [`ACK_WAIT_US`]; only an ACK with the frame's sequence number counts as
+//!   delivery. Missing ACKs are retried up to `macMaxFrameRetries` and then
+//!   reported as [`MacError::NoAck`].
+//! * **Incoming:** a data/command frame with the AR bit set is acknowledged
+//!   only when its destination is exactly this node
+//!   ([`crate::frames::software_ack_sequence`]); broadcasts and frames for
+//!   other nodes are never acknowledged.
+//!
+//! Frames that arrive while the MAC is waiting for an ACK or a poll response
+//! are queued (bounded, [`PENDING_RX_DEPTH`]) for `MCPS-DATA.indication`
+//! instead of being dropped. Whether the software TX→RX and RX→TX turnaround
+//! meets the parent's `macAckWaitDuration` must still be proven on hardware.
 
 mod config;
 pub mod driver;
@@ -37,8 +56,29 @@ use driver::Cc2340Driver;
 pub use driver::{RadioConfig, RadioError};
 use zigbee_types::*;
 
+use crate::frames::{self, BackoffRng};
 use embassy_futures::select;
-use embassy_time::{Instant, Timer};
+use embassy_time::{Duration, Instant, Timer};
+
+/// macAckWaitDuration (54 symbols = 864 µs) plus margin for the software
+/// TX→RX re-arm of the PBE, which is not hardware-timed on this backend.
+pub const ACK_WAIT_US: u64 = 2_000;
+
+/// How long to listen for the parent's indirect frame after an ACK with the
+/// frame-pending bit (macMaxFrameTotalWaitTime ≈ 20 ms at default PIB, plus
+/// parent software latency).
+pub const POLL_DATA_WAIT_MS: u64 = 100;
+
+/// Frames received while waiting for an ACK/poll response, retained for
+/// `MCPS-DATA.indication`.
+pub const PENDING_RX_DEPTH: usize = 4;
+
+/// A data frame received out of band, kept until indication consumes it.
+struct PendingRx {
+    data: [u8; 127],
+    len: u8,
+    lqi: u8,
+}
 
 /// Invalid factory or configured IEEE identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +111,7 @@ pub struct Cc2340Mac {
     channel: u8,
     extended_address: IeeeAddress,
     coord_short_address: ShortAddress,
+    coord_extended_address: IeeeAddress,
     rx_on_when_idle: bool,
     association_permit: bool,
     auto_request: bool,
@@ -83,6 +124,12 @@ pub struct Cc2340Mac {
     max_frame_retries: u8,
     promiscuous: bool,
     tx_power: i8,
+    /// Data frames received during ACK/poll waits, oldest first.
+    pending_rx: heapless::Deque<PendingRx, PENDING_RX_DEPTH>,
+    /// CSMA backoff generator: per-device seed from the EUI-64, stirred with
+    /// timer and RSSI jitter before every draw. Not used for key material —
+    /// `fill_random` stays fail-closed until a TRNG path is validated.
+    backoff_rng: BackoffRng,
 }
 
 impl Cc2340Mac {
@@ -106,6 +153,7 @@ impl Cc2340Mac {
             channel: 11,
             extended_address,
             coord_short_address: ShortAddress(0x0000),
+            coord_extended_address: [0; 8],
             rx_on_when_idle: false,
             association_permit: false,
             auto_request: true,
@@ -118,6 +166,8 @@ impl Cc2340Mac {
             max_frame_retries: 3,
             promiscuous: false,
             tx_power: 5,
+            pending_rx: heapless::Deque::new(),
+            backoff_rng: BackoffRng::new(&extended_address, 0),
         })
     }
 
@@ -333,6 +383,193 @@ impl Cc2340Mac {
     }
 
     /// Synchronize the driver's radio config with our PIB state.
+    /// Wait a random unslotted CSMA-CA backoff of `0..2^be` unit periods.
+    async fn csma_backoff(&mut self, be: u8) {
+        let jitter =
+            (Instant::now().as_ticks() as u32) ^ ((self.driver.read_rssi() as u8 as u32) << 24);
+        self.backoff_rng.mix(jitter);
+        let slots = frames::csma_backoff_slots(self.backoff_rng.next_u32(), be);
+        if slots > 0 {
+            Timer::after_micros(u64::from(slots) * frames::UNIT_BACKOFF_PERIOD_US).await;
+        }
+    }
+
+    /// Transmit `frame` with unslotted CSMA-CA using the PIB backoff policy.
+    ///
+    /// The CC2340 backend has no CCA, so a refused/failed transmission is the
+    /// only "busy" signal; it consumes one CSMA attempt.
+    async fn transmit_csma(&mut self, frame: &[u8]) -> Result<(), MacError> {
+        let mut be = self.min_be;
+        let mut nb: u8 = 0;
+        loop {
+            self.csma_backoff(be).await;
+            match self.driver.transmit(frame).await {
+                Ok(()) => return Ok(()),
+                Err(RadioError::InvalidFrame) => return Err(MacError::FrameTooLong),
+                Err(RadioError::RadioConfigUnavailable | RadioError::FirmwareUnavailable) => {
+                    return Err(MacError::RadioError);
+                }
+                Err(_) => {
+                    nb += 1;
+                    be = core::cmp::min(be + 1, self.max_be);
+                    if nb > self.max_csma_backoffs {
+                        return Err(MacError::ChannelAccessFailure);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Acknowledge `data` in software if it is an AR frame addressed exactly to
+    /// this node. ACKs are sent without CCA, as IEEE 802.15.4 requires.
+    async fn acknowledge_if_required(&mut self, data: &[u8]) {
+        if let Some(sequence) = frames::software_ack_sequence(
+            data,
+            self.pan_id,
+            self.short_address,
+            &self.extended_address,
+        ) && let Err(error) = self
+            .driver
+            .transmit(&frames::build_ack(sequence, false))
+            .await
+        {
+            log::warn!("[CC2340] software ACK for seq {sequence} failed: {error:?}");
+        }
+    }
+
+    /// Retain a data frame that arrived outside `MCPS-DATA.indication`.
+    fn retain_frame(&mut self, data: &[u8], lqi: u8) {
+        if data.len() < 3 || data[0] & 0x07 != 0x01 || data.len() > 127 {
+            return;
+        }
+        if self.pending_rx.is_full() {
+            log::warn!("[CC2340] pending RX queue full, dropping oldest frame");
+            let _ = self.pending_rx.pop_front();
+        }
+        let mut entry = PendingRx {
+            data: [0; 127],
+            len: data.len() as u8,
+            lqi,
+        };
+        entry.data[..data.len()].copy_from_slice(data);
+        let _ = self.pending_rx.push_back(entry);
+    }
+
+    /// Handle a frame received while waiting for something else: ACK it if
+    /// required and keep it for indication.
+    async fn handle_out_of_band(&mut self, data: &[u8], lqi: u8) {
+        self.acknowledge_if_required(data).await;
+        self.retain_frame(data, lqi);
+    }
+
+    /// Listen for the ACK of `sequence` for [`ACK_WAIT_US`].
+    ///
+    /// Returns `Some(frame_pending)` for a matching ACK and `None` when the
+    /// window closes without one. Other frames are queued, not dropped.
+    async fn wait_for_ack(&mut self, sequence: u8) -> Result<Option<bool>, MacError> {
+        let deadline = Instant::now() + Duration::from_micros(ACK_WAIT_US);
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            match select::select(self.driver.receive(), Timer::after(deadline - now)).await {
+                select::Either::Second(()) => return Ok(None),
+                select::Either::First(Err(
+                    RadioError::RadioConfigUnavailable | RadioError::FirmwareUnavailable,
+                )) => return Err(MacError::RadioError),
+                select::Either::First(Err(_)) => {}
+                select::Either::First(Ok(rx)) => {
+                    let data = &rx.data[..rx.len];
+                    match frames::ack_info(data) {
+                        Some((seq, pending)) if seq == sequence => return Ok(Some(pending)),
+                        Some(_) => {} // someone else's ACK
+                        None => self.handle_out_of_band(data, rx.lqi).await,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Transmit an ACK-requested frame and retry until its ACK arrives.
+    ///
+    /// Returns the ACK's frame-pending bit, or [`MacError::NoAck`] after
+    /// `macMaxFrameRetries` retransmissions.
+    async fn transmit_acknowledged(&mut self, frame: &[u8]) -> Result<bool, MacError> {
+        let sequence = frame[2];
+        for attempt in 0..=self.max_frame_retries {
+            self.transmit_csma(frame).await?;
+            if let Some(pending) = self.wait_for_ack(sequence).await? {
+                return Ok(pending);
+            }
+            log::debug!("[CC2340] no ACK for seq {sequence} (attempt {attempt})");
+        }
+        Err(MacError::NoAck)
+    }
+
+    /// Whether `data` is the parent's indirect frame answering our poll: a
+    /// data frame addressed exactly to us whose source is the coordinator.
+    fn is_poll_response(&self, data: &[u8]) -> bool {
+        if data.len() < 3 || data[0] & 0x07 != 0x01 {
+            return false;
+        }
+        let fc = u16::from_le_bytes([data[0], data[1]]);
+        let (Some(dst), Some(src)) = (parse_dest_address(data, fc), parse_source_address(data, fc))
+        else {
+            return false;
+        };
+        if !frames::is_exact_destination(
+            &dst,
+            self.pan_id,
+            self.short_address,
+            &self.extended_address,
+        ) {
+            return false;
+        }
+        match src {
+            MacAddress::Short(pan, addr) => {
+                pan == self.pan_id && addr.0 < 0xFFF8 && addr == self.coord_short_address
+            }
+            MacAddress::Extended(_, addr) => {
+                self.coord_extended_address != [0; 8] && addr == self.coord_extended_address
+            }
+        }
+    }
+
+    /// Third-level filter and decode for `MCPS-DATA.indication`.
+    fn indication_from(&self, data: &[u8], lqi: u8) -> Option<McpsDataIndication> {
+        if data.len() < 5 {
+            return None;
+        }
+        let fc = u16::from_le_bytes([data[0], data[1]]);
+        if fc & 0x07 != 1 {
+            return None;
+        }
+        let header_len = 3 + addressing_size(fc);
+        if data.len() <= header_len {
+            return None;
+        }
+        let src = parse_source_address(data, fc)?;
+        let dst = parse_dest_address(data, fc)?;
+        if !self.promiscuous
+            && !frames::frame_is_for_us(
+                &dst,
+                self.pan_id,
+                self.short_address,
+                &self.extended_address,
+            )
+        {
+            return None;
+        }
+        Some(McpsDataIndication {
+            src_address: src,
+            dst_address: dst,
+            lqi,
+            payload: MacFrame::from_slice(&data[header_len..])?,
+            security_use: (fc >> 3) & 1 != 0,
+        })
+    }
+
     fn sync_radio_config(&mut self) {
         self.driver.update_config(|cfg| {
             cfg.channel = self.channel;
@@ -585,6 +822,10 @@ impl MacDriver for Cc2340Mac {
                         if data.len() < 5 {
                             continue;
                         }
+                        // The indirect Association Response is AR-unicast to
+                        // our EUI-64; without our ACK the parent retries it
+                        // and may expire the allocation.
+                        self.acknowledge_if_required(data).await;
                         let fc = u16::from_le_bytes([data[0], data[1]]);
                         if fc & 0x07 != 3 {
                             continue;
@@ -634,6 +875,8 @@ impl MacDriver for Cc2340Mac {
         self.short_address = ShortAddress(0xFFFF);
         self.pan_id = PanId(0xFFFF);
         self.coord_short_address = ShortAddress(0x0000);
+        self.coord_extended_address = [0; 8];
+        self.pending_rx.clear();
         self.sync_radio_config();
         log::info!("[CC2340] Disassociated");
         Ok(())
@@ -646,6 +889,7 @@ impl MacDriver for Cc2340Mac {
             self.pan_id = PanId(0xFFFF);
             self.channel = 11;
             self.coord_short_address = ShortAddress(0x0000);
+            self.coord_extended_address = [0; 8];
             self.rx_on_when_idle = false;
             self.association_permit = false;
             self.auto_request = true;
@@ -659,6 +903,7 @@ impl MacDriver for Cc2340Mac {
             self.promiscuous = false;
             self.tx_power = 5;
         }
+        self.pending_rx.clear();
         self.sync_radio_config();
         Ok(())
     }
@@ -692,6 +937,8 @@ impl MacDriver for Cc2340Mac {
             PhyChannelsSupported => Ok(PibValue::U32(zigbee_types::ChannelMask::ALL_2_4GHZ.0)),
             PhyCurrentPage => Ok(PibValue::U8(0)),
             MacBeaconPayload => Ok(PibValue::Payload(self.beacon_payload.clone())),
+            MacCoordShortAddress => Ok(PibValue::ShortAddress(self.coord_short_address)),
+            MacCoordExtendedAddress => Ok(PibValue::ExtendedAddress(self.coord_extended_address)),
             _ => Err(MacError::Unsupported),
         }
     }
@@ -740,6 +987,9 @@ impl MacDriver for Cc2340Mac {
             (MacCoordShortAddress, PibValue::ShortAddress(v)) => {
                 self.coord_short_address = v;
             }
+            (MacCoordExtendedAddress, PibValue::ExtendedAddress(v)) => {
+                self.coord_extended_address = v;
+            }
             _ => return Err(MacError::Unsupported),
         }
 
@@ -748,36 +998,50 @@ impl MacDriver for Cc2340Mac {
 
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError> {
         let parent = MacAddress::Short(self.pan_id, self.coord_short_address);
-        let data_req = build_data_request(self.next_dsn(), &parent, &self.extended_address);
+        let seq = self.next_dsn();
+        // IEEE 802.15.4 §6.3.4: use the short source address once assigned.
+        let data_req = if self.short_address.0 < 0xFFFE {
+            frames::build_data_request_short(seq, &parent, self.short_address)
+        } else {
+            frames::build_data_request(seq, &parent, &self.extended_address)
+        };
 
-        self.driver
-            .transmit(&data_req)
-            .await
-            .map_err(|_| MacError::RadioError)?;
+        // Data Request is ACK-requested; the ACK's frame-pending bit says
+        // whether the parent holds indirect traffic for us.
+        if !self.transmit_acknowledged(&data_req).await? {
+            return Ok(None);
+        }
 
-        let result = select::select(Timer::after_millis(500), self.driver.receive()).await;
-
-        match result {
-            select::Either::Second(Ok(received)) => {
-                if received.len < 5 {
-                    return Ok(None);
-                }
-                let data = &received.data[..received.len];
-                let fc = u16::from_le_bytes([data[0], data[1]]);
-                let frame_type = fc & 0x07;
-
-                if frame_type != 1 {
-                    return Ok(None);
-                }
-
-                let header_len = 3 + addressing_size(fc);
-                if data.len() <= header_len {
-                    return Ok(None);
-                }
-
-                Ok(MacFrame::from_slice(&data[header_len..]))
+        let deadline = Instant::now() + Duration::from_millis(POLL_DATA_WAIT_MS);
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                log::debug!("[CC2340 POLL] frame pending but no data from parent");
+                return Ok(None);
             }
-            _ => Ok(None),
+            match select::select(self.driver.receive(), Timer::after(deadline - now)).await {
+                select::Either::Second(()) => return Ok(None),
+                select::Either::First(Err(
+                    RadioError::RadioConfigUnavailable | RadioError::FirmwareUnavailable,
+                )) => return Err(MacError::RadioError),
+                select::Either::First(Err(_)) => {}
+                select::Either::First(Ok(rx)) => {
+                    let data = &rx.data[..rx.len];
+                    if frames::ack_info(data).is_some() {
+                        continue;
+                    }
+                    self.acknowledge_if_required(data).await;
+                    if self.is_poll_response(data) {
+                        let fc = u16::from_le_bytes([data[0], data[1]]);
+                        let header_len = 3 + addressing_size(fc);
+                        return Ok(data
+                            .get(header_len..)
+                            .filter(|payload| !payload.is_empty())
+                            .and_then(MacFrame::from_slice));
+                    }
+                    self.retain_frame(data, rx.lqi);
+                }
+            }
         }
     }
 
@@ -790,40 +1054,10 @@ impl MacDriver for Cc2340Mac {
             req.tx_options.frame_pending,
         );
 
-        // Unslotted CSMA-CA
-        let mut be = self.min_be;
-        let mut nb: u8 = 0;
-        let symbol_period_us: u64 = 16;
-        let unit_backoff_symbols: u64 = 20;
-
-        loop {
-            let max_val = (1u32 << be) - 1;
-            let random = (self.dsn as u32)
-                .wrapping_mul(1103515245)
-                .wrapping_add(12345);
-            let backoff = (random % (max_val + 1)) as u64;
-            let delay_us = backoff * unit_backoff_symbols * symbol_period_us;
-            if delay_us > 0 {
-                Timer::after_micros(delay_us).await;
-            }
-
-            match self.driver.transmit(&frame).await {
-                Ok(_) => break,
-                Err(_) => {
-                    nb += 1;
-                    be = core::cmp::min(be + 1, self.max_be);
-                    if nb > self.max_csma_backoffs {
-                        return Err(MacError::ChannelAccessFailure);
-                    }
-                }
-            }
-        }
-
         if ack_requested {
-            for retransmit in 0..4u8 {
-                Timer::after_millis(3 + retransmit as u64 * 2).await;
-                let _ = self.driver.transmit(&frame).await;
-            }
+            self.transmit_acknowledged(&frame).await?;
+        } else {
+            self.transmit_csma(&frame).await?;
         }
 
         Ok(McpsDataConfirm {
@@ -840,11 +1074,18 @@ impl MacDriver for Cc2340Mac {
         &mut self,
         timeout_us: u32,
     ) -> Result<McpsDataIndication, MacError> {
-        let deadline =
-            embassy_time::Instant::now() + embassy_time::Duration::from_micros(timeout_us as u64);
+        while let Some(entry) = self.pending_rx.pop_front() {
+            if let Some(indication) =
+                self.indication_from(&entry.data[..entry.len as usize], entry.lqi)
+            {
+                return Ok(indication);
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_micros(timeout_us as u64);
 
         loop {
-            let now = embassy_time::Instant::now();
+            let now = Instant::now();
             if now >= deadline {
                 return Err(MacError::NoData);
             }
@@ -857,53 +1098,9 @@ impl MacDriver for Cc2340Mac {
                 select::Either::First(Err(_)) => continue,
                 select::Either::First(Ok(rx_frame)) => {
                     let data = &rx_frame.data[..rx_frame.len];
-                    if data.len() < 5 {
-                        continue;
-                    }
-                    let fc = u16::from_le_bytes([data[0], data[1]]);
-                    if fc & 0x07 != 1 {
-                        continue;
-                    }
-                    let header_len = 3 + addressing_size(fc);
-                    if data.len() <= header_len {
-                        continue;
-                    }
-
-                    let src = parse_source_address(data, fc)
-                        .unwrap_or(MacAddress::Short(PanId(0), ShortAddress(0)));
-                    let dst = parse_dest_address(data, fc)
-                        .unwrap_or(MacAddress::Short(PanId(0), ShortAddress(0)));
-
-                    // Software address filtering
-                    if !self.promiscuous {
-                        let accepted = match &dst {
-                            MacAddress::Short(pan, addr) => {
-                                (pan.0 == 0xFFFF
-                                    || pan.0 == self.pan_id.0
-                                    || self.pan_id.0 == 0xFFFF)
-                                    && (addr.0 == 0xFFFF || addr.0 == self.short_address.0)
-                            }
-                            MacAddress::Extended(pan, addr) => {
-                                (pan.0 == 0xFFFF
-                                    || pan.0 == self.pan_id.0
-                                    || self.pan_id.0 == 0xFFFF)
-                                    && *addr == self.extended_address
-                            }
-                        };
-                        if !accepted {
-                            continue;
-                        }
-                    }
-
-                    let payload_data = &data[header_len..];
-                    if let Some(mac_frame) = MacFrame::from_slice(payload_data) {
-                        return Ok(McpsDataIndication {
-                            src_address: src,
-                            dst_address: dst,
-                            lqi: rx_frame.lqi,
-                            payload: mac_frame,
-                            security_use: (fc >> 3) & 1 != 0,
-                        });
+                    self.acknowledge_if_required(data).await;
+                    if let Some(indication) = self.indication_from(data, rx_frame.lqi) {
+                        return Ok(indication);
                     }
                 }
             }
@@ -1000,5 +1197,84 @@ mod tests {
 
         let mut mac = Cc2340Mac::new(VALID_IEEE).unwrap();
         assert_eq!(mac.initialize_radio(), Err(expected));
+    }
+
+    fn associated_mac() -> Cc2340Mac {
+        let mut mac = Cc2340Mac::new(VALID_IEEE).unwrap();
+        mac.pan_id = PanId(0x1234);
+        mac.short_address = ShortAddress(0x5678);
+        mac.coord_short_address = ShortAddress(0x0000);
+        mac
+    }
+
+    /// Data frame, PAN-compressed short→short, AR set.
+    fn data_frame(seq: u8, dst: u16, src: u16, payload: &[u8]) -> heapless::Vec<u8, 127> {
+        let mut frame = heapless::Vec::new();
+        frame
+            .extend_from_slice(&[0x61, 0x88, seq, 0x34, 0x12])
+            .unwrap();
+        frame.extend_from_slice(&dst.to_le_bytes()).unwrap();
+        frame.extend_from_slice(&src.to_le_bytes()).unwrap();
+        frame.extend_from_slice(payload).unwrap();
+        frame
+    }
+
+    #[test]
+    fn poll_response_must_come_from_parent_and_name_us() {
+        let mut mac = associated_mac();
+        assert!(mac.is_poll_response(&data_frame(1, 0x5678, 0x0000, &[0xAA])));
+        // Another router's unicast to us is not the indirect frame we polled.
+        assert!(!mac.is_poll_response(&data_frame(2, 0x5678, 0x1111, &[0xAA])));
+        // The parent's broadcast is not a poll response.
+        assert!(!mac.is_poll_response(&data_frame(3, 0xFFFF, 0x0000, &[0xAA])));
+        // Parent traffic for a sibling.
+        assert!(!mac.is_poll_response(&data_frame(4, 0x9999, 0x0000, &[0xAA])));
+        // ACK and command frames never qualify.
+        assert!(!mac.is_poll_response(&frames::build_ack(5, true)));
+
+        // A parent known only by EUI-64 is matched on its extended source.
+        mac.coord_extended_address = [9; 8];
+        let mut ext_src = heapless::Vec::<u8, 127>::new();
+        ext_src
+            .extend_from_slice(&[0x61, 0xC8, 6, 0x34, 0x12, 0x78, 0x56])
+            .unwrap();
+        ext_src.extend_from_slice(&[9; 8]).unwrap();
+        ext_src.push(0xAA).unwrap();
+        assert!(mac.is_poll_response(&ext_src));
+        ext_src[7] = 8;
+        assert!(!mac.is_poll_response(&ext_src));
+    }
+
+    #[test]
+    fn retained_frames_are_delivered_through_indication_filter() {
+        let mut mac = associated_mac();
+        mac.retain_frame(&data_frame(1, 0x5678, 0x1111, &[0x01]), 200);
+        mac.retain_frame(&data_frame(2, 0x9999, 0x1111, &[0x02]), 200);
+        // ACKs and commands are not retained.
+        mac.retain_frame(&frames::build_ack(3, false), 200);
+        assert_eq!(mac.pending_rx.len(), 2);
+
+        let first = mac.pending_rx.pop_front().unwrap();
+        let indication = mac
+            .indication_from(&first.data[..first.len as usize], first.lqi)
+            .unwrap();
+        assert_eq!(indication.payload.as_slice(), &[0x01]);
+        assert_eq!(indication.lqi, 200);
+
+        let second = mac.pending_rx.pop_front().unwrap();
+        assert!(
+            mac.indication_from(&second.data[..second.len as usize], 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_queue_is_bounded_and_keeps_newest() {
+        let mut mac = associated_mac();
+        for seq in 0..(PENDING_RX_DEPTH as u8 + 2) {
+            mac.retain_frame(&data_frame(seq, 0x5678, 0x1111, &[seq]), 0);
+        }
+        assert_eq!(mac.pending_rx.len(), PENDING_RX_DEPTH);
+        assert_eq!(mac.pending_rx.front().unwrap().data[2], 2);
     }
 }
