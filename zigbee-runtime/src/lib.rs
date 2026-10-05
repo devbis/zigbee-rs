@@ -6093,6 +6093,28 @@ mod resume_tests {
     }
 
     #[test]
+    fn a_due_secure_rejoin_stays_due_past_half_the_clock_range() {
+        // The deadline used to be compared with a half-range wrapping test
+        // forever, so a retry that could not run for ~35.8 min read as
+        // "in the future" again and the rejoin silently stalled.
+        use zigbee_mac::PlatformServices as _;
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        device.schedule_secure_rejoin_retry();
+        assert!(!device.secure_rejoin_retry_due());
+
+        let delay = ZigbeeDevice::<MockMac, crate::role::EndDevice>::SECURE_REJOIN_RETRY_DELAY_US;
+        block_on(device.mac_mut().delay_micros(delay));
+        assert!(device.secure_rejoin_retry_due());
+
+        block_on(device.mac_mut().delay_micros(0x8000_0000));
+        assert!(
+            device.secure_rejoin_retry_due(),
+            "a consumed deadline must not alias back into the future"
+        );
+        assert!(device.secure_rejoin_pending());
+    }
+
+    #[test]
     fn resuming_a_router_never_negotiates_a_timeout() {
         let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
             .device_type(DeviceType::Router)
@@ -6200,6 +6222,19 @@ pub struct EndpointConfig {
 pub struct ClusterRef<'a> {
     pub endpoint: u8,
     pub cluster: &'a mut dyn Cluster,
+}
+
+/// When the next automatic secure-rejoin attempt may run.
+///
+/// The concrete deadline is only held while it lies in the future; once it is
+/// observed due it collapses to [`SecureRejoinRetry::Due`] and is no longer
+/// compared against the wrapping microsecond counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecureRejoinRetry {
+    /// Attempt at the next opportunity.
+    Due,
+    /// Attempt once the monotonic microsecond counter reaches this value.
+    At(u32),
 }
 
 /// User-initiated actions, triggered by button presses or application logic.
@@ -6534,8 +6569,8 @@ pub struct ZigbeeDevice<M: MacDriver, R: crate::role::DeviceRole = crate::role::
     /// Whether an APS table snapshot has been loaded or stored this power
     /// cycle.
     aps_tables_persisted: bool,
-    /// Earliest monotonic time for the next automatic secure-rejoin attempt.
-    secure_rejoin_retry_at: Option<u32>,
+    /// Next automatic secure-rejoin attempt, `None` when none is pending.
+    secure_rejoin_retry_at: Option<SecureRejoinRetry>,
     /// Per-role runtime state (see [`crate::role::RoleState`]).
     ///
     /// This is where every role-specific runtime field now lives, keeping each
@@ -8980,17 +9015,32 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.secure_rejoin_retry_at.is_some()
     }
 
-    pub(crate) fn secure_rejoin_retry_due(&self) -> bool {
-        let Some(deadline) = self.secure_rejoin_retry_at else {
-            return false;
-        };
-        let now = self.bdb.zdo().nwk().mac().monotonic_micros();
-        now.wrapping_sub(deadline) < 0x8000_0000
+    /// Whether the pending secure rejoin may be attempted now.
+    ///
+    /// A concrete deadline is consumed (collapsed to
+    /// [`SecureRejoinRetry::Due`]) the first time it is observed due, so a
+    /// retry left pending for longer than half the 32-bit microsecond range
+    /// (~35.8 min) can never alias back into the future.
+    pub(crate) fn secure_rejoin_retry_due(&mut self) -> bool {
+        match self.secure_rejoin_retry_at {
+            None => false,
+            Some(SecureRejoinRetry::Due) => true,
+            Some(SecureRejoinRetry::At(deadline)) => {
+                let now = self.bdb.zdo().nwk().mac().monotonic_micros();
+                let due = now.wrapping_sub(deadline) < 0x8000_0000;
+                if due {
+                    self.secure_rejoin_retry_at = Some(SecureRejoinRetry::Due);
+                }
+                due
+            }
+        }
     }
 
     fn schedule_secure_rejoin_retry(&mut self) {
         let now = self.bdb.zdo().nwk().mac().monotonic_micros();
-        self.secure_rejoin_retry_at = Some(now.wrapping_add(Self::SECURE_REJOIN_RETRY_DELAY_US));
+        self.secure_rejoin_retry_at = Some(SecureRejoinRetry::At(
+            now.wrapping_add(Self::SECURE_REJOIN_RETRY_DELAY_US),
+        ));
     }
 
     /// The device's NWK short address (0xFFFF if not joined).
@@ -9926,8 +9976,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.bdb.attributes_mut().primary_channel_set = ChannelMask(1u32 << state.channel);
         self.bdb.attributes_mut().secondary_channel_set = ChannelMask(0);
         self.state_dirty = false;
-        let now = self.bdb.zdo().nwk().mac().monotonic_micros();
-        self.secure_rejoin_retry_at = state.rejoin_pending.then_some(now);
+        self.secure_rejoin_retry_at = state.rejoin_pending.then_some(SecureRejoinRetry::Due);
         #[cfg(feature = "router")]
         R::record_network_key_snapshot(self, state);
         #[cfg(feature = "router")]
@@ -10883,8 +10932,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     if pending.request.rejoin {
                         self.bdb.zdo_mut().nwk_mut().set_joined(false);
                         self.reset_identify_clusters();
-                        let now = self.bdb.zdo().nwk().mac().monotonic_micros();
-                        self.secure_rejoin_retry_at = Some(now);
+                        self.secure_rejoin_retry_at = Some(SecureRejoinRetry::Due);
                     } else {
                         if leave_result.is_err() {
                             log::warn!(
@@ -12424,8 +12472,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 // rejoin/leave lifecycle action, so a stale record can never be
                 // read as "interview complete" during the rejoin window.
                 self.remote_reporting.clear();
-                let now = self.bdb.zdo().nwk().mac().monotonic_micros();
-                self.secure_rejoin_retry_at = Some(now);
+                self.secure_rejoin_retry_at = Some(SecureRejoinRetry::Due);
                 Some(event_loop::StackEvent::RejoinRequested)
             }
             zigbee_nwk::nlde::NwkCommandOutcome::LeaveRequested {
@@ -12459,8 +12506,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     return None;
                 }
                 if rejoin {
-                    let now = self.bdb.zdo().nwk().mac().monotonic_micros();
-                    self.secure_rejoin_retry_at = Some(now);
+                    self.secure_rejoin_retry_at = Some(SecureRejoinRetry::Due);
                     Some(event_loop::StackEvent::RejoinRequested)
                 } else {
                     self.secure_rejoin_retry_at = None;
@@ -12607,8 +12653,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         // Rejoin branch: an end device, a device whose address came from its
         // parent, or a router that could not pick a replacement.
         self.remote_reporting.clear();
-        let now = self.bdb.zdo().nwk().mac().monotonic_micros();
-        self.secure_rejoin_retry_at = Some(now);
+        self.secure_rejoin_retry_at = Some(SecureRejoinRetry::Due);
         Some(event_loop::StackEvent::RejoinRequested)
     }
 
@@ -13118,8 +13163,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 if request.rejoin {
                     self.bdb.zdo_mut().nwk_mut().set_joined(false);
                     self.reset_identify_clusters();
-                    let now = self.bdb.zdo().nwk().mac().monotonic_micros();
-                    self.secure_rejoin_retry_at = Some(now);
+                    self.secure_rejoin_retry_at = Some(SecureRejoinRetry::Due);
                     return Some(event_loop::StackEvent::RejoinRequested);
                 }
                 if leave_result.is_err() {

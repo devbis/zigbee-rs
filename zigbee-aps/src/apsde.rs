@@ -8102,8 +8102,7 @@ mod tests {
         let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
         // The ACK is unicast back to the sender; a router only transmits to a
         // known next hop (R22 §3.6.3.3), so the sender must be a neighbour.
-        aps.nwk_mut()
-            .update_neighbor_address(PEER_SHORT, [0x33; 8]);
+        aps.nwk_mut().update_neighbor_address(PEER_SHORT, [0x33; 8]);
         let counter = 0x42;
         assert!(
             deliver(
