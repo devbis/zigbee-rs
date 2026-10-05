@@ -58,6 +58,15 @@ const CLUSTER_RESPONSE_HEADER_LEN: usize = 3;
 const _: () =
     assert!(CLUSTER_RESPONSE_HEADER_LEN + CLUSTER_RESPONSE_PAYLOAD_CAP <= PENDING_ZCL_DATA_CAP);
 
+/// Payload budget of a locally generated global response frame.
+///
+/// Responses are never manufacturer specific, so their header is
+/// frame-control + sequence + command = 3 bytes. Record-structured responses
+/// (Read Attributes, Read Reporting Configuration) are built against this
+/// budget with whole records only, so they are never truncated mid-record
+/// and never dropped for size (see [`crate::zcl_wire`]).
+const GLOBAL_RESPONSE_PAYLOAD_CAP: usize = PENDING_ZCL_DATA_CAP - 3;
+
 /// An APS group-table mutation requested by a Groups cluster command.
 ///
 /// The Groups cluster's own state is synced synchronously inside the
@@ -69,6 +78,16 @@ pub(crate) enum GroupTableAction {
     Add { group: u16, endpoint: u8 },
     Remove { group: u16, endpoint: u8 },
     RemoveAll { endpoint: u8 },
+}
+
+/// Result of applying a validated Configure Reporting command.
+struct ConfigureReportingOutcome {
+    /// Length of the Configure Reporting Response payload in `zcl_scratch`.
+    response_len: usize,
+    /// Every record was accepted.
+    all_succeeded: bool,
+    /// Every record was a Send-direction record.
+    all_send: bool,
 }
 
 /// Result of one synchronous local ZCL dispatch.
@@ -105,6 +124,11 @@ pub(crate) struct LocalZclCtx<'a, 'c, const N: usize> {
     pending_responses: &'a mut heapless::Vec<PendingZclResponse, N>,
     clusters: &'a mut [ClusterRef<'c>],
     zcl_scratch: &'a mut [u8; 253],
+    /// `false` when the frame arrived groupcast or broadcast (NWK broadcast
+    /// address or APS group delivery). ZCL r8 §2.5.12.2 restricts Default
+    /// Response to unicast commands, and the Groups cluster (§3.6.2.3)
+    /// suppresses its responses to groupcast/broadcast requests.
+    unicast: bool,
     #[cfg(any(feature = "groups", test))]
     group_action: Option<GroupTableAction>,
     #[cfg(any(feature = "finding-binding", test))]
@@ -132,11 +156,61 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             pending_responses,
             clusters,
             zcl_scratch,
+            unicast: true,
             #[cfg(any(feature = "groups", test))]
             group_action: None,
             #[cfg(any(feature = "finding-binding", test))]
             fb_identify_target: None,
         }
+    }
+
+    /// Mark the frame as groupcast/broadcast (`unicast == false`) so no
+    /// Default Response and no Groups cluster response is generated for it.
+    pub(crate) fn with_unicast(mut self, unicast: bool) -> Self {
+        self.unicast = unicast;
+        self
+    }
+
+    /// Queue a Default Response for the received command when ZCL r8
+    /// §2.5.12.2 requires one.
+    ///
+    /// * Only unicast commands are answered.
+    /// * A Default Response is never answered with another one.
+    /// * The Disable Default Response bit suppresses *success* only: an error
+    ///   status is always reported.
+    #[allow(clippy::too_many_arguments)]
+    fn queue_default_response_for(
+        &mut self,
+        header: &zigbee_zcl::frame::ZclFrameHeader,
+        src_addr: u16,
+        src_endpoint: u8,
+        dst_ep: u8,
+        cluster_id: u16,
+        status: ZclStatus,
+    ) {
+        if !self.unicast {
+            return;
+        }
+        if header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
+            && header.command_id.0 == 0x0B
+        {
+            return;
+        }
+        if status == ZclStatus::Success && header.disable_default_response() {
+            return;
+        }
+        queue_default_response(
+            self.pending_responses,
+            ShortAddress(src_addr),
+            src_endpoint,
+            dst_ep,
+            cluster_id,
+            header.seq_number,
+            header.command_id.0,
+            status,
+            header.direction(),
+            header.manufacturer_code,
+        );
     }
 
     /// Run the synchronous local ZCL engine and package its outcome.
@@ -285,6 +359,115 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             .map(access)
     }
 
+    /// Apply every record of an already validated Configure Reporting
+    /// payload and write the Configure Reporting Response payload into
+    /// `zcl_scratch`.
+    ///
+    /// Per-record rules (ZCL r8 §2.5.7.1 / §2.5.8.1):
+    /// * unknown attribute → `UNSUPPORTED_ATTRIBUTE`;
+    /// * disabled or mismatched data type → `INVALID_DATA_TYPE`;
+    /// * attribute not reportable → `UNREPORTABLE_ATTRIBUTE`;
+    /// * minimum interval above a finite maximum (`max` not 0x0000 and not
+    ///   0xFFFF) → `INVALID_VALUE`;
+    /// * maximum interval 0xFFFF stops reporting the attribute. An existing
+    ///   configuration is replaced by the disabled one (the reporting engine
+    ///   never reports it automatically); when none exists nothing is stored,
+    ///   so a "stop reporting" request can never fail for table capacity.
+    #[inline(never)]
+    fn apply_configure_reporting(
+        &mut self,
+        dst_ep: u8,
+        cluster_id: u16,
+        payload: &[u8],
+    ) -> ConfigureReportingOutcome {
+        use zigbee_zcl::foundation::reporting::ReportDirection;
+        let mut outcome = ConfigureReportingOutcome {
+            response_len: 0,
+            all_succeeded: true,
+            all_send: true,
+        };
+        let mut cursor = 0usize;
+        while cursor < payload.len() {
+            let Some(cfg) = crate::zcl_wire::parse_configure_reporting_record(payload, &mut cursor)
+            else {
+                // Unreachable: the caller validated the whole payload.
+                outcome.all_succeeded = false;
+                break;
+            };
+            if cfg.direction == ReportDirection::Receive {
+                outcome.all_send = false;
+            }
+            let attr_definition = self
+                .with_cluster(dst_ep, ClusterId(cluster_id), |cluster| {
+                    cluster
+                        .attributes()
+                        .find(cfg.attribute_id)
+                        .map(|definition| (definition.access, definition.data_type))
+                })
+                .flatten();
+            let send = cfg.direction == ReportDirection::Send;
+            let status = if !zigbee_zcl::data_types::is_data_type_enabled(cfg.data_type) {
+                ZclStatus::InvalidDataType
+            } else if let Some((access, attribute_type)) = attr_definition {
+                if send && cfg.data_type != attribute_type {
+                    ZclStatus::InvalidDataType
+                } else if send && !access.is_reportable() {
+                    ZclStatus::UnreportableAttribute
+                } else if send
+                    && cfg.max_interval != 0x0000
+                    && cfg.max_interval != 0xFFFF
+                    && cfg.min_interval > cfg.max_interval
+                {
+                    ZclStatus::InvalidValue
+                } else if send
+                    && cfg.max_interval == 0xFFFF
+                    && self
+                        .reporting
+                        .get_config(dst_ep, cluster_id, cfg.direction, cfg.attribute_id)
+                        .is_none()
+                {
+                    ZclStatus::Success
+                } else {
+                    match self
+                        .reporting
+                        .configure_for_cluster(dst_ep, cluster_id, cfg.clone())
+                    {
+                        Ok(()) => ZclStatus::Success,
+                        Err(status) => status,
+                    }
+                }
+            } else {
+                ZclStatus::UnsupportedAttribute
+            };
+            rt_trace!(
+                "[RT] zcl_cfg attr=0x{:04X} dir={} status=0x{:02X}",
+                cfg.attribute_id.0,
+                cfg.direction as u8,
+                status as u8,
+            );
+            if status != ZclStatus::Success {
+                outcome.all_succeeded = false;
+                let pos = outcome.response_len;
+                // A record is at least 5 bytes (Receive) and a ZCL payload at
+                // most `MAX_ZCL_PAYLOAD`, so the failed-record list (4 bytes
+                // each) always fits the 253-byte scratch; bound it anyway.
+                if pos + 4 <= self.zcl_scratch.len() {
+                    let id = cfg.attribute_id.0.to_le_bytes();
+                    self.zcl_scratch[pos] = status as u8;
+                    self.zcl_scratch[pos + 1] = cfg.direction as u8;
+                    self.zcl_scratch[pos + 2] = id[0];
+                    self.zcl_scratch[pos + 3] = id[1];
+                    outcome.response_len = pos + 4;
+                }
+            }
+        }
+        if outcome.response_len == 0 {
+            self.zcl_scratch[0] = ZclStatus::Success as u8;
+            outcome.response_len = 1;
+        }
+        outcome
+    }
+
     fn reset_zcl_to_factory_defaults(&mut self) {
         self.basic_cluster.reset_to_factory_defaults();
         for entry in self.identify_clusters.iter_mut() {
@@ -337,6 +520,37 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             zcl_frame.payload.len(),
         );
 
+        // Manufacturer-specific commands (ZCL r8 §2.4.1.1.3). No manufacturer
+        // extension is registered with the runtime, so such a frame must not
+        // be interpreted as the standard command sharing its id (its payload
+        // and attribute space belong to the manufacturer). Answer with the
+        // dedicated UNSUP_MANUF_* status — always, since it is an error — and
+        // change no state. No event is raised: the frame carries no standard
+        // meaning an application could act on.
+        if zcl_frame.header.is_manufacturer_specific() {
+            let status = match zcl_frame.header.frame_type() {
+                zigbee_zcl::frame::ZclFrameType::Global => {
+                    ZclStatus::UnsupManufacturerGeneralCommand
+                }
+                _ => ZclStatus::UnsupManufacturerClusterCommand,
+            };
+            rt_trace!(
+                "[RT] zcl_manuf_unsupported ep={} cluster=0x{:04X} cmd=0x{:02X}",
+                dst_ep,
+                cluster_id,
+                cmd_id,
+            );
+            self.queue_default_response_for(
+                &zcl_frame.header,
+                src_addr,
+                src_endpoint,
+                dst_ep,
+                cluster_id,
+                status,
+            );
+            return None;
+        }
+
         // Check if this is a Report Attributes (0x0A) — incoming report from remote
         if zcl_frame.header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
             && cmd_id == 0x0A
@@ -383,7 +597,11 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         //
         // Two independent results come out of this branch. The per-record
         // status list drives the standards-mandated Configure Reporting
-        // Response (0x07) and is unchanged. Separately, the cluster is added
+        // Response (0x07; ZCL r8 §2.5.8: a single SUCCESS status when every
+        // record succeeded, otherwise one status record per *failed*
+        // attribute). A malformed command is rejected whole with a
+        // MALFORMED_COMMAND Default Response before any record is applied.
+        // Separately, the cluster is added
         // to the runtime's remote-reporting record *only* when the whole
         // command was well formed and every record succeeded — see
         // [`crate::remote_reporting`]. Anything less (empty or malformed
@@ -395,195 +613,60 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             && cmd_id == 0x06
             && zcl_frame.header.direction() == ClusterDirection::ClientToServer
         {
-            use zigbee_zcl::foundation::reporting::{
-                ConfigureReportingResponse, ConfigureReportingStatusRecord, ReportDirection,
-                ReportingConfig,
-            };
             let payload = zcl_frame.payload.as_slice();
-            let mut response = ConfigureReportingResponse {
-                records: heapless::Vec::new(),
-            };
-            let mut i = 0usize;
-            let mut records = 0usize;
-            let mut parse_ok = true;
-            let mut all_records_succeeded = true;
-            // Outbound (device→client) reporting progress may only be advanced
-            // by a command made *entirely* of Send-direction records. A
-            // Receive-direction record configures how *this* device consumes a
-            // client's reports, never what it sends, so a receive-only or
-            // mixed command must not count towards interview completion even if
-            // every record is individually accepted.
-            let mut all_records_send = true;
             rt_trace!(
                 "[RT] zcl_cfg_reporting ep={} cluster=0x{:04X} len={}",
                 dst_ep,
                 cluster_id,
                 payload.len(),
             );
-
-            while i < payload.len() {
-                let direction = match payload[i] {
-                    0x00 => ReportDirection::Send,
-                    0x01 => ReportDirection::Receive,
-                    _other => {
-                        rt_trace!("[RT] zcl_cfg bad_dir=0x{:02X}", _other);
-                        parse_ok = false;
-                        break;
-                    }
-                };
-                if direction == ReportDirection::Receive {
-                    all_records_send = false;
-                }
-                i += 1;
-                if i + 2 > payload.len() {
-                    parse_ok = false;
-                    break;
-                }
-                let attribute_id =
-                    zigbee_zcl::AttributeId(u16::from_le_bytes([payload[i], payload[i + 1]]));
-                i += 2;
-
-                let cfg = if direction == ReportDirection::Send {
-                    if i + 5 > payload.len() {
-                        parse_ok = false;
-                        break;
-                    }
-                    let Some(data_type) = zigbee_zcl::data_types::ZclDataType::from_u8(payload[i])
-                    else {
-                        rt_trace!("[RT] zcl_cfg bad_type=0x{:02X}", payload[i]);
-                        parse_ok = false;
-                        break;
-                    };
-                    i += 1;
-                    let min_interval = u16::from_le_bytes([payload[i], payload[i + 1]]);
-                    i += 2;
-                    let max_interval = u16::from_le_bytes([payload[i], payload[i + 1]]);
-                    i += 2;
-                    let data_type_enabled = zigbee_zcl::data_types::is_data_type_enabled(data_type);
-                    let reportable_change = if zigbee_zcl::data_types::is_analog_type(data_type) {
-                        if data_type_enabled {
-                            let Some((val, consumed)) =
-                                zigbee_zcl::data_types::ZclValue::deserialize(
-                                    data_type,
-                                    &payload[i..],
-                                )
-                            else {
-                                parse_ok = false;
-                                break;
-                            };
-                            i += consumed;
-                            Some(val)
-                        } else {
-                            let Some(value_size) =
-                                zigbee_zcl::data_types::data_type_size(data_type)
-                            else {
-                                parse_ok = false;
-                                break;
-                            };
-                            if i + value_size > payload.len() {
-                                parse_ok = false;
-                                break;
-                            }
-                            i += value_size;
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    ReportingConfig {
-                        direction,
-                        attribute_id,
-                        data_type,
-                        min_interval,
-                        max_interval,
-                        reportable_change,
-                    }
-                } else {
-                    if i + 2 > payload.len() {
-                        parse_ok = false;
-                        break;
-                    }
-                    let timeout = u16::from_le_bytes([payload[i], payload[i + 1]]);
-                    i += 2;
-                    ReportingConfig {
-                        direction,
-                        attribute_id,
-                        data_type: zigbee_zcl::data_types::ZclDataType::NoData,
-                        min_interval: 0,
-                        max_interval: timeout,
-                        reportable_change: None,
-                    }
-                };
-
-                let attr_definition = self
-                    .with_cluster(dst_ep, ClusterId(cluster_id), |cluster| {
-                        cluster
-                            .attributes()
-                            .find(cfg.attribute_id)
-                            .map(|definition| (definition.access, definition.data_type))
-                    })
-                    .flatten();
-                let status = if !zigbee_zcl::data_types::is_data_type_enabled(cfg.data_type) {
-                    ZclStatus::InvalidDataType
-                } else if let Some((access, attribute_type)) = attr_definition {
-                    if cfg.direction == ReportDirection::Send && cfg.data_type != attribute_type {
-                        ZclStatus::InvalidDataType
-                    } else if cfg.direction == ReportDirection::Send && !access.is_reportable() {
-                        ZclStatus::UnreportableAttribute
-                    } else {
-                        match self
-                            .reporting
-                            .configure_for_cluster(dst_ep, cluster_id, cfg.clone())
-                        {
-                            Ok(()) => ZclStatus::Success,
-                            Err(s) => s,
-                        }
-                    }
-                } else {
-                    ZclStatus::UnsupportedAttribute
-                };
-                if status != ZclStatus::Success {
-                    all_records_succeeded = false;
-                }
-                let _ = response.records.push(ConfigureReportingStatusRecord {
-                    status,
-                    direction: cfg.direction,
-                    attribute_id: cfg.attribute_id,
-                });
-                records += 1;
+            // Parse the *whole* command before touching any state: a
+            // malformed tail must not leave earlier records applied with no
+            // response explaining it.
+            let Some(records) = crate::zcl_wire::count_configure_reporting_records(payload) else {
                 rt_trace!(
-                    "[RT] zcl_cfg attr=0x{:04X} dir={} status=0x{:02X}",
-                    cfg.attribute_id.0,
-                    cfg.direction as u8,
-                    status as u8,
-                );
-            }
-
-            if parse_ok && records > 0 {
-                // Queue Configure Reporting Response (0x07)
-                queue_reporting_response(
-                    self.pending_responses,
-                    ShortAddress(src_addr),
-                    src_endpoint,
-                    dst_ep,
-                    cluster_id,
-                    zcl_frame.header.seq_number,
-                    &response,
-                );
-                log::info!(
-                    "[Runtime] Configure Reporting: ep={} cluster=0x{:04X} ({} attrs)",
-                    dst_ep,
-                    cluster_id,
-                    records
-                );
-            } else {
-                rt_trace!(
-                    "[RT] zcl_cfg_reporting parse_fail ep={} cluster=0x{:04X} len={}",
+                    "[RT] zcl_cfg_reporting malformed ep={} cluster=0x{:04X} len={}",
                     dst_ep,
                     cluster_id,
                     payload.len(),
                 );
-            }
+                self.queue_default_response_for(
+                    &zcl_frame.header,
+                    src_addr,
+                    src_endpoint,
+                    dst_ep,
+                    cluster_id,
+                    ZclStatus::MalformedCommand,
+                );
+                return Some(command_received_event(
+                    src_addr,
+                    src_endpoint,
+                    dst_ep,
+                    cluster_id,
+                    cmd_id,
+                    zcl_frame.header.seq_number,
+                    payload,
+                ));
+            };
+            let applied = self.apply_configure_reporting(dst_ep, cluster_id, payload);
+            queue_global_response_inner(
+                self.pending_responses,
+                src_addr,
+                src_endpoint,
+                dst_ep,
+                cluster_id,
+                zcl_frame.header.seq_number,
+                0x07, // Configure Reporting Response
+                &self.zcl_scratch[..applied.response_len],
+            );
+            log::info!(
+                "[Runtime] Configure Reporting: ep={} cluster=0x{:04X} ({} attrs)",
+                dst_ep,
+                cluster_id,
+                records
+            );
+            let all_records_succeeded = applied.all_succeeded;
+            let all_records_send = applied.all_send;
 
             // Interview accounting: only a well-formed, non-empty command made
             // entirely of Send-direction records whose statuses were all
@@ -591,7 +674,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             // rejected command (the client did not get what it asked for) or a
             // receive-only/mixed command (which does not configure what this
             // device *sends*) is answered but never counts.
-            if parse_ok && records > 0 && all_records_succeeded && all_records_send {
+            if all_records_succeeded && all_records_send {
                 match self.remote_reporting.record(dst_ep, cluster_id) {
                     RecordOutcome::Added | RecordOutcome::AlreadyRecorded => {}
                     RecordOutcome::Full => {
@@ -736,18 +819,23 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                         )
                     },
                 ) {
-                    let payload_buf = &mut *self.zcl_scratch;
-                    let payload_len = response.serialize(payload_buf).min(payload_buf.len());
+                    // Whole records only, sized to the queued-frame budget:
+                    // a record that does not fit is left for the client's
+                    // follow-up read instead of truncating the frame.
+                    let payload_buf = &mut self.zcl_scratch[..GLOBAL_RESPONSE_PAYLOAD_CAP];
+                    let (payload_len, _records) =
+                        crate::zcl_wire::serialize_read_attributes_response(&response, payload_buf);
                     rt_trace!(
-                        "[RT] zcl_read_rsp cluster=0x{:04X} len={} records={}",
+                        "[RT] zcl_read_rsp cluster=0x{:04X} len={} records={}/{}",
                         cluster_id,
                         payload_len,
+                        _records,
                         response.records.len(),
                     );
                     log::info!(
                         "[ZCL] ReadAttr response: {} bytes, {} records queued",
                         payload_len,
-                        response.records.len(),
+                        _records,
                     );
                     queue_global_response_for_direction_inner(
                         self.pending_responses,
@@ -1102,6 +1190,12 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                 cluster.handle_command(CommandId(cmd_id), zcl_frame.payload.as_slice())
             }) {
                 cluster_found = true;
+                // Status carried by a Groups Add/Remove response (byte 0).
+                #[cfg(any(feature = "groups", test))]
+                let group_response_status = match &result {
+                    Ok(resp) => resp.first().copied().map(ZclStatus::from_u8),
+                    Err(_) => None,
+                };
                 match result {
                     Ok(resp) => {
                         response_payload = if resp.is_empty() { None } else { Some(resp) };
@@ -1111,15 +1205,35 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                     }
                 }
 
-                // Groups cluster → APS group table bridge
+                // Groups cluster → APS group table bridge.
+                //
+                // The APS group table mirrors the Groups cluster's membership,
+                // so it changes only when the cluster actually holds (Add:
+                // SUCCESS, or DUPLICATE_EXISTS for an already-present group)
+                // or no longer holds (Remove: SUCCESS, or NOT_FOUND) the
+                // group. A rejected command — malformed, or INSUFFICIENT_SPACE
+                // because the cluster table is full — must not make APS
+                // deliver a group the cluster does not have.
                 #[cfg(any(feature = "groups", test))]
                 if cluster_id == ClusterId::GROUPS.0 {
                     // Parse group action from command ID and sync to APS table.
                     // Can't use GroupsCluster::take_action() through trait object,
                     // so we infer the action from the ZCL command directly.
+                    let cluster_ok = cmd_status == ZclStatus::Success;
+                    let member = cluster_ok
+                        && matches!(
+                            group_response_status,
+                            Some(ZclStatus::Success | ZclStatus::DuplicateExists)
+                        );
+                    let not_member = cluster_ok
+                        && matches!(
+                            group_response_status,
+                            Some(ZclStatus::Success | ZclStatus::NotFound)
+                        );
                     match cmd_id {
                         command
                             if command == zigbee_zcl::clusters::groups::CMD_ADD_GROUP.0
+                                && member
                                 && zcl_frame.payload.len() >= 2 =>
                         {
                             // Add Group — group_id is first 2 bytes of payload
@@ -1132,6 +1246,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                         }
                         command
                             if command == zigbee_zcl::clusters::groups::CMD_REMOVE_GROUP.0
+                                && not_member
                                 && zcl_frame.payload.len() >= 2 =>
                         {
                             // Remove Group — group_id is first 2 bytes
@@ -1143,7 +1258,8 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                             });
                         }
                         command
-                            if command == zigbee_zcl::clusters::groups::CMD_REMOVE_ALL_GROUPS.0 =>
+                            if command == zigbee_zcl::clusters::groups::CMD_REMOVE_ALL_GROUPS.0
+                                && cluster_ok =>
                         {
                             // Remove All Groups
                             self.group_action =
@@ -1152,6 +1268,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                         command
                             if command
                                 == zigbee_zcl::clusters::groups::CMD_ADD_GROUP_IF_IDENTIFYING.0
+                                && cluster_ok
                                 && zcl_frame.payload.len() >= 2 =>
                         {
                             // Add Group If Identifying — only add if Identify cluster
@@ -1174,21 +1291,30 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                                 })
                                 .unwrap_or(false);
                             if is_identifying {
-                                // Add to APS group table
-                                self.group_action = Some(GroupTableAction::Add {
-                                    group: gid,
-                                    endpoint: dst_ep,
-                                });
-                                // Also add to GroupsCluster internal list via CMD_ADD_GROUP
-                                // (cluster's handle_command for 0x05 is a no-op; use 0x00 to sync)
+                                // Add to the GroupsCluster internal list via
+                                // CMD_ADD_GROUP (the cluster's handle_command
+                                // for 0x05 is a no-op), and mirror it into the
+                                // APS group table only if the cluster took it.
                                 let add_payload = gid.to_le_bytes();
-                                let _ =
-                                    self.with_cluster_mut(dst_ep, ClusterId::GROUPS, |cluster| {
+                                let added = self
+                                    .with_cluster_mut(dst_ep, ClusterId::GROUPS, |cluster| {
                                         cluster.handle_command(
                                             zigbee_zcl::clusters::groups::CMD_ADD_GROUP,
                                             &add_payload,
                                         )
+                                    })
+                                    .and_then(Result::ok)
+                                    .and_then(|resp| resp.first().copied())
+                                    .map(ZclStatus::from_u8);
+                                if matches!(
+                                    added,
+                                    Some(ZclStatus::Success | ZclStatus::DuplicateExists)
+                                ) {
+                                    self.group_action = Some(GroupTableAction::Add {
+                                        group: gid,
+                                        endpoint: dst_ep,
                                     });
+                                }
                             }
                         }
                         _ => {}
@@ -1196,8 +1322,14 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                 }
             }
 
+            // Groups cluster commands received groupcast/broadcast are not
+            // answered (ZCL r8 §3.6.2.3).
+            let suppress_cluster_response = !self.unicast && cluster_id == ClusterId::GROUPS.0;
+
             // Send cluster-specific response if the cluster produced one
-            if let Some(resp) = response_payload {
+            if let Some(resp) = response_payload
+                && !suppress_cluster_response
+            {
                 // Determine the response command ID.
                 // For most clusters, the response uses the same cmd_id.
                 // Exceptions per ZCL spec:
@@ -1228,20 +1360,19 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                     // Provably never overflows (see the module-level `const _`
                     // bound), so it is always queued whole.
                 );
-            } else if cluster_found && !zcl_frame.header.disable_default_response() {
+            } else if cluster_found && !suppress_cluster_response {
                 // Only send Default Response for clusters we handle in ClusterRef.
                 // Unmatched clusters (e.g. OTA 0x0019) are app-handled — don't
                 // send spurious Default Responses that confuse the coordinator.
-                queue_default_response(
-                    self.pending_responses,
-                    ShortAddress(src_addr),
+                // An error status is reported even when the sender set the
+                // Disable Default Response bit (ZCL r8 §2.5.12.2).
+                self.queue_default_response_for(
+                    &zcl_frame.header,
+                    src_addr,
                     src_endpoint,
                     dst_ep,
                     cluster_id,
-                    zcl_frame.header.seq_number,
-                    cmd_id,
                     cmd_status,
-                    zcl_frame.header.direction(),
                 );
             }
 
@@ -1267,21 +1398,25 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             ));
         }
 
-        // Other global commands — send Default Response for unsupported, then pass through
-        if !zcl_frame.header.disable_default_response() {
-            // Send UNSUP_GENERAL_COMMAND for unhandled foundation commands
-            queue_default_response(
-                self.pending_responses,
-                ShortAddress(src_addr),
-                src_endpoint,
-                dst_ep,
-                cluster_id,
-                zcl_frame.header.seq_number,
-                cmd_id,
-                ZclStatus::UnsupGeneralCommand,
-                zcl_frame.header.direction(),
-            );
-        }
+        // Other global commands. Foundation *responses* (to requests an
+        // application sent) are passed through to the application, which
+        // consumes them, so they are acknowledged as handled — only when the
+        // sender asked for it. Every other foundation command is not
+        // supported here: UNSUP_GENERAL_COMMAND is an error and is reported
+        // regardless of the Disable Default Response bit (ZCL r8 §2.5.12.2).
+        let status = if is_foundation_response(cmd_id) {
+            ZclStatus::Success
+        } else {
+            ZclStatus::UnsupGeneralCommand
+        };
+        self.queue_default_response_for(
+            &zcl_frame.header,
+            src_addr,
+            src_endpoint,
+            dst_ep,
+            cluster_id,
+            status,
+        );
         Some(command_received_event(
             src_addr,
             src_endpoint,
@@ -1292,6 +1427,52 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             zcl_frame.payload.as_slice(),
         ))
     }
+}
+
+/// Foundation response commands a client-side application consumes from the
+/// pass-through event (Read Attributes / Write Attributes / Configure
+/// Reporting / Read Reporting Configuration / Discover responses).
+fn is_foundation_response(cmd_id: u8) -> bool {
+    matches!(
+        cmd_id,
+        0x01 | 0x04 | 0x07 | 0x09 | 0x0D | 0x12 | 0x14 | 0x16
+    )
+}
+
+/// Local endpoints an application APS indication is delivered to
+/// (R22 §2.2.4.1.1).
+///
+/// * Group addressing: every configured endpoint that is a member of `group`
+///   in the APS group table (possibly none — the frame is then dropped).
+/// * Broadcast endpoint `0xFF`: every configured application endpoint.
+/// * Otherwise: the addressed endpoint, unchanged (an unknown endpoint is
+///   still handed to the dispatcher, which reports it as before).
+#[inline(never)]
+pub(crate) fn delivery_endpoints(
+    endpoints: &[EndpointConfig],
+    dst_ep: u8,
+    group: Option<u16>,
+    group_table: &zigbee_aps::group::GroupTable,
+) -> heapless::Vec<u8, { crate::MAX_ENDPOINTS }> {
+    let mut targets = heapless::Vec::new();
+    match group {
+        Some(group) => {
+            for configured in endpoints {
+                if group_table.is_member(group, configured.endpoint) {
+                    let _ = targets.push(configured.endpoint);
+                }
+            }
+        }
+        None if dst_ep == 0xFF => {
+            for configured in endpoints {
+                let _ = targets.push(configured.endpoint);
+            }
+        }
+        None => {
+            let _ = targets.push(dst_ep);
+        }
+    }
+    targets
 }
 
 /// Build the `CommandReceived` pass-through event for a foundation command.
@@ -1377,15 +1558,11 @@ fn command_received_event_with_type(
 /// than sent corrupt. This matches every reachable historical foundation
 /// helper:
 ///
-/// * The global-response path (e.g. Read Attributes) is caller-sized and can
-///   genuinely overflow; historically it serialized into a scratch buffer and
-///   returned without queueing when the copy into the `PendingZclResponse`
-///   buffer overflowed.
-/// * The Read Reporting Configuration response path serializes into a
-///   128-byte payload buffer. Capacity profiles whose maximum framed response
-///   exceeds `PENDING_ZCL_DATA_CAP` drop it whole; smaller profiles queue the
-///   complete response (regression:
-///   `read_reporting_max_response_is_queued_whole_or_dropped`).
+/// * The Read Attributes and Read Reporting Configuration responses are
+///   serialized with the bounded `zcl_wire` serializers into at most
+///   [`GLOBAL_RESPONSE_PAYLOAD_CAP`] bytes, keeping only whole records, so
+///   the framed response always fits (regression:
+///   `read_reporting_max_response_keeps_whole_records`).
 /// * The default / configure-reporting / cluster-specific paths build frames
 ///   that are provably small enough that the drop branch never runs (see the
 ///   module-level `const _` assertion for the cluster-specific bound).
@@ -1502,6 +1679,7 @@ pub(crate) fn queue_default_response<const N: usize>(
     triggering_cmd: u8,
     status: ZclStatus,
     triggering_direction: ClusterDirection,
+    manufacturer_code: Option<u16>,
 ) {
     let response_direction = match triggering_direction {
         ClusterDirection::ClientToServer => ClusterDirection::ServerToClient,
@@ -1513,35 +1691,15 @@ pub(crate) fn queue_default_response<const N: usize>(
         response_direction,
         true,
     );
+    // The response to a manufacturer-specific command carries the same
+    // manufacturer code (ZCL r8 §2.4.1.1.3: frame control bit 2), so the
+    // sender can correlate it.
+    if let Some(code) = manufacturer_code {
+        frame.header.frame_control |= 1 << 2;
+        frame.header.manufacturer_code = Some(code);
+    }
     let _ = frame.payload.push(triggering_cmd);
     let _ = frame.payload.push(status as u8);
-    queue_frame(
-        pending_responses,
-        dst_addr,
-        dst_endpoint,
-        src_endpoint,
-        cluster_id,
-        &frame,
-    );
-}
-
-/// Queue a Configure Reporting Response (0x07).
-pub(crate) fn queue_reporting_response<const N: usize>(
-    pending_responses: &mut heapless::Vec<PendingZclResponse, N>,
-    dst_addr: ShortAddress,
-    dst_endpoint: u8,
-    src_endpoint: u8,
-    cluster_id: u16,
-    seq: u8,
-    response: &zigbee_zcl::foundation::reporting::ConfigureReportingResponse,
-) {
-    let mut frame =
-        ZclFrame::new_global(seq, CommandId(0x07), ClusterDirection::ServerToClient, true);
-    let mut payload_buf = [0u8; 64];
-    let payload_len = response.serialize(&mut payload_buf);
-    for &b in &payload_buf[..payload_len] {
-        let _ = frame.payload.push(b);
-    }
     queue_frame(
         pending_responses,
         dst_addr,
@@ -1564,8 +1722,12 @@ pub(crate) fn queue_read_reporting_response<const N: usize>(
 ) {
     let mut frame =
         ZclFrame::new_global(seq, CommandId(0x09), ClusterDirection::ServerToClient, true);
-    let mut payload_buf = [0u8; 128];
-    let payload_len = response.serialize(&mut payload_buf);
+    let mut payload_buf = [0u8; GLOBAL_RESPONSE_PAYLOAD_CAP];
+    // Whole records only, sized to the queued-frame budget: the response is
+    // never truncated mid-record and never dropped for size (regression:
+    // `read_reporting_max_response_keeps_whole_records`).
+    let (payload_len, _records) =
+        crate::zcl_wire::serialize_read_reporting_response(response, &mut payload_buf);
     for &b in &payload_buf[..payload_len] {
         let _ = frame.payload.push(b);
     }
@@ -1576,10 +1738,6 @@ pub(crate) fn queue_read_reporting_response<const N: usize>(
         src_endpoint,
         cluster_id,
         &frame,
-        // Capacity profiles that produce more than PENDING_ZCL_DATA_CAP bytes
-        // retain the exact prior drop-whole behavior. Compact profiles can fit
-        // their complete maximum response and queue it without truncation
-        // (regression: `read_reporting_max_response_is_queued_whole_or_dropped`).
     );
 }
 
@@ -1599,7 +1757,7 @@ mod tests {
     use zigbee_zcl::clusters::ota::OtaCluster;
     use zigbee_zcl::clusters::temperature::TemperatureCluster;
     use zigbee_zcl::data_types::ZclValue;
-    use zigbee_zcl::foundation::reporting::ReportingEngine;
+    use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig, ReportingEngine};
     use zigbee_zcl::frame::ZclFrame;
     use zigbee_zcl::{ClusterDirection, ClusterId, CommandId, DeviceId, ZclStatus};
 
@@ -1709,6 +1867,27 @@ mod tests {
             cluster_id: u16,
             frame: &[u8],
         ) -> super::LocalZclOutcome {
+            self.dispatch_addressed(endpoint, clusters, cluster_id, frame, true)
+        }
+
+        /// Dispatch as if received via groupcast/broadcast (`unicast = false`).
+        fn dispatch_groupcast(
+            &mut self,
+            clusters: &mut [ClusterRef<'_>],
+            cluster_id: u16,
+            frame: &[u8],
+        ) -> super::LocalZclOutcome {
+            self.dispatch_addressed(EP, clusters, cluster_id, frame, false)
+        }
+
+        fn dispatch_addressed(
+            &mut self,
+            endpoint: u8,
+            clusters: &mut [ClusterRef<'_>],
+            cluster_id: u16,
+            frame: &[u8],
+            unicast: bool,
+        ) -> super::LocalZclOutcome {
             LocalZclCtx::new(
                 &self.endpoints,
                 &mut self.basic,
@@ -1719,6 +1898,7 @@ mod tests {
                 clusters,
                 &mut self.scratch,
             )
+            .with_unicast(unicast)
             .dispatch(endpoint, SRC_EP, cluster_id, SRC_ADDR, frame)
         }
     }
@@ -1949,11 +2129,11 @@ mod tests {
     }
 
     /// Regression lock for the Read Reporting Configuration response overflow
-    /// policy: a maximum-size response is queued whole when it fits the active
-    /// capacity profile, or dropped whole when it exceeds
-    /// `PENDING_ZCL_DATA_CAP`. It is never truncated.
+    /// policy: a maximum-size response always produces a response frame that
+    /// fits `PENDING_ZCL_DATA_CAP`, carrying the longest prefix of *whole*
+    /// records. A record is never truncated mid-way.
     #[test]
-    fn read_reporting_max_response_is_queued_whole_or_dropped() {
+    fn read_reporting_max_response_keeps_whole_records() {
         use zigbee_zcl::data_types::{ZclDataType, ZclValue};
         use zigbee_zcl::foundation::reporting::{
             ReadReportingConfigResponse, ReadReportingConfigResponseRecord, ReportDirection,
@@ -1986,18 +2166,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Independently reconstruct the full serialized 0x09 frame the helper
-        // builds so the expected queue/drop result is tied to its actual size.
-        let mut frame =
-            ZclFrame::new_global(SEQ, CommandId(0x09), ClusterDirection::ServerToClient, true);
-        let mut payload_buf = [0u8; 128];
-        let payload_len = response.serialize(&mut payload_buf);
-        for &b in &payload_buf[..payload_len] {
-            frame.payload.push(b).unwrap();
-        }
-        let mut full = [0u8; 256];
-        let full_len = frame.serialize(&mut full).unwrap();
-
         let mut pending: heapless::Vec<PendingZclResponse, 4> = heapless::Vec::new();
         super::queue_read_reporting_response(
             &mut pending,
@@ -2009,13 +2177,19 @@ mod tests {
             &response,
         );
 
-        if full_len > crate::PENDING_ZCL_DATA_CAP {
-            // Dropped: an oversized framed response queues nothing rather than
-            // enqueueing a truncated (malformed) frame.
-            assert!(pending.is_empty());
-        } else {
-            assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].zcl_data.as_slice(), &full[..full_len]);
+        // Each Send record here is 1+1+2+1+2+2+8 = 17 bytes.
+        const RECORD: usize = 17;
+        let fits = (super::GLOBAL_RESPONSE_PAYLOAD_CAP / RECORD).min(response.records.len());
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].zcl_data.len() <= crate::PENDING_ZCL_DATA_CAP);
+        let resp = ZclFrame::parse(pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x09);
+        assert_eq!(resp.payload.len(), fits * RECORD);
+        for (n, rec) in resp.payload.chunks(RECORD).enumerate() {
+            assert_eq!(rec[0], ZclStatus::Success as u8);
+            assert_eq!(u16::from_le_bytes([rec[2], rec[3]]), n as u16);
+            assert_eq!(rec[4], ZclDataType::U64 as u8);
+            assert_eq!(&rec[9..], &0x0102_0304_0506_0708u64.to_le_bytes());
         }
     }
 
@@ -2396,8 +2570,9 @@ mod tests {
         ));
     }
 
-    /// An unknown data-type byte fails the parse: no response is queued (the
-    /// command is malformed) and nothing is counted.
+    /// An unknown data-type byte fails the parse: the command is malformed,
+    /// so a MALFORMED_COMMAND Default Response is queued (even with the
+    /// Disable Default Response bit set) and nothing is counted.
     #[test]
     fn unknown_data_type_is_not_counted() {
         let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
@@ -2409,12 +2584,24 @@ mod tests {
             &req,
         );
 
-        assert!(fx.pending.is_empty());
+        assert_malformed_default_response(&fx, 0x06);
         assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
         assert!(matches!(
             outcome.event,
             Some(crate::event_loop::StackEvent::CommandReceived { .. })
         ));
+    }
+
+    /// Assert the only queued response is a Default Response carrying
+    /// MALFORMED_COMMAND for `cmd`.
+    fn assert_malformed_default_response(fx: &Fixture, cmd: u8) {
+        assert_eq!(fx.pending.len(), 1);
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x0B);
+        assert_eq!(
+            resp.payload.as_slice(),
+            &[cmd, ZclStatus::MalformedCommand as u8]
+        );
     }
 
     /// A truncated record and an empty payload are both malformed/empty
@@ -2436,6 +2623,8 @@ mod tests {
             Some(crate::event_loop::StackEvent::CommandReceived { .. })
         ));
         assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert_malformed_default_response(&fx, 0x06);
+        fx.pending.clear();
 
         // Empty payload: zero records.
         let empty = global_request(0x06, true, &[]);
@@ -2449,7 +2638,7 @@ mod tests {
             Some(crate::event_loop::StackEvent::CommandReceived { .. })
         ));
         assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
-        assert!(fx.pending.is_empty());
+        assert_malformed_default_response(&fx, 0x06);
     }
 
     /// A command that configures one attribute successfully and is rejected
@@ -2476,11 +2665,14 @@ mod tests {
             &req,
         );
 
-        // Per-record response: Success for 0x0000, failure for 0x00FF.
+        // ZCL r8 §2.5.8.1: status records are only included for attributes
+        // whose configuration failed — exactly one record, for 0x00FF.
         let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
         assert_eq!(resp.header.command_id.0, 0x07);
-        assert_eq!(resp.payload[0], ZclStatus::Success as u8);
-        assert_eq!(resp.payload[4], ZclStatus::UnsupportedAttribute as u8);
+        assert_eq!(
+            resp.payload.as_slice(),
+            &[ZclStatus::UnsupportedAttribute as u8, 0x00, 0xFF, 0x00]
+        );
         assert!(
             fx.reporting
                 .get_config(
@@ -2777,6 +2969,284 @@ mod tests {
         assert_eq!(resp.header.command_id.0, 0x00);
         assert_eq!(resp.payload[0], ZclStatus::Success as u8);
         assert_eq!(&resp.payload[1..3], &[0x07, 0x00]);
+    }
+
+    // ── Configure Reporting validation (F3) ────────────────────────────
+
+    fn send_config(fx: &Fixture, attr: u16) -> Option<ReportingConfig> {
+        fx.reporting
+            .get_config(
+                EP,
+                ClusterId::TEMPERATURE.0,
+                ReportDirection::Send,
+                zigbee_zcl::AttributeId(attr),
+            )
+            .cloned()
+    }
+
+    /// A valid first record followed by a truncated tail is a malformed
+    /// command: nothing is applied (all-or-nothing parse) and a
+    /// MALFORMED_COMMAND Default Response is sent.
+    #[test]
+    fn configure_reporting_malformed_tail_applies_nothing() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let mut payload = heapless::Vec::<u8, 32>::new();
+        payload
+            .extend_from_slice(&configure_reporting_record(0x0000, 0x29))
+            .unwrap();
+        payload
+            .extend_from_slice(&[0x00, 0x01, 0x00, 0x29, 0x0A])
+            .unwrap();
+        let req = global_request(0x06, false, &payload);
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        assert!(send_config(&fx, 0x0000).is_none());
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+        assert_malformed_default_response(&fx, 0x06);
+        assert!(matches!(
+            outcome.event,
+            Some(crate::event_loop::StackEvent::CommandReceived { .. })
+        ));
+    }
+
+    /// min > finite max is INVALID_VALUE for that record and is not stored.
+    #[test]
+    fn configure_reporting_min_above_max_is_invalid_value() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        // min 60 s, max 10 s.
+        let req = global_request(
+            0x06,
+            true,
+            &[0x00, 0x00, 0x00, 0x29, 0x3C, 0x00, 0x0A, 0x00, 0x05, 0x00],
+        );
+        fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x07);
+        assert_eq!(
+            resp.payload.as_slice(),
+            &[ZclStatus::InvalidValue as u8, 0x00, 0x00, 0x00]
+        );
+        assert!(send_config(&fx, 0x0000).is_none());
+        assert_eq!(fx.remote_reporting.cluster_count(EP), 0);
+    }
+
+    /// Max interval 0xFFFF stops reporting (§2.5.7.1.6): with no existing
+    /// configuration nothing is stored; with one, it is disabled in place.
+    #[test]
+    fn configure_reporting_max_ffff_disables_reporting() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let disable = [0x00, 0x00, 0x00, 0x29, 0x0A, 0x00, 0xFF, 0xFF, 0x05, 0x00];
+
+        let req = global_request(0x06, true, &disable);
+        fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.payload.as_slice(), &[ZclStatus::Success as u8]);
+        assert!(send_config(&fx, 0x0000).is_none());
+        fx.pending.clear();
+
+        let req = global_request(0x06, true, &configure_reporting_record(0x0000, 0x29));
+        fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+        assert_eq!(send_config(&fx, 0x0000).unwrap().max_interval, 0x003C);
+        fx.pending.clear();
+
+        let req = global_request(0x06, true, &disable);
+        fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.payload.as_slice(), &[ZclStatus::Success as u8]);
+        assert_eq!(send_config(&fx, 0x0000).unwrap().max_interval, 0xFFFF);
+    }
+
+    // ── Manufacturer-specific / Default Response rules (F6) ────────────
+
+    fn manufacturer_frame(
+        cluster_specific: bool,
+        cmd: u8,
+        payload: &[u8],
+    ) -> heapless::Vec<u8, 64> {
+        // FC: frame type, manufacturer-specific (bit 2), DDR (bit 4).
+        let fc = (cluster_specific as u8) | 0x04 | 0x10;
+        let mut v = heapless::Vec::new();
+        v.extend_from_slice(&[fc, 0x34, 0x12, SEQ, cmd]).unwrap();
+        v.extend_from_slice(payload).unwrap();
+        v
+    }
+
+    /// A manufacturer-specific foundation command is not processed as the
+    /// standard command of the same id: Configure Reporting is not applied
+    /// and UNSUP_MANUF_GENERAL_COMMAND is returned despite the DDR bit.
+    #[test]
+    fn manufacturer_specific_global_command_is_rejected() {
+        let mut fx = Fixture::new(&[ClusterId::TEMPERATURE]);
+        let mut temp = TemperatureCluster::new(-4000, 12500);
+        let req = manufacturer_frame(false, 0x06, &configure_reporting_record(0x0000, 0x29));
+        let outcome = fx.dispatch(
+            &mut temperature_clusters(&mut temp),
+            ClusterId::TEMPERATURE.0,
+            &req,
+        );
+
+        assert!(outcome.event.is_none());
+        assert!(send_config(&fx, 0x0000).is_none());
+        assert_eq!(fx.pending.len(), 1);
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x0B);
+        assert_eq!(resp.header.manufacturer_code, Some(0x1234));
+        assert_eq!(
+            resp.payload.as_slice(),
+            &[0x06, ZclStatus::UnsupManufacturerGeneralCommand as u8]
+        );
+    }
+
+    /// A manufacturer-specific cluster command (here: Identify) is not run
+    /// as the standard command: UNSUP_MANUF_CLUSTER_COMMAND is returned.
+    #[test]
+    fn manufacturer_specific_cluster_command_is_rejected() {
+        let mut fx = Fixture::new(&[ClusterId::IDENTIFY]);
+        let req = manufacturer_frame(true, 0x00, &[0x05, 0x00]);
+        let outcome = fx.dispatch(&mut [], ClusterId::IDENTIFY.0, &req);
+
+        assert!(outcome.event.is_none());
+        assert_eq!(
+            fx.identify[0]
+                .cluster
+                .attributes()
+                .get(zigbee_zcl::AttributeId(0x0000)),
+            Some(&zigbee_zcl::data_types::ZclValue::U16(0))
+        );
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(
+            resp.payload.as_slice(),
+            &[0x00, ZclStatus::UnsupManufacturerClusterCommand as u8]
+        );
+    }
+
+    /// The Disable Default Response bit only suppresses a *successful*
+    /// Default Response; errors are always reported (ZCL r8 §2.5.12.2).
+    #[test]
+    fn disable_default_response_does_not_suppress_errors() {
+        let mut fx = Fixture::new(&[ClusterId::BASIC]);
+        let req = global_request(0xFF, true, &[]);
+        fx.dispatch(&mut [], ClusterId::BASIC.0, &req);
+        let expected =
+            expected_global_response(0x0B, &[0xFF, ZclStatus::UnsupGeneralCommand as u8]);
+        assert_eq!(fx.pending.len(), 1);
+        assert_eq!(fx.pending[0].zcl_data.as_slice(), expected.as_slice());
+
+        // A successful cluster command with DDR set still gets no response.
+        let mut fx = Fixture::new(&[ClusterId::IDENTIFY]);
+        let req = cluster_request(0x00, true, &[0x05, 0x00]);
+        fx.dispatch(&mut [], ClusterId::IDENTIFY.0, &req);
+        assert!(fx.pending.is_empty());
+    }
+
+    /// Groupcast/broadcast frames never elicit a Default Response, and the
+    /// Groups cluster does not answer groupcast commands (§3.6.2.3).
+    #[test]
+    fn groupcast_frames_get_no_response() {
+        let mut fx = Fixture::new(&[ClusterId::BASIC]);
+        let req = global_request(0xFF, false, &[]);
+        fx.dispatch_groupcast(&mut [], ClusterId::BASIC.0, &req);
+        assert!(fx.pending.is_empty());
+
+        let mut fx = Fixture::new(&[ClusterId::GROUPS]);
+        let mut groups = GroupsCluster::new();
+        let mut clusters = [ClusterRef {
+            endpoint: EP,
+            cluster: &mut groups,
+        }];
+        let req = cluster_request(0x00, false, &[0x07, 0x00, 0x00]);
+        let outcome = fx.dispatch_groupcast(&mut clusters, ClusterId::GROUPS.0, &req);
+        assert!(fx.pending.is_empty());
+        // The membership change itself is still applied.
+        assert!(matches!(
+            outcome.group_action,
+            Some(GroupTableAction::Add { group: 0x0007, .. })
+        ));
+    }
+
+    // ── Groups → APS bridge only on success (F8) ───────────────────────
+
+    #[test]
+    fn add_group_failure_does_not_touch_aps_group_table() {
+        let mut fx = Fixture::new(&[ClusterId::GROUPS]);
+        let mut groups = GroupsCluster::new();
+        for g in 0..zigbee_zcl::clusters::groups::MAX_GROUPS as u16 {
+            let [lo, hi] = (0x0100 + g).to_le_bytes();
+            groups
+                .handle_command(CommandId(0x00), &[lo, hi, 0x00])
+                .unwrap();
+        }
+        let mut clusters = [ClusterRef {
+            endpoint: EP,
+            cluster: &mut groups,
+        }];
+        let req = cluster_request(0x00, true, &[0x07, 0x00, 0x00]);
+        let outcome = fx.dispatch(&mut clusters, ClusterId::GROUPS.0, &req);
+
+        assert!(outcome.group_action.is_none());
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.payload[0], ZclStatus::InsufficientSpace as u8);
+    }
+
+    #[test]
+    fn remove_unknown_group_still_syncs_but_malformed_add_does_not() {
+        let mut fx = Fixture::new(&[ClusterId::GROUPS]);
+        let mut groups = GroupsCluster::new();
+        let mut clusters = [ClusterRef {
+            endpoint: EP,
+            cluster: &mut groups,
+        }];
+        // Malformed Add Group (no group id) → no action.
+        let req = cluster_request(0x00, true, &[0x07]);
+        let outcome = fx.dispatch(&mut clusters, ClusterId::GROUPS.0, &req);
+        assert!(outcome.group_action.is_none());
+        // Remove of an absent group (NOT_FOUND) keeps the APS table in sync.
+        let req = cluster_request(0x03, true, &[0x09, 0x00]);
+        let outcome = fx.dispatch(&mut clusters, ClusterId::GROUPS.0, &req);
+        assert!(matches!(
+            outcome.group_action,
+            Some(GroupTableAction::Remove { group: 0x0009, .. })
+        ));
+    }
+
+    #[test]
+    fn delivery_endpoints_follow_group_membership_and_broadcast_endpoint() {
+        let fx = Fixture::with_second_endpoint(&[ClusterId::IDENTIFY]);
+        let mut table = zigbee_aps::group::GroupTable::new();
+        assert!(table.add_group(0x0042, EP2));
+
+        let members = super::delivery_endpoints(&fx.endpoints, 0xFF, Some(0x0042), &table);
+        assert_eq!(members.as_slice(), &[EP2]);
+        let none = super::delivery_endpoints(&fx.endpoints, 0xFF, Some(0x0043), &table);
+        assert!(none.is_empty());
+        let all = super::delivery_endpoints(&fx.endpoints, 0xFF, None, &table);
+        assert_eq!(all.as_slice(), &[EP, EP2]);
+        let one = super::delivery_endpoints(&fx.endpoints, EP2, None, &table);
+        assert_eq!(one.as_slice(), &[EP2]);
     }
 
     #[test]

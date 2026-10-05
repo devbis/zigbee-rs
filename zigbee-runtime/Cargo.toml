@@ -56,6 +56,10 @@ router = [
 ]
 trust-center = ["router", "zigbee-aps/trust-center", "zigbee-bdb/trust-center"]
 ota = []
+# Deprecated item-by-item `save_state`/`restore_state` persistence. It does not
+# persist the Trust Center link key, APS keys, bindings or groups; production
+# devices use `SecurityStateStore`. Kept only for tests and mock examples.
+legacy-nv = []
 trace = ["zigbee-bdb/trace", "zigbee-aps/trace", "zigbee-nwk/trace"]
 constrained-memory = [
     "zigbee-zcl/constrained-memory",

@@ -370,9 +370,11 @@ mod tests {
         )
     }
 
-    /// Build a minimal valid OTA file: 56B header + 6B sub-element header,
-    /// no firmware payload — enough to exercise header parsing and a single
-    /// zero-length block without needing multi-block bookkeeping.
+    /// Build a minimal valid OTA file: 56B header + 6B UpgradeImage
+    /// sub-element header + 2B firmware payload (64B total). The header's
+    /// total image size matches the file length, as the OTA manager now
+    /// rejects images whose header disagrees with the advertised size or
+    /// that carry an empty UpgradeImage element.
     fn build_ota_file(mfg: u16, img_type: u16, version: u32) -> heapless::Vec<u8, 64> {
         let mut file = heapless::Vec::<u8, 64>::new();
         let push_bytes = |bytes: &[u8], file: &mut heapless::Vec<u8, 64>| {
@@ -391,9 +393,10 @@ mod tests {
         for _ in 0..32 {
             let _ = file.push(0);
         } // header string
-        push_bytes(&56u32.to_le_bytes(), &mut file); // total image size == header only
+        push_bytes(&64u32.to_le_bytes(), &mut file); // total image size == file length
         push_bytes(&0x0000u16.to_le_bytes(), &mut file); // sub-element tag: UpgradeImage
-        push_bytes(&0u32.to_le_bytes(), &mut file); // sub-element length: 0 bytes of firmware
+        push_bytes(&2u32.to_le_bytes(), &mut file); // sub-element length: 2 bytes of firmware
+        push_bytes(&[0xA5, 0x5A], &mut file); // firmware payload
         file
     }
 
