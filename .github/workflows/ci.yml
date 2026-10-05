@@ -1151,7 +1151,7 @@ jobs:
   # modern-tc32/rust toolchain. Stock nightly cannot compile this target.
 
   build-phy6222:
-    name: Build PHY6222 sensor
+    name: Build PHY6222/PHY6252 sensor
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -1201,6 +1201,36 @@ jobs:
             examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.hex
             examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.phy6.bin
           if-no-files-found: error
+      # PHY6252 is a known physical-limit failure: its XIP span is 96 B over
+      # the 130,816 B application slot. Report that exact linker failure as a
+      # warning; any other failure is fatal. Once the image links, the same
+      # mandatory layout gate as PHY6222 applies automatically.
+      - name: Build PHY6252 sensor and check its physical XIP limit
+        working-directory: examples/phy6222-sensor
+        run: |
+          LOG="$RUNNER_TEMP/phy6252-build.log"
+          set +e
+          cargo build --release --locked --no-default-features --features phy6252 \
+            --target-dir target/phy6252 2>&1 | tee "$LOG"
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [[ "$STATUS" == 0 ]]; then
+            sh check-layout.sh target/phy6252/thumbv6m-none-eabi/release/phy6222-sensor
+            echo "::notice title=PHY6252 fits::PHY6252 now fits the 130,816 B XIP slot; update the docs that list it as over the limit."
+            exit 0
+          fi
+          if ! grep -q "PHY62x2 XIP image exceeds the 130816-byte application slot" "$LOG"; then
+            echo "PHY6252 build failed for a reason other than the known XIP overflow" >&2
+            exit "$STATUS"
+          fi
+          OVER="$(grep -oE "'FLASH': overflowed by [0-9]+ bytes" "$LOG" \
+            | grep -oE '[0-9]+' | sort -n | tail -1)"
+          echo "::warning title=PHY6252 known XIP overflow::PHY6252 image is ${OVER:-an unknown number of} bytes over the 130,816 B XIP slot; it is not a release target until it fits."
+          {
+            echo "### PHY6252 XIP slot"
+            echo
+            echo "Known physical-limit failure: ${OVER:-unknown} B over the 130,816 B XIP application slot."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── EFR32MG1P (Silicon Labs, ARM Cortex-M4F) ─────────────────
   build-efr32mg1:
