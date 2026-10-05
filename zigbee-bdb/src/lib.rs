@@ -264,6 +264,9 @@ pub struct BdbLayer<M: MacDriver> {
     /// post-network commissioning security handshake is pending.
     #[cfg(feature = "centralized-tclk")]
     tclk_exchange: Option<TclkExchange>,
+    /// The next previous-network rejoin scans the widened BDB channel sets
+    /// instead of only the last operating channel (set after a failure).
+    rejoin_scan_widened: bool,
 }
 
 impl<M: MacDriver> BdbLayer<M> {
@@ -295,6 +298,7 @@ impl<M: MacDriver> BdbLayer<M> {
             fb_current_ieee: None,
             #[cfg(feature = "centralized-tclk")]
             tclk_exchange: None,
+            rejoin_scan_widened: false,
         }
     }
 
@@ -327,6 +331,7 @@ impl<M: MacDriver> BdbLayer<M> {
             }
             #[cfg(feature = "centralized-tclk")]
             core::ptr::addr_of_mut!((*slot).tclk_exchange).write(None);
+            core::ptr::addr_of_mut!((*slot).rejoin_scan_widened).write(false);
         }
     }
 
