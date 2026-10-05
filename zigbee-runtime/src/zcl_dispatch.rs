@@ -207,7 +207,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         payload: &[u8],
     ) -> Option<Result<heapless::Vec<u8, 64>, ZclStatus>> {
         use zigbee_zcl::clusters::ClusterRole;
-        use zigbee_zcl::clusters::scenes::{SceneCapable, SceneEndpoint};
+        use zigbee_zcl::clusters::scenes::SceneCapable;
 
         if !self.endpoint_has_server_cluster(endpoint, ClusterId::SCENES) {
             return None;
@@ -234,14 +234,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         }
         let groups = self.group_table;
         let is_member = |group: u16| groups.is_some_and(|table| table.is_member(group, endpoint));
-        Some(table?.handle_command_with(
-            cmd_id,
-            payload,
-            &mut SceneEndpoint {
-                clusters: &mut state,
-                is_member: &is_member,
-            },
-        ))
+        Some(table?.handle_endpoint_command(cmd_id, payload, &mut state, &is_member))
     }
 
     /// Queue a Default Response for the received command when ZCL r8

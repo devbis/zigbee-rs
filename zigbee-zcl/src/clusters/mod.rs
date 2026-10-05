@@ -64,8 +64,10 @@ use crate::{ClusterId, CommandId, ZclStatus};
 pub enum ClusterRole<'a> {
     /// Nothing beyond its own commands and attributes.
     None,
-    /// The endpoint's scene table (ZCL r8 §3.7).
-    SceneTable(&'a mut scenes::ScenesCluster),
+    /// The endpoint's scene table (ZCL r8 §3.7). Reached only through the
+    /// Scenes server's own vtable, so images without a Scenes server do not
+    /// link the scene-table command handling.
+    SceneTable(&'a mut dyn scenes::SceneTable),
     /// A cluster whose state is stored in and recalled from scenes.
     SceneState(&'a mut dyn scenes::SceneCapable),
 }
