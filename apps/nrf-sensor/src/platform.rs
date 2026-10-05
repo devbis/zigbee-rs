@@ -68,9 +68,16 @@ impl WakeController<SensorMac> for NrfWakeController {
     }
 
     async fn button_held_for(&mut self, duration_ms: u32) -> bool {
+        // The active-low button may already be released by the time the
+        // press wake is handled. Waiting for the next rising edge would then
+        // time out and turn a short press into a long-press factory reset;
+        // `wait_for_high` completes immediately for a released button.
+        if self.button.is_high() {
+            return false;
+        }
         matches!(
             select(
-                self.button.wait_for_rising_edge(),
+                self.button.wait_for_high(),
                 Timer::after(Duration::from_millis(u64::from(duration_ms))),
             )
             .await,

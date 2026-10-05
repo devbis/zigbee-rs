@@ -28,3 +28,10 @@ zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, feat
 zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+# The lifecycle suite exercises the routing and coordinator frontends, which
+# exist only with the `router` feature. Keep `cargo test -p router-app` with
+# default features compiling by skipping it there instead of failing.
+[[test]]
+name = "lifecycle"
+required-features = ["router"]

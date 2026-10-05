@@ -105,6 +105,14 @@ pub enum DiagnosticEvent {
     JoinRetry {
         attempt: u8,
     },
+    /// An unjoined commissioning attempt failed; the next one starts after
+    /// `delay_ms` of sleep (exponential backoff, capped at 30 minutes).
+    JoinBackoff {
+        delay_ms: u32,
+    },
+    /// The device left its network by request and is factory-new; it sleeps
+    /// without searching for a network until the user presses the button.
+    WaitingForButton,
     FactoryResetRequested,
     SecurityResetRebooting,
     ForceReport {

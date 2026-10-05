@@ -14,6 +14,12 @@ publish = false
 # supplies the single chip feature that root selected (`nrf52840` /
 # `nrf52833`). Naming a chip here would make the crate usable by exactly one
 # product, which is the opposite of its purpose.
+[features]
+# Report the synthetic humidity ramp of the original no-external-sensor
+# bring-up firmware from `OnChipTemperature`. Demo/devkit only: without it the
+# on-chip source reports the ZCL "invalid measurement" humidity value.
+demo-humidity = []
+
 [dependencies]
 sensor-sed-app = { path = "../sensor-sed" }
 zigbee-mac = { path = "../../zigbee-mac" }

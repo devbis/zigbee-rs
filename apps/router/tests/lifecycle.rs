@@ -5969,3 +5969,253 @@ mod key_power_cuts {
         }
     }
 }
+
+fn leave_request_frame(rejoin: bool, counter: u32) -> MacFrame {
+    let command = [
+        NwkCommandId::Leave as u8,
+        LeaveCommand {
+            remove_children: false,
+            request: true,
+            rejoin,
+        }
+        .serialize(),
+    ];
+    secured_nwk_frame(
+        NwkFrameType::Command,
+        ShortAddress::COORDINATOR,
+        COORDINATOR_IEEE,
+        ShortAddress(SHORT_ADDRESS),
+        counter as u8,
+        counter,
+        &command,
+    )
+}
+
+fn commissioning_attempts(events: &[DiagnosticEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, DiagnosticEvent::CommissioningAttempt { .. }))
+        .count()
+}
+
+#[test]
+fn leave_without_rejoin_stays_factory_new_until_commissioning_is_requested() {
+    let mut profile = profile();
+    let mut device = relay_device(&mut profile);
+    let mut security = security_store(false);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let parts = RouterParts::new(
+        RecordingStatus::default(),
+        TestSupervisor::default(),
+        RecordingDiagnostics::default(),
+    );
+    let mut app = RelayRouterApp::new(node, NoChildren, &FAST_RETRY_POLICY, parts).unwrap();
+
+    block_on(app.initialize()).unwrap();
+    assert!(app.node().device().is_joined());
+    assert!(!app.awaiting_commissioning_request());
+    assert!(
+        !app.request_commissioning(),
+        "a joined router ignores a commissioning request"
+    );
+    let attempts_before = commissioning_attempts(&app.parts().diagnostics.events);
+
+    let mac = app.node_mut().device_mut().mac_mut();
+    mac.set_rx_delay_us(0);
+    mac.enqueue_rx(McpsDataIndication {
+        src_address: MacAddress::Short(PanId(PAN_ID), ShortAddress::COORDINATOR),
+        dst_address: MacAddress::Short(PanId(PAN_ID), ShortAddress(SHORT_ADDRESS)),
+        lqi: 220,
+        payload: leave_request_frame(false, 61),
+        security_use: false,
+    });
+    let events = block_on(app.step()).unwrap();
+    assert!(matches!(events.incoming, Some(StackEvent::LeaveRequested)));
+    assert!(!app.node().device().is_joined());
+    assert!(
+        !app.node_mut()
+            .load_security_state()
+            .unwrap()
+            .unwrap()
+            .commissioned,
+        "Leave without rejoin commits factory-new state"
+    );
+    assert!(app.awaiting_commissioning_request());
+    assert!(
+        app.parts()
+            .diagnostics
+            .events
+            .contains(&DiagnosticEvent::AwaitingCommissioningRequest)
+    );
+    assert!(
+        !app.parts()
+            .diagnostics
+            .events
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::RetryScheduled { delay_ms: 0, .. }))
+    );
+
+    // Far beyond the 40..80 ms retry policy: no automatic network search.
+    app.node_mut()
+        .device_mut()
+        .mac_mut()
+        .set_rx_delay_us(u32::MAX);
+    for _ in 0..50 {
+        block_on(app.step()).unwrap();
+    }
+    assert_eq!(
+        commissioning_attempts(&app.parts().diagnostics.events),
+        attempts_before,
+        "a removed router must wait for an explicit commissioning request"
+    );
+    assert!(!app.node().device().is_joined());
+    assert!(app.awaiting_commissioning_request());
+
+    assert!(app.request_commissioning());
+    assert!(!app.awaiting_commissioning_request());
+    block_on(app.step()).unwrap();
+    assert_eq!(
+        commissioning_attempts(&app.parts().diagnostics.events),
+        attempts_before + 1,
+        "the explicit request starts commissioning on the next step"
+    );
+    assert!(
+        app.parts()
+            .diagnostics
+            .events
+            .contains(&DiagnosticEvent::CommissioningRequested)
+    );
+}
+
+#[test]
+fn local_leave_on_an_always_on_end_device_waits_for_a_commissioning_request() {
+    let mut profile = profile();
+    let mut device = always_on_end_device(&mut profile);
+    let mut security = security_store(false);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let parts = RouterParts::new(
+        NoStatus,
+        TestSupervisor::default(),
+        RecordingDiagnostics::default(),
+    );
+    let mut app = AlwaysOnEndDeviceApp::new(node, &FAST_RETRY_POLICY, parts).unwrap();
+
+    block_on(app.initialize()).unwrap();
+    assert!(app.node().device().is_joined());
+    let attempts_before = commissioning_attempts(&app.parts().diagnostics.events);
+
+    app.node_mut().device_mut().user_action(UserAction::Leave);
+    let events = block_on(app.step()).unwrap();
+    assert!(matches!(events.tick, Some(StackEvent::Left)));
+    assert!(app.awaiting_commissioning_request());
+    for _ in 0..50 {
+        block_on(app.step()).unwrap();
+    }
+    assert_eq!(
+        commissioning_attempts(&app.parts().diagnostics.events),
+        attempts_before
+    );
+
+    assert!(app.request_commissioning());
+    block_on(app.step()).unwrap();
+    assert_eq!(
+        commissioning_attempts(&app.parts().diagnostics.events),
+        attempts_before + 1
+    );
+}
+
+#[test]
+fn product_requested_reset_still_recommissions_immediately() {
+    let mut profile = profile();
+    let mut device = relay_device(&mut profile);
+    let mut security = security_store(false);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let parts = RouterParts::new(
+        NoStatus,
+        TestSupervisor::default(),
+        RecordingDiagnostics::default(),
+    );
+    let mut app = RelayRouterApp::new(node, NoChildren, &FAST_RETRY_POLICY, parts).unwrap();
+
+    block_on(app.initialize()).unwrap();
+    block_on(app.urgent_factory_reset_and_recommission()).unwrap();
+    assert!(!app.awaiting_commissioning_request());
+    let attempts_before = commissioning_attempts(&app.parts().diagnostics.events);
+    block_on(app.step()).unwrap();
+    assert_eq!(
+        commissioning_attempts(&app.parts().diagnostics.events),
+        attempts_before + 1
+    );
+}
+
+#[test]
+fn exhausted_device_annce_backs_off_instead_of_resetting_in_a_tight_loop() {
+    let mut profile = profile();
+    let mut device = parent_device(&mut profile);
+    script_fresh_router_join(&mut device);
+    // Association and Transport Key succeed; every Device_annce transmit fails.
+    device.mac_mut().set_tx_failures(u32::MAX);
+    let mut security = RamSecurityStateStore::new();
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let parts = RouterParts::new(
+        NoStatus,
+        TestSupervisor::default(),
+        RecordingDiagnostics::default(),
+    );
+    let mut app = ParentRouterApp::new(
+        node,
+        PersistentChildren::new(CountingChildStore::default()),
+        &POLICY,
+        parts,
+    )
+    .unwrap();
+
+    block_on(app.initialize()).unwrap();
+    assert!(
+        app.node()
+            .device()
+            .steering_diagnostics()
+            .device_annce_exhausted(),
+        "the scripted join must fail at Device_annce"
+    );
+    assert!(!app.node().device().is_joined());
+    assert!(!app.factory_reset_pending());
+    let events = &app.parts().diagnostics.events;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, DiagnosticEvent::FactoryReset))
+            .count(),
+        1,
+        "the partial join is discarded exactly once"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        DiagnosticEvent::RetryScheduled {
+            delay_ms: 5_000,
+            ..
+        }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::RetryScheduled { delay_ms: 0, .. })),
+        "a repeatable announce failure must not recommission immediately"
+    );
+    assert_eq!(commissioning_attempts(events), 1);
+
+    // The 5 s backoff is pending: bounded 20 ms steps do not start steering
+    // again, and no further factory reset (security journal write) happens.
+    for _ in 0..10 {
+        block_on(app.step()).unwrap();
+    }
+    let events = &app.parts().diagnostics.events;
+    assert_eq!(commissioning_attempts(events), 1);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, DiagnosticEvent::FactoryReset))
+            .count(),
+        1
+    );
+}
