@@ -510,30 +510,14 @@ impl Cc2340Mac {
     /// Whether `data` is the parent's indirect frame answering our poll: a
     /// data frame addressed exactly to us whose source is the coordinator.
     fn is_poll_response(&self, data: &[u8]) -> bool {
-        if data.len() < 3 || data[0] & 0x07 != 0x01 {
-            return false;
-        }
-        let fc = u16::from_le_bytes([data[0], data[1]]);
-        let (Some(dst), Some(src)) = (parse_dest_address(data, fc), parse_source_address(data, fc))
-        else {
-            return false;
-        };
-        if !frames::is_exact_destination(
-            &dst,
+        frames::is_parent_poll_response(
+            data,
             self.pan_id,
             self.short_address,
             &self.extended_address,
-        ) {
-            return false;
-        }
-        match src {
-            MacAddress::Short(pan, addr) => {
-                pan == self.pan_id && addr.0 < 0xFFF8 && addr == self.coord_short_address
-            }
-            MacAddress::Extended(_, addr) => {
-                self.coord_extended_address != [0; 8] && addr == self.coord_extended_address
-            }
-        }
+            self.coord_short_address,
+            &self.coord_extended_address,
+        )
     }
 
     /// Third-level filter and decode for `MCPS-DATA.indication`.

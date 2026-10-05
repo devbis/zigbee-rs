@@ -927,6 +927,43 @@ pub fn software_ack_sequence(
     is_exact_destination(&dst, our_pan, our_short, our_extended).then_some(data[2])
 }
 
+/// Decide whether `data` is the parent's indirect data frame answering our
+/// Data Request.
+///
+/// After a frame-pending ACK only a data frame whose destination names this
+/// node exactly and whose source is the coordinator (`macCoordShortAddress`
+/// in our PAN, or a configured `macCoordExtendedAddress`) completes the poll.
+/// Broadcasts and frames overheard from other nodes must be handled through
+/// the normal receive path; callers that wrap a poll result as "from the
+/// parent" would otherwise misattribute them.
+pub fn is_parent_poll_response(
+    data: &[u8],
+    our_pan: PanId,
+    our_short: ShortAddress,
+    our_extended: &IeeeAddress,
+    coord_short: ShortAddress,
+    coord_extended: &IeeeAddress,
+) -> bool {
+    if data.len() < 3 || data[0] & 0x07 != 0x01 {
+        return false;
+    }
+    let fc = u16::from_le_bytes([data[0], data[1]]);
+    if data.len() < 3 + addressing_size(fc) {
+        return false;
+    }
+    let (Some(dst), Some(src)) = (parse_dest_address(data, fc), parse_source_address(data, fc))
+    else {
+        return false;
+    };
+    if !is_exact_destination(&dst, our_pan, our_short, our_extended) {
+        return false;
+    }
+    match src {
+        MacAddress::Short(pan, addr) => pan == our_pan && addr.0 < 0xFFF8 && addr == coord_short,
+        MacAddress::Extended(_, addr) => *coord_extended != [0; 8] && addr == *coord_extended,
+    }
+}
+
 /// Build an Imm-Ack frame (FCS excluded) for `sequence`.
 pub const fn build_ack(sequence: u8, frame_pending: bool) -> [u8; 3] {
     [if frame_pending { 0x12 } else { 0x02 }, 0x00, sequence]
@@ -1622,5 +1659,67 @@ mod tests {
         // All-zero EUI and jitter still yields a live generator.
         let mut z = BackoffRng::new(&[0; 8], 0);
         assert_ne!(z.next_u32(), 0);
+    }
+
+    #[test]
+    fn parent_poll_response_requires_parent_source_and_exact_destination() {
+        let ext = [1, 2, 3, 4, 5, 6, 7, 8];
+        let pan = PanId(0x1234);
+        let short = ShortAddress(0x5678);
+        let parent = ShortAddress(0x0000);
+        // Data, AR, PAN compression, short dst 0x5678, short src 0x0000.
+        let from_parent = [0x61, 0x88, 0x42, 0x34, 0x12, 0x78, 0x56, 0x00, 0x00, 0xAA];
+        assert!(is_parent_poll_response(
+            &from_parent,
+            pan,
+            short,
+            &ext,
+            parent,
+            &[0; 8]
+        ));
+
+        // A neighbour router answering into our poll window is not the parent.
+        let mut neighbour = from_parent;
+        neighbour[7] = 0x01;
+        assert!(!is_parent_poll_response(
+            &neighbour, pan, short, &ext, parent, &[0; 8]
+        ));
+
+        // The parent's broadcast is not a poll response.
+        let mut broadcast = from_parent;
+        broadcast[5] = 0xFF;
+        broadcast[6] = 0xFF;
+        assert!(!is_parent_poll_response(
+            &broadcast, pan, short, &ext, parent, &[0; 8]
+        ));
+
+        // A MAC command (e.g. a stray association response) is not data.
+        let mut command = from_parent;
+        command[0] = 0x63;
+        assert!(!is_parent_poll_response(
+            &command, pan, short, &ext, parent, &[0; 8]
+        ));
+
+        // Truncated addressing never matches.
+        assert!(!is_parent_poll_response(
+            &from_parent[..6],
+            pan,
+            short,
+            &ext,
+            parent,
+            &[0; 8]
+        ));
+
+        // Extended destination (rejoin response queued by IEEE) from the
+        // parent's short address is accepted.
+        let mut by_ieee = heapless::Vec::<u8, 32>::new();
+        by_ieee
+            .extend_from_slice(&[0x61, 0x8C, 0x07, 0x34, 0x12])
+            .unwrap();
+        by_ieee.extend_from_slice(&ext).unwrap();
+        by_ieee.extend_from_slice(&[0x00, 0x00, 0x09]).unwrap();
+        assert!(is_parent_poll_response(
+            &by_ieee, pan, short, &ext, parent, &[0; 8]
+        ));
     }
 }
