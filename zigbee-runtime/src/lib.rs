@@ -4324,6 +4324,26 @@ mod resume_tests {
         args: &[u8],
         counter: u8,
     ) -> zigbee_mac::MacFrame {
+        cluster_command_frame_from(
+            (COORDINATOR, COORDINATOR_IEEE),
+            endpoint,
+            cluster,
+            command,
+            args,
+            counter,
+        )
+    }
+
+    /// A unicast cluster-specific command from `source` (short, IEEE) to
+    /// `endpoint` on `cluster`.
+    fn cluster_command_frame_from(
+        source: (ShortAddress, [u8; 8]),
+        endpoint: u8,
+        cluster: u16,
+        command: u8,
+        args: &[u8],
+        counter: u8,
+    ) -> zigbee_mac::MacFrame {
         let mut payload: heapless::Vec<u8, 32> = heapless::Vec::new();
         let [cluster_lo, cluster_hi] = cluster.to_le_bytes();
         payload
@@ -4336,13 +4356,61 @@ mod resume_tests {
             ])
             .unwrap();
         payload.extend_from_slice(args).unwrap();
-        nwk_frame(
+        nwk_frame_from(
             zigbee_nwk::frames::NwkFrameType::Data,
+            source.0,
+            source.1,
             ShortAddress(OUR_SHORT),
             &payload,
             u32::from(counter),
             true,
         )
+    }
+
+    /// A Zone Enroll Response enrolls the IAS Zone only when it comes from
+    /// the CIE written to `IAS_CIE_Address` (ZCL r8 §8.2.2.3.1).
+    #[test]
+    fn ias_zone_enrolls_only_on_a_response_from_its_cie() {
+        use zigbee_zcl::clusters::ias_zone::{
+            CMD_ZONE_ENROLL_RESPONSE, IasZoneCluster, ZONE_TYPE_CONTACT_SWITCH,
+        };
+
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .endpoint(1, 0x0104, crate::DeviceId::IAS_ZONE, |endpoint| {
+                endpoint.cluster_server(crate::ClusterId::IAS_ZONE)
+            })
+            .build();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        let mut zone = IasZoneCluster::new(ZONE_TYPE_CONTACT_SWITCH);
+        zone.set_cie_address(u64::from_le_bytes(COORDINATOR_IEEE));
+        let enroll = |device: &mut ZigbeeDevice<MockMac>,
+                      zone: &mut IasZoneCluster,
+                      source: (ShortAddress, [u8; 8]),
+                      counter: u8| {
+            let mut clusters = [crate::ClusterRef {
+                endpoint: 1,
+                cluster: zone,
+            }];
+            let frame = cluster_command_frame_from(
+                source,
+                1,
+                crate::ClusterId::IAS_ZONE.0,
+                CMD_ZONE_ENROLL_RESPONSE.0,
+                &[0x00, 0x07], // Success, ZoneID 7
+                counter,
+            );
+            block_on(device.process_incoming(&indication(frame), &mut clusters));
+        };
+
+        // Another node of the network is not the CIE.
+        enroll(&mut device, &mut zone, (ShortAddress(0x2345), [0x77; 8]), 1);
+        assert!(!zone.is_enrolled(), "only the CIE may enroll the zone");
+
+        enroll(&mut device, &mut zone, (COORDINATOR, COORDINATOR_IEEE), 2);
+        assert!(zone.is_enrolled());
+        assert_eq!(zone.get_zone_id(), 7);
     }
 
     /// Store Scene captures the endpoint's On/Off state and Recall Scene
@@ -13833,6 +13901,17 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.dispatch_application_zcl(clusters, &aps_indication, dst_ep, cluster_id, src_addr, dst)
     }
 
+    /// The IEEE address of `src` from the NWK neighbor table/address map,
+    /// or the Trust Center address for the coordinator (`0x0000`) of a
+    /// centralized-security network.
+    fn source_ieee(&self, src: ShortAddress) -> Option<u64> {
+        let ieee = self.bdb.zdo().nwk().find_ieee_by_short(src).or_else(|| {
+            let tc = self.bdb.zdo().aps().aib().aps_trust_center_address;
+            (src.0 == 0x0000 && tc != [0; 8] && tc != [0xFF; 8]).then_some(tc)
+        })?;
+        Some(u64::from_le_bytes(ieee))
+    }
+
     /// Deliver one application APS indication to the local ZCL dispatcher.
     ///
     /// Synchronous and `#[inline(never)]` so the fan-out loop and its locals
@@ -13870,6 +13949,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         if targets.is_empty() {
             rt_trace!("[RT] zcl_rx no member endpoint for dst_ep={}", dst_ep);
         }
+        // Only IAS Zone needs the sender's identity (Zone Enroll Response).
+        let src_ieee = if cluster_id == zigbee_zcl::ClusterId::IAS_ZONE.0 {
+            self.source_ieee(ShortAddress(src_addr))
+        } else {
+            None
+        };
         let mut event = None;
         for target in targets {
             let zcl_scratch = unsafe { &mut *self.scratch.zcl.get() };
@@ -13883,7 +13968,8 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 clusters,
                 zcl_scratch,
             )
-            .with_unicast(unicast);
+            .with_unicast(unicast)
+            .with_source_ieee(src_ieee);
             #[cfg(any(feature = "groups", test))]
             let ctx = ctx.with_group_table(self.bdb.zdo().aps().group_table());
             let outcome = ctx.dispatch(

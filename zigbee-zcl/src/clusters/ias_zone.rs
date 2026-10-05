@@ -292,6 +292,22 @@ impl Cluster for IasZoneCluster {
         }
     }
 
+    fn handle_command_from(
+        &mut self,
+        src_ieee: Option<u64>,
+        cmd_id: CommandId,
+        payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+        if cmd_id == CMD_ZONE_ENROLL_RESPONSE {
+            // Only the CIE may enroll the zone.
+            let src_ieee = src_ieee.ok_or(ZclStatus::Failure)?;
+            return self
+                .handle_enroll_response_from(src_ieee, payload)
+                .map(|()| heapless::Vec::new());
+        }
+        self.handle_command(cmd_id, payload)
+    }
+
     fn received_commands(&self) -> heapless::Vec<u8, 32> {
         let mut v = heapless::Vec::new();
         let _ = v.push(CMD_ZONE_ENROLL_RESPONSE.0);
@@ -358,6 +374,33 @@ mod tests {
         z.handle_enroll_response_from(CIE, &[0, 7]).unwrap();
         assert!(z.is_enrolled());
         assert_eq!(z.get_zone_id(), 7);
+    }
+
+    /// The dispatcher-facing `handle_command_from` gates Zone Enroll
+    /// Response on the CIE through `dyn Cluster`, and passes other commands
+    /// through unchanged.
+    #[test]
+    fn dyn_dispatch_enrolls_only_from_the_cie() {
+        let mut z = IasZoneCluster::new(ZONE_TYPE_CONTACT_SWITCH);
+        z.set_cie_address(CIE);
+        let cluster: &mut dyn Cluster = &mut z;
+        assert_eq!(
+            cluster.handle_command_from(None, CMD_ZONE_ENROLL_RESPONSE, &[0, 7]),
+            Err(ZclStatus::Failure)
+        );
+        assert_eq!(
+            cluster.handle_command_from(Some(CIE + 1), CMD_ZONE_ENROLL_RESPONSE, &[0, 7]),
+            Err(ZclStatus::Failure)
+        );
+        cluster
+            .handle_command_from(None, CMD_INITIATE_NORMAL_OP_MODE, &[])
+            .unwrap();
+        assert!(!z.is_enrolled());
+        let cluster: &mut dyn Cluster = &mut z;
+        cluster
+            .handle_command_from(Some(CIE), CMD_ZONE_ENROLL_RESPONSE, &[0, 7])
+            .unwrap();
+        assert!(z.is_enrolled());
     }
 
     #[test]

@@ -129,6 +129,9 @@ pub(crate) struct LocalZclCtx<'a, 'c, const N: usize> {
     /// Response to unicast commands, and the Groups cluster (§3.6.2.3)
     /// suppresses its responses to groupcast/broadcast requests.
     unicast: bool,
+    /// IEEE address of the sender when known: a Zone Enroll Response is only
+    /// accepted from the zone's CIE (ZCL r8 §8.2.2.3.1).
+    src_ieee: Option<u64>,
     /// APS group table: the group membership Scenes commands are checked
     /// against (ZCL r8 §3.7.2.4).
     #[cfg(any(feature = "groups", test))]
@@ -161,6 +164,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             clusters,
             zcl_scratch,
             unicast: true,
+            src_ieee: None,
             #[cfg(any(feature = "groups", test))]
             group_table: None,
             #[cfg(any(feature = "groups", test))]
@@ -168,6 +172,12 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             #[cfg(any(feature = "finding-binding", test))]
             fb_identify_target: None,
         }
+    }
+
+    /// The sender's IEEE address, when the caller could resolve it.
+    pub(crate) fn with_source_ieee(mut self, src_ieee: Option<u64>) -> Self {
+        self.src_ieee = src_ieee;
+        self
     }
 
     /// Mark the frame as groupcast/broadcast (`unicast == false`) so no
@@ -196,7 +206,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         cmd_id: CommandId,
         payload: &[u8],
     ) -> Option<Result<heapless::Vec<u8, 64>, ZclStatus>> {
-        use zigbee_zcl::clusters::SceneRole;
+        use zigbee_zcl::clusters::ClusterRole;
         use zigbee_zcl::clusters::scenes::{SceneCapable, SceneEndpoint};
 
         if !self.endpoint_has_server_cluster(endpoint, ClusterId::SCENES) {
@@ -209,9 +219,9 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             if cluster.endpoint != endpoint {
                 continue;
             }
-            match cluster.cluster.scene_role() {
-                SceneRole::Table(scenes) => table = Some(scenes),
-                SceneRole::State(capable) => {
+            match cluster.cluster.cluster_role() {
+                ClusterRole::SceneTable(scenes) => table = Some(scenes),
+                ClusterRole::SceneState(capable) => {
                     if state.push(capable).is_err() {
                         log::warn!(
                             "[Runtime] Scenes: extra scene cluster on ep {} ignored",
@@ -219,7 +229,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                         );
                     }
                 }
-                SceneRole::None => {}
+                ClusterRole::None => {}
             }
         }
         let groups = self.group_table;
@@ -1243,9 +1253,14 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             };
             #[cfg(not(any(feature = "groups", test)))]
             let result = None;
+            let src_ieee = self.src_ieee;
             if let Some(result) = result.or_else(|| {
                 self.with_cluster_mut(dst_ep, ClusterId(cluster_id), |cluster| {
-                    cluster.handle_command(CommandId(cmd_id), zcl_frame.payload.as_slice())
+                    cluster.handle_command_from(
+                        src_ieee,
+                        CommandId(cmd_id),
+                        zcl_frame.payload.as_slice(),
+                    )
                 })
             }) {
                 cluster_found = true;
