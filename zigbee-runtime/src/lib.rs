@@ -202,13 +202,20 @@ mod runtime_scratch_tests {
 fn unpack_nwk_indication(
     scratch_nwk: &mut [u8; 128],
     nwk_indication: Option<zigbee_nwk::nlde::NwkIndication<'_>>,
-) -> Option<(ShortAddress, ShortAddress, bool, Option<IeeeAddress>, usize)> {
+) -> Option<(
+    ShortAddress,
+    ShortAddress,
+    bool,
+    zigbee_aps::apsde::IncomingNwkSecurity,
+    usize,
+)> {
     let nwk = nwk_indication?;
-    let (payload, dst, src, security_use, security_source): (
+    let (payload, dst, src, security_use, security_source, src_ieee): (
         &[u8],
         ShortAddress,
         ShortAddress,
         bool,
+        Option<IeeeAddress>,
         Option<IeeeAddress>,
     ) = match &nwk {
         zigbee_nwk::nlde::NwkIndication::Borrowed(data) => (
@@ -217,6 +224,7 @@ fn unpack_nwk_indication(
             data.src_addr,
             data.security_use,
             data.security_source,
+            data.src_ieee,
         ),
         zigbee_nwk::nlde::NwkIndication::Owned(data) => (
             data.payload.as_slice(),
@@ -224,11 +232,19 @@ fn unpack_nwk_indication(
             data.src_addr,
             data.security_use,
             data.security_source,
+            data.src_ieee,
         ),
     };
     let len = payload.len().min(scratch_nwk.len());
     scratch_nwk[..len].copy_from_slice(&payload[..len]);
-    Some((dst, src, security_use, security_source, len))
+    // The auxiliary security header names the last hop; the NWK header
+    // extended source (when present) names the end-to-end originator that
+    // APS must authenticate commands such as Update-Device against.
+    let mut security = zigbee_aps::apsde::IncomingNwkSecurity::new(security_use, security_source);
+    if let Some(originator) = src_ieee {
+        security = security.with_originator(originator);
+    }
+    Some((dst, src, security_use, security, len))
 }
 
 /// Extract the APS routing metadata (destination endpoint, cluster and source
@@ -325,6 +341,7 @@ mod receive_stage_helper_tests {
             lqi: 200,
             security_use: true,
             security_source: Some(SRC_IEEE),
+            src_ieee: None,
         })
     }
 
@@ -336,6 +353,7 @@ mod receive_stage_helper_tests {
             lqi: 200,
             security_use: true,
             security_source: Some(SRC_IEEE),
+            src_ieee: None,
         })
     }
 
@@ -352,9 +370,41 @@ mod receive_stage_helper_tests {
         let ro = unpack_nwk_indication(&mut buf_o, Some(owned(&data))).unwrap();
 
         assert_eq!(rb, ro);
-        assert_eq!(rb, (DST, SRC, true, Some(SRC_IEEE), data.len()));
+        assert_eq!(
+            rb,
+            (
+                DST,
+                SRC,
+                true,
+                zigbee_aps::apsde::IncomingNwkSecurity::new(true, Some(SRC_IEEE)),
+                data.len()
+            )
+        );
         assert_eq!(&buf_b[..data.len()], &data[..]);
         assert_eq!(buf_b, buf_o);
+    }
+
+    /// The NWK header extended source (the end-to-end originator) is handed
+    /// to APS separately from the auxiliary-header last hop, so Update-Device
+    /// and other originator-checked commands relayed through a router are
+    /// attributed to the right device.
+    #[test]
+    fn nwk_header_extended_source_becomes_the_aps_originator() {
+        const ORIGINATOR: IeeeAddress = [9, 9, 9, 9, 9, 9, 9, 9];
+        let data = [0x01];
+        let mut buf = [0u8; 128];
+        let mut indication = borrowed(&data);
+        if let NwkIndication::Borrowed(ind) = &mut indication {
+            ind.src_ieee = Some(ORIGINATOR);
+        }
+
+        let (_, _, _, security, _) = unpack_nwk_indication(&mut buf, Some(indication)).unwrap();
+
+        assert_eq!(
+            security,
+            zigbee_aps::apsde::IncomingNwkSecurity::new(true, Some(SRC_IEEE))
+                .with_originator(ORIGINATOR)
+        );
     }
 
     /// A payload larger than the 128-byte NWK scratch is clamped to the buffer
@@ -12882,7 +12932,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             return event;
         }
 
-        let (dst, src, nwk_security, nwk_security_source, len) = {
+        let (dst, src, nwk_security, incoming_nwk_security, len) = {
             let scratch_nwk = unsafe { &mut *self.scratch.nwk.get() };
             match unpack_nwk_indication(scratch_nwk, nwk_indication) {
                 Some(v) => v,
@@ -12939,7 +12989,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 src,
                 dst,
                 indication.lqi,
-                zigbee_aps::apsde::IncomingNwkSecurity::new(nwk_security, nwk_security_source),
+                incoming_nwk_security,
                 aps_decrypt_buf,
                 defer_binding,
                 &mut commit,

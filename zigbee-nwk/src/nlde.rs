@@ -18,7 +18,13 @@ pub struct NldeDataIndication<'a> {
     pub payload: &'a [u8],
     pub lqi: u8,
     pub security_use: bool,
+    /// Auxiliary security header source: the device that applied NWK
+    /// security, i.e. the **last hop** of a relayed frame.
     pub security_source: Option<IeeeAddress>,
+    /// NWK header extended source (R22 §3.3.1.6): the end-to-end
+    /// originator's IEEE address, present only when the frame control's
+    /// extended-source bit was set.
+    pub src_ieee: Option<IeeeAddress>,
 }
 
 /// Owned NWK data indication — for decrypted frames where payload is owned.
@@ -29,7 +35,13 @@ pub struct NldeDataIndicationOwned {
     pub payload: heapless::Vec<u8, 128>,
     pub lqi: u8,
     pub security_use: bool,
+    /// Auxiliary security header source: the device that applied NWK
+    /// security, i.e. the **last hop** of a relayed frame.
     pub security_source: Option<IeeeAddress>,
+    /// NWK header extended source (R22 §3.3.1.6): the end-to-end
+    /// originator's IEEE address, present only when the frame control's
+    /// extended-source bit was set.
+    pub src_ieee: Option<IeeeAddress>,
 }
 
 /// Result of processing an incoming NWK frame.
@@ -1735,6 +1747,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 lqi,
                 security_use: false,
                 security_source: None,
+                src_ieee: header.src_ieee,
             })),
             NwkPayload::Decrypted {
                 payload,
@@ -1746,6 +1759,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 lqi,
                 security_use: true,
                 security_source: Some(security_source),
+                src_ieee: header.src_ieee,
             })),
         }
     }
@@ -5374,6 +5388,38 @@ mod tests {
             7,
             "each elapsed second ages the neighbour cache exactly once"
         );
+    }
+
+    #[test]
+    fn local_delivery_reports_the_nwk_header_extended_source() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        let mut header = frame(NwkFrameType::Data, PEER, OUR_ADDR);
+        header.frame_control.src_ieee_present = true;
+        header.src_ieee = Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &[0xAB], &mut buf);
+
+        match block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)) {
+            Some(NwkIndication::Borrowed(data)) => {
+                assert_eq!(
+                    data.src_ieee,
+                    Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+                    "the end-to-end originator comes from the NWK header"
+                );
+                assert_eq!(data.security_source, None);
+            }
+            other => panic!("expected local delivery, got {other:?}"),
+        }
+
+        let len = encode(
+            &frame(NwkFrameType::Data, PEER, OUR_ADDR),
+            &[0xAB],
+            &mut buf,
+        );
+        match block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)) {
+            Some(NwkIndication::Borrowed(data)) => assert_eq!(data.src_ieee, None),
+            other => panic!("expected local delivery, got {other:?}"),
+        }
     }
 
     #[test]
