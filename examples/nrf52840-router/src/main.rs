@@ -20,8 +20,9 @@ use {defmt_rtt as _, panic_probe as _};
 use embassy_executor::Spawner;
 use embassy_nrf::gpio;
 use embassy_nrf::{bind_interrupts, peripherals, radio, rng};
-use embassy_time::{Duration, Instant};
+use embassy_time::Instant;
 
+use nrf52840_router_product::button::{ButtonGesture, ButtonGestures};
 use nrf52840_router_product::status::StatusLedState;
 use router_app::{
     AlwaysOnEndDeviceApp, DiagnosticEvent, Diagnostics, NodeArchetype, RouterAppError, RouterParts,
@@ -33,8 +34,6 @@ use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::profile::ApplicationProfile;
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_zcl::clusters::basic::PowerSource;
-
-const FACTORY_RESET_HOLD: Duration = Duration::from_secs(3);
 
 struct DefmtLogger;
 
@@ -153,8 +152,12 @@ impl Diagnostics for DkRouterDiagnostics {
                 info!("Left network")
             }
             DiagnosticEvent::StackEvent(StackEventSummary::LeaveRequested) => {
-                info!("Leave requested; durable reset and recommission")
+                info!("Leave requested; durable reset to factory-new")
             }
+            DiagnosticEvent::AwaitingCommissioningRequest => {
+                info!("Factory-new after Leave; press Button 1 to commission")
+            }
+            DiagnosticEvent::CommissioningRequested => info!("Commissioning requested"),
             DiagnosticEvent::StackEvent(StackEventSummary::RejoinRequested) => {
                 info!("Secure rejoin requested")
             }
@@ -313,11 +316,13 @@ async fn main(_spawner: Spawner) {
         fatal(app.parts_mut(), error);
     }
 
-    let mut reset_pressed_at: Option<Instant> = None;
+    // Product-owned gestures: short press requests commissioning (needed
+    // after a Leave, when the app stays factory-new until asked), a
+    // three-second hold commits a factory reset.
+    let mut gestures = ButtonGestures::new();
     loop {
-        if button.is_low() {
-            let pressed_at = *reset_pressed_at.get_or_insert_with(Instant::now);
-            if pressed_at.elapsed() >= FACTORY_RESET_HOLD {
+        match gestures.sample(button.is_low(), Instant::now().as_millis()) {
+            Some(ButtonGesture::FactoryReset) => {
                 app.parts_mut().status.set(RouterStatus::Resetting {
                     archetype: NodeArchetype::AlwaysOnEndDevice,
                 });
@@ -331,8 +336,13 @@ async fn main(_spawner: Spawner) {
                     Err(error) => fatal(app.parts_mut(), error),
                 }
             }
-        } else {
-            reset_pressed_at = None;
+            Some(ButtonGesture::CommissioningRequest) => {
+                // Accepted requests are logged by the diagnostics adapter.
+                if !app.request_commissioning() {
+                    info!("Button 1 press ignored: joined or reset pending");
+                }
+            }
+            None => {}
         }
 
         // AlwaysOnEndDeviceApp bounds this receive/tick cycle to the product's 20 ms

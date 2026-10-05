@@ -1,13 +1,14 @@
 //! Product configuration for the nRF52840-DK always-on Zigbee End Device.
 //!
 //! The product owns its Zigbee identity, Range Extender profile, bounded
-//! always-on scheduling policy, semantic LED1 mapping, and the crash-safe
-//! security journal at the top of flash. Physical DK wiring remains in
-//! `boards/nrf52840-dk`; commissioning and runtime lifecycle remain in
-//! `apps/router`.
+//! always-on scheduling policy, semantic LED1 mapping, Button 1 gestures, and
+//! the crash-safe security journal at the top of flash. Physical DK wiring
+//! remains in `boards/nrf52840-dk`; commissioning and runtime lifecycle remain
+//! in `apps/router`.
 
 #![no_std]
 
+pub mod button;
 pub mod policy;
 pub mod profile;
 pub mod status;
