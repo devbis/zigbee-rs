@@ -17,6 +17,7 @@
 pub mod driver;
 mod rac_seq;
 
+use crate::frames::{self, parse_association_response, parse_mac_addresses};
 use crate::pib::{self, PibAttribute, PibPayload, PibValue};
 use crate::primitives::*;
 use crate::{MacCapabilities, MacDriver, MacError, PlatformServices};
@@ -76,6 +77,9 @@ pub struct Efr32Mac {
     /// Returned by the next mlme_poll() call.
     pending_assoc_frame: Option<([u8; 128], usize)>,
     scan_diagnostics: ScanDiagnostics,
+    /// CSMA-CA backoff PRNG state (xorshift32). Zero means "not yet seeded";
+    /// it is seeded lazily from the EUI-64 once the time driver is running.
+    rng_state: u32,
     #[cfg(all(feature = "hardware-aes-efr32mg1", target_arch = "arm"))]
     aes_engine: Option<efr32mg1_hal::crypto::AesEngine>,
 }
@@ -120,6 +124,7 @@ impl Efr32Mac {
             promiscuous: false,
             pending_assoc_frame: None,
             scan_diagnostics: ScanDiagnostics::default(),
+            rng_state: 0,
             #[cfg(all(feature = "hardware-aes-efr32mg1", target_arch = "arm"))]
             aes_engine: None,
         }
@@ -251,9 +256,26 @@ impl Efr32Mac {
         }
     }
 
-    /// Simple PRNG: deterministic hash from seed byte.
-    fn prng(seed: u8) -> u32 {
-        (seed as u32).wrapping_mul(1103515245).wrapping_add(12345)
+    /// Draw a CSMA-CA backoff count in `0..2^be`.
+    ///
+    /// The xorshift32 state is device-unique (seeded from the EUI-64) and is
+    /// re-mixed with the monotonic clock and the last CCA RSSI sample on every
+    /// draw, so nodes that start in lockstep do not keep colliding.
+    fn random_backoff(&mut self, be: u8) -> u32 {
+        let now = Instant::now().as_ticks();
+        if self.rng_state == 0 {
+            self.rng_state = csma_seed(&self.extended_address);
+        }
+        let (cca_rssi, _, _, _) = self.driver.cca_snapshot();
+        let noise = (now as u32) ^ ((now >> 32) as u32) ^ ((cca_rssi as u8 as u32) << 24);
+        self.rng_state = xorshift32(self.rng_state ^ noise);
+        backoff_slots(self.rng_state, be)
+    }
+
+    /// Accept a frame for this node (IEEE 802.15.4 third-level filtering).
+    fn accepts_destination(&self, dst: &MacAddress) -> bool {
+        self.promiscuous
+            || frames::frame_is_for_us(dst, self.pan_id, self.short_address, &self.extended_address)
     }
 
     /// Unslotted CSMA-CA + TX + ACK wait + retries.
@@ -277,13 +299,10 @@ impl Efr32Mac {
         for attempt in 0..=max_retries {
             // ── Unslotted CSMA-CA ──
             let mut nb: u8 = 0;
-            let mut be = self.min_be;
+            let mut be = self.min_be.min(self.max_be);
 
             let channel_clear = loop {
-                let max_val = (1u32 << be) - 1;
-                let seed = self.dsn.wrapping_add(nb).wrapping_add(attempt);
-                let random = Self::prng(seed);
-                let backoff = (random % (max_val + 1)) as u64;
+                let backoff = self.random_backoff(be) as u64;
                 let delay_us = backoff * UNIT_BACKOFF_SYMBOLS * SYMBOL_PERIOD_US;
                 if delay_us > 0 {
                     Timer::after_micros(delay_us).await;
@@ -299,8 +318,8 @@ impl Efr32Mac {
                     break true;
                 }
 
-                nb += 1;
-                be = core::cmp::min(be + 1, self.max_be);
+                nb = nb.saturating_add(1);
+                be = core::cmp::min(be.saturating_add(1), self.max_be);
                 if nb > self.max_csma_backoffs {
                     break false;
                 }
@@ -641,8 +660,11 @@ impl MacDriver for Efr32Mac {
                             continue;
                         }
 
-                        if (fc >> 5) & 1 != 0 {
-                            self.send_ack(data[2]).await;
+                        // Neither an Association Response for another joiner
+                        // nor a foreign data frame may be consumed here.
+                        let (_, dst, payload_offset, _) = parse_mac_addresses(data);
+                        if !self.accepts_destination(&dst) {
+                            continue;
                         }
 
                         if frame_type == 0x03 {
@@ -685,17 +707,17 @@ impl MacDriver for Efr32Mac {
                             }
                         }
 
-                        if frame_type == 0x01 && self.pending_assoc_frame.is_none() {
-                            let (_, _, payload_offset, _) = parse_mac_addresses(data);
-                            if data.len() > payload_offset {
-                                let payload = &data[payload_offset..];
-                                let copy_len = payload.len().min(128);
-                                // Reuse stack allocation from pending_assoc_frame tuple
-                                let mut buf = [0u8; 128];
-                                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                                self.pending_assoc_frame = Some((buf, copy_len));
-                                log::info!("efr32: saved post-assoc frame ({} bytes)", copy_len);
-                            }
+                        if frame_type == 0x01
+                            && self.pending_assoc_frame.is_none()
+                            && data.len() > payload_offset
+                        {
+                            let payload = &data[payload_offset..];
+                            let copy_len = payload.len().min(128);
+                            // Reuse stack allocation from pending_assoc_frame tuple
+                            let mut buf = [0u8; 128];
+                            buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                            self.pending_assoc_frame = Some((buf, copy_len));
+                            log::info!("efr32: saved post-assoc frame ({} bytes)", copy_len);
                         }
                     }
                 }
@@ -740,19 +762,10 @@ impl MacDriver for Efr32Mac {
                                 dst_str
                             );
                         }
-                        if (fc >> 5) & 1 != 0 {
-                            self.send_ack(data[2]).await;
-                        }
                         if frame_type == 0x01 {
                             let (_, dst, payload_offset, _) = parse_mac_addresses(data);
-                            // Save unicast data frames for us
-                            let for_us = match &dst {
-                                MacAddress::Short(_, a) => {
-                                    a.0 == self.short_address.0 || a.0 == 0xFFFF
-                                }
-                                MacAddress::Extended(_, e) => *e == self.extended_address,
-                            };
-                            if for_us && data.len() > payload_offset {
+                            // Save data frames for us (destination and PAN).
+                            if self.accepts_destination(&dst) && data.len() > payload_offset {
                                 let payload = &data[payload_offset..];
                                 let copy_len = payload.len().min(128);
                                 // Reuse stack allocation
@@ -1018,8 +1031,9 @@ impl MacDriver for Efr32Mac {
                         let frame_type = fc & 0x07;
 
                         if frame_type == 0x02 {
-                            let frame_pending = (data[0] >> 4) & 1 != 0;
-                            if !frame_pending {
+                            // Only an ACK for this Data Request may end the
+                            // window; foreign ACKs on the channel are ignored.
+                            if matching_ack_frame_pending(data, data_req[2]) == Some(false) {
                                 got_none = true;
                                 break;
                             }
@@ -1031,21 +1045,8 @@ impl MacDriver for Efr32Mac {
                         }
 
                         let (_src, dst, payload_offset, _security_use) = parse_mac_addresses(data);
-                        match &dst {
-                            MacAddress::Short(_, d) => {
-                                let for_us = d.0 == self.short_address.0
-                                    || d.0 == 0xFFFF
-                                    || d.0 == 0xFFFD
-                                    || d.0 == 0xFFFC;
-                                if !for_us {
-                                    continue;
-                                }
-                            }
-                            MacAddress::Extended(_, e) => {
-                                if *e != self.extended_address {
-                                    continue;
-                                }
-                            }
+                        if !self.accepts_destination(&dst) {
+                            continue;
                         }
 
                         if (fc >> 5) & 1 != 0 {
@@ -1102,15 +1103,17 @@ impl MacDriver for Efr32Mac {
         let ack_requested = req.tx_options.ack_tx;
 
         let seq = self.next_dsn();
-        let mac_frame = build_data_frame(
+        let mac_frame = frames::build_data_frame(
             seq,
-            self.pan_id,
-            &req.dst_address,
+            req.src_addr_mode,
             self.short_address,
+            &self.extended_address,
+            &req.dst_address,
             req.payload,
             ack_requested,
             req.tx_options.frame_pending,
-        );
+        )
+        .map_err(|_| MacError::FrameTooLong)?;
 
         self.csma_ca_transmit(&mac_frame, ack_requested).await?;
 
@@ -1161,43 +1164,25 @@ impl MacDriver for Efr32Mac {
                         continue;
                     }
 
-                    if (fc >> 5) & 1 != 0 {
-                        self.send_ack(data[2]).await;
-                    }
-
                     let (src_address, dst_address, payload_offset, security_use) =
                         parse_mac_addresses(data);
 
-                    if !self.promiscuous {
-                        match &dst_address {
-                            MacAddress::Short(pan, addr) => {
-                                let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
-                                let addr_ok = addr.0 == self.short_address.0
-                                    || addr.0 == 0xFFFF
-                                    || addr.0 == 0xFFFD
-                                    || addr.0 == 0xFFFC;
-                                if !pan_ok || !addr_ok {
-                                    #[cfg(feature = "efr32-trace")]
-                                    efr32_trace!(
-                                        "[MAC] rx FILTERED short: pan={:04X} addr={:04X} (me={:04X} pan={:04X})",
-                                        pan.0,
-                                        addr.0,
-                                        self.short_address.0,
-                                        self.pan_id.0
-                                    );
-                                    continue;
-                                }
-                            }
-                            MacAddress::Extended(pan, addr) => {
-                                let pan_ok = pan.0 == self.pan_id.0 || pan.0 == 0xFFFF;
-                                let addr_ok = *addr == self.extended_address;
-                                if !pan_ok || !addr_ok {
-                                    #[cfg(feature = "efr32-trace")]
-                                    efr32_trace!("[MAC] rx FILTERED ext: pan={:04X}", pan.0);
-                                    continue;
-                                }
-                            }
-                        }
+                    // Only 0xFFFF is a MAC broadcast; 0xFFFD/0xFFFC are NWK
+                    // values and never valid MAC destinations.
+                    if !self.accepts_destination(&dst_address) {
+                        #[cfg(feature = "efr32-trace")]
+                        efr32_trace!(
+                            "[MAC] rx FILTERED (me={:04X} pan={:04X})",
+                            self.short_address.0,
+                            self.pan_id.0
+                        );
+                        continue;
+                    }
+
+                    // The FRC IRQ already ACKed AR frames that passed the
+                    // hardware destination filter; send_ack is a no-op here.
+                    if (fc >> 5) & 1 != 0 {
+                        self.send_ack(data[2]).await;
                     }
 
                     if data.len() <= payload_offset {
@@ -1277,6 +1262,111 @@ mod tests {
         assert_eq!(matching_ack_frame_pending(&[0x11, 0x00, 7], 7), None);
     }
 
+    const OUR_EXT: IeeeAddress = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    const OTHER_EXT: IeeeAddress = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
+
+    fn association_response(dst: &IeeeAddress) -> heapless::Vec<u8, 32> {
+        // Command, AR, PAN compression, dst/src extended.
+        let mut rsp = heapless::Vec::new();
+        rsp.extend_from_slice(&[0x63, 0xCC, 0x05, 0x62, 0x1A])
+            .unwrap();
+        rsp.extend_from_slice(dst).unwrap();
+        rsp.extend_from_slice(&OTHER_EXT).unwrap();
+        rsp.extend_from_slice(&[0x02, 0x44, 0x33, 0x00]).unwrap();
+        rsp
+    }
+
+    #[test]
+    fn truncated_association_response_never_reads_out_of_bounds() {
+        let rsp = association_response(&OUR_EXT);
+        assert_eq!(
+            parse_association_response(&rsp),
+            Some((ShortAddress(0x3344), 0))
+        );
+        // The former local parser read data[offset + 3] after only checking
+        // offset + 3 <= len, panicking on a response without status byte.
+        for len in 0..rsp.len() {
+            assert_eq!(parse_association_response(&rsp[..len]), None);
+        }
+    }
+
+    #[test]
+    fn association_capture_rejects_responses_for_other_joiners() {
+        let unassociated = |rsp: &[u8]| {
+            let (_, dst, _, _) = parse_mac_addresses(rsp);
+            frames::frame_is_for_us(&dst, PanId(0xFFFF), ShortAddress(0xFFFF), &OUR_EXT)
+        };
+        assert!(unassociated(&association_response(&OUR_EXT)));
+        assert!(!unassociated(&association_response(&OTHER_EXT)));
+    }
+
+    #[test]
+    fn poll_rx_rejects_nwk_broadcast_mac_destinations() {
+        let pan = PanId(0x1A62);
+        let me = ShortAddress(0x3344);
+        for (addr, expected) in [
+            (0x3344, true),
+            (0xFFFF, true),
+            (0xFFFD, false),
+            (0xFFFC, false),
+        ] {
+            let dst = MacAddress::Short(pan, ShortAddress(addr));
+            assert_eq!(
+                frames::frame_is_for_us(&dst, pan, me, &OUR_EXT),
+                expected,
+                "dst {addr:#06X}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_frame_fcf_follows_destination_address_mode() {
+        let pan = PanId(0x1A62);
+        let build = |dst: MacAddress| {
+            frames::build_data_frame(
+                1,
+                AddressMode::Short,
+                ShortAddress(0x3344),
+                &OUR_EXT,
+                &dst,
+                &[0xAA],
+                true,
+                false,
+            )
+            .unwrap()
+        };
+        // Proven on-air short/short framing is byte-identical.
+        let short = build(MacAddress::Short(pan, ShortAddress(0x0000)));
+        assert_eq!(
+            short.as_slice(),
+            &[0x61, 0x88, 1, 0x62, 0x1A, 0x00, 0x00, 0x44, 0x33, 0xAA]
+        );
+        // Extended destination: FCF dst mode 3 and 8 address bytes.
+        let ext = build(MacAddress::Extended(pan, OTHER_EXT));
+        assert_eq!(u16::from_le_bytes([ext[0], ext[1]]), 0x8C61);
+        let (src, dst, offset, _) = parse_mac_addresses(&ext);
+        assert_eq!(dst, MacAddress::Extended(pan, OTHER_EXT));
+        assert_eq!(src, MacAddress::Short(pan, ShortAddress(0x3344)));
+        assert_eq!(&ext[offset..], &[0xAA]);
+    }
+
+    #[test]
+    fn csma_backoff_is_device_unique_and_bounded() {
+        assert_ne!(csma_seed(&OUR_EXT), csma_seed(&OTHER_EXT));
+        assert_ne!(csma_seed(&[0; 8]), 0);
+        let mut state = csma_seed(&OUR_EXT);
+        let mut seen = [false; 8];
+        for _ in 0..256 {
+            state = xorshift32(state);
+            assert_ne!(state, 0);
+            let slots = backoff_slots(state, 3);
+            assert!(slots < 8);
+            seen[slots as usize] = true;
+        }
+        assert!(seen.iter().all(|s| *s));
+        assert_eq!(backoff_slots(u32::MAX, 40), 255);
+    }
+
     #[test]
     fn acked_empty_poll_is_distinct_from_a_no_ack_poll() {
         // Parent ACKed at least one Data Request but had nothing pending:
@@ -1335,6 +1425,29 @@ fn matching_ack_frame_pending(frame: &[u8], sequence: u8) -> Option<bool> {
         return None;
     }
     Some(frame_control & 0x0010 != 0)
+}
+
+/// Device-unique non-zero xorshift32 seed derived from the EUI-64.
+fn csma_seed(eui64: &IeeeAddress) -> u32 {
+    let seed = u32::from_le_bytes([eui64[0], eui64[1], eui64[2], eui64[3]])
+        ^ u32::from_le_bytes([eui64[4], eui64[5], eui64[6], eui64[7]]).rotate_left(16)
+        ^ 0x9E37_79B9;
+    seed.max(1)
+}
+
+fn xorshift32(mut value: u32) -> u32 {
+    if value == 0 {
+        value = 0x9E37_79B9;
+    }
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    value
+}
+
+/// Map a random word onto `0..2^be` backoff periods (macMaxBE ≤ 8).
+fn backoff_slots(random: u32, be: u8) -> u32 {
+    random & ((1u32 << be.min(8)) - 1)
 }
 
 fn build_beacon_request(seq: u8) -> [u8; 8] {
@@ -1440,52 +1553,6 @@ fn build_data_request_ieee(
     frame
 }
 
-fn build_data_frame(
-    seq: u8,
-    pan_id: PanId,
-    dst: &MacAddress,
-    src_short: ShortAddress,
-    payload: &[u8],
-    ack: bool,
-    frame_pending: bool,
-) -> heapless::Vec<u8, 127> {
-    let mut frame: heapless::Vec<u8, 127> = heapless::Vec::new();
-
-    let mut fc: u16 = 0x8861; // data + dst short + src short + PAN compress
-    if frame_pending {
-        fc |= 0x0010;
-    }
-    if ack {
-        fc |= 0x0020;
-    }
-    let _ = frame.push(fc as u8);
-    let _ = frame.push((fc >> 8) as u8);
-    let _ = frame.push(seq);
-
-    let _ = frame.push(pan_id.0 as u8);
-    let _ = frame.push((pan_id.0 >> 8) as u8);
-    match dst {
-        MacAddress::Short(_, a) => {
-            let _ = frame.push(a.0 as u8);
-            let _ = frame.push((a.0 >> 8) as u8);
-        }
-        MacAddress::Extended(_, ext) => {
-            for b in ext {
-                let _ = frame.push(*b);
-            }
-        }
-    }
-
-    let _ = frame.push(src_short.0 as u8);
-    let _ = frame.push((src_short.0 >> 8) as u8);
-
-    for &b in payload {
-        let _ = frame.push(b);
-    }
-
-    frame
-}
-
 fn parse_beacon_frame(data: &[u8], channel: u8) -> Option<PanDescriptor> {
     // PHR is now stripped by the driver — data IS the PSDU
     let psdu = data;
@@ -1574,112 +1641,4 @@ fn parse_beacon_frame(data: &[u8], channel: u8) -> Option<PanDescriptor> {
         security_use: false,
         zigbee_beacon,
     })
-}
-
-fn parse_mac_addresses(data: &[u8]) -> (MacAddress, MacAddress, usize, bool) {
-    let default_addr = MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF));
-    if data.len() < 3 {
-        return (default_addr, default_addr, 0, false);
-    }
-
-    let fc = u16::from_le_bytes([data[0], data[1]]);
-    let security = (fc >> 3) & 1 != 0;
-    let pan_compress = (fc >> 6) & 1 != 0;
-    let dst_mode = (fc >> 10) & 0x03;
-    let src_mode = (fc >> 14) & 0x03;
-
-    let mut offset = 3;
-
-    let dst_pan = if dst_mode > 0 && offset + 2 <= data.len() {
-        let p = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        offset += 2;
-        PanId(p)
-    } else {
-        PanId(0xFFFF)
-    };
-
-    let dst_address = match dst_mode {
-        2 if offset + 2 <= data.len() => {
-            let a = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            offset += 2;
-            MacAddress::Short(dst_pan, ShortAddress(a))
-        }
-        3 if offset + 8 <= data.len() => {
-            let mut ext = [0u8; 8];
-            ext.copy_from_slice(&data[offset..offset + 8]);
-            offset += 8;
-            MacAddress::Extended(dst_pan, ext)
-        }
-        _ => default_addr,
-    };
-
-    let src_pan = if src_mode > 0 && !pan_compress && offset + 2 <= data.len() {
-        let p = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        offset += 2;
-        PanId(p)
-    } else {
-        dst_pan
-    };
-
-    let src_address = match src_mode {
-        2 if offset + 2 <= data.len() => {
-            let a = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            offset += 2;
-            MacAddress::Short(src_pan, ShortAddress(a))
-        }
-        3 if offset + 8 <= data.len() => {
-            let mut ext = [0u8; 8];
-            ext.copy_from_slice(&data[offset..offset + 8]);
-            offset += 8;
-            MacAddress::Extended(src_pan, ext)
-        }
-        _ => MacAddress::Short(src_pan, ShortAddress(0xFFFF)),
-    };
-
-    (src_address, dst_address, offset, security)
-}
-
-fn parse_association_response(data: &[u8]) -> Option<(ShortAddress, u8)> {
-    if data.len() < 5 {
-        return None;
-    }
-    let fc = u16::from_le_bytes([data[0], data[1]]);
-    if fc & 0x07 != 0x03 {
-        return None;
-    }
-
-    let dst_mode = (fc >> 10) & 0x03;
-    let src_mode = (fc >> 14) & 0x03;
-    let pan_compress = (fc >> 6) & 0x01;
-
-    let mut offset = 3;
-    if dst_mode > 0 {
-        offset += 2;
-    }
-    match dst_mode {
-        2 => offset += 2,
-        3 => offset += 8,
-        _ => {}
-    }
-    if src_mode > 0 && pan_compress == 0 {
-        offset += 2;
-    }
-    match src_mode {
-        2 => offset += 2,
-        3 => offset += 8,
-        _ => {}
-    }
-
-    if offset + 3 > data.len() {
-        return None;
-    }
-
-    if data[offset] != 0x02 {
-        return None;
-    }
-
-    let short = u16::from_le_bytes([data[offset + 1], data[offset + 2]]);
-    let status = data[offset + 3];
-
-    Some((ShortAddress(short), status))
 }
