@@ -257,6 +257,18 @@ impl<M: MacDriver> NwkLayer<M> {
     ///
     /// The key is resolved before a counter is drawn so a frame that cannot be
     /// encrypted never burns durably reserved counter space.
+    /// The active network key together with its own sequence number.
+    ///
+    /// Every NWK-secured transmission takes both from this one entry so the
+    /// auxiliary header's key sequence number always names the key CCM*
+    /// actually used, whatever `nib.active_key_seq_number` holds.
+    #[inline]
+    pub(crate) fn active_tx_key(&self) -> Option<(crate::security::AesKey, u8)> {
+        self.security
+            .active_key()
+            .map(|entry| (entry.key, entry.seq_number))
+    }
+
     pub(crate) fn build_nwk_frame(
         &mut self,
         header: &NwkHeader,
@@ -279,7 +291,9 @@ impl<M: MacDriver> NwkLayer<M> {
         if self.security.activation_pending {
             return Err(NwkStatus::NotPermitted);
         }
-        let Some(key) = self.security.active_key().map(|entry| entry.key) else {
+        // The key and the sequence number named in the auxiliary header come
+        // from the same active key entry, so they cannot diverge.
+        let Some((key, key_seq_number)) = self.active_tx_key() else {
             log::warn!("[NWK] No active network key for encryption");
             return Err(NwkStatus::NoKey);
         };
@@ -290,7 +304,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 .next_frame_counter()
                 .ok_or(NwkStatus::MaxFrmCounterReached)?,
             source_address: self.nib.ieee_address,
-            key_seq_number: self.nib.active_key_seq_number,
+            key_seq_number,
         };
         if hdr_len + crate::security::NWK_AUX_HEADER_LEN > buf.len() {
             return Err(NwkStatus::FrameTooLong);
@@ -3729,6 +3743,37 @@ mod tests {
             .build_nwk_frame(&header, payload, &mut bytes)
             .unwrap();
         heapless::Vec::from_slice(&bytes[..len]).unwrap()
+    }
+
+    #[test]
+    fn secured_transmissions_name_the_sequence_of_the_key_actually_used() {
+        // The NIB copy drifts (as public `nib_mut()` access allows); every
+        // secured sender must still name the active key entry's sequence.
+        let check = |nwk: &NwkLayer<MockMac>, index: usize| {
+            let bytes = nwk.mac.tx_history()[index].payload.as_slice();
+            let (_, header_len) = NwkHeader::parse(bytes).unwrap();
+            let (aux, _) = crate::security::NwkSecurityHeader::parse(&bytes[header_len..]).unwrap();
+            assert_eq!(aux.key_seq_number, KEY_SEQ);
+            let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+            receiver.joined = true;
+            assert!(block_on(receiver.process_incoming_nwk_frame(bytes, 42)).is_some());
+        };
+
+        let mut sender = secured_node(DeviceType::EndDevice, ORIGIN, ORIGIN_IEEE);
+        sender.nib.active_key_seq_number = KEY_SEQ.wrapping_add(9);
+        block_on(sender.nlde_data_request(OUR_ADDR, 5, &[0xAB], true, false)).unwrap();
+        check(&sender, 0);
+
+        let mut leaver = secured_node(DeviceType::EndDevice, ORIGIN, ORIGIN_IEEE);
+        leaver.nib.active_key_seq_number = KEY_SEQ.wrapping_add(9);
+        block_on(leaver.nlme_leave(false)).unwrap();
+        let (_, header_len) =
+            NwkHeader::parse(leaver.mac.tx_history()[0].payload.as_slice()).unwrap();
+        let (aux, _) = crate::security::NwkSecurityHeader::parse(
+            &leaver.mac.tx_history()[0].payload.as_slice()[header_len..],
+        )
+        .unwrap();
+        assert_eq!(aux.key_seq_number, KEY_SEQ);
     }
 
     #[test]
