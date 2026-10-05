@@ -27,6 +27,11 @@
 //! snapshot first and the security-state record last, so a power cut cannot
 //! activate a partial generation.
 //!
+//! Every generation number is written once. If a marginal commit nevertheless
+//! leaves two committed records with the same generation, the scan resolves
+//! them deterministically and never lowers an outgoing-counter reservation
+//! (see `resolve_duplicate_generation`).
+//!
 //! The default 4 KiB logical sector has 32 slots and can represent all 112
 //! replay domains of a router build, but a completely populated snapshot uses
 //! 28 replay slots plus one state slot. Only three slots (12 frame commits)
@@ -307,20 +312,74 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
                 let Some((generation, state)) = Self::decode_record(&record) else {
                     continue;
                 };
-                let replace = match newest {
-                    Some(current) => generation > current.generation,
-                    None => true,
+                let candidate = LocatedState {
+                    generation,
+                    sector,
+                    state,
                 };
-                if replace {
-                    newest = Some(LocatedState {
-                        generation,
-                        sector,
-                        state,
-                    });
-                }
+                newest = Some(match newest {
+                    None => candidate,
+                    Some(current) if generation > current.generation => candidate,
+                    Some(current) if generation == current.generation => {
+                        Self::resolve_duplicate_generation(current, candidate)
+                    }
+                    Some(current) => current,
+                });
             }
         }
         Ok(newest)
+    }
+
+    /// Choose between two committed records that carry the same generation.
+    ///
+    /// The writer assigns every generation exactly once, so a duplicate only
+    /// appears after a marginal commit write that failed verification, was
+    /// retried under the same generation and later read back as committed.
+    /// The journal cannot tell which copy the runtime acted on, so:
+    ///
+    /// * the result is independent of scan order: the copy with the larger
+    ///   `(global_counter_limit, tclk_counter_limit)` reservation wins, then
+    ///   the later physical position (sector, then slot), and
+    /// * the outgoing-counter reservations never move backwards: the chosen
+    ///   copy's global (and, for the same TCLK, TCLK) limits are raised to
+    ///   the larger of the two, because either reservation may have been
+    ///   used for transmission.
+    ///
+    /// Reporting `Corrupt` instead would also block `store()`, so a factory
+    /// reset could no longer write a fresh record and the device would need
+    /// an external flash erase to recover.
+    fn resolve_duplicate_generation(first: LocatedState, second: LocatedState) -> LocatedState {
+        if first.state == second.state {
+            return first;
+        }
+        let rank = |located: &LocatedState| {
+            (
+                located.state.global_counter_limit,
+                located.state.tclk_counter_limit,
+            )
+        };
+        // The scan visits sector 0 before sector 1 and lower slots first, so
+        // `second` is always the later physical position.
+        let (mut chosen, other) = if rank(&first) > rank(&second) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        chosen.state.global_counter_limit = chosen
+            .state
+            .global_counter_limit
+            .max(other.state.global_counter_limit);
+        if chosen.state.tclk_present
+            && other.state.tclk_present
+            && chosen.state.trust_center_address == other.state.trust_center_address
+            && chosen.state.trust_center_link_key == other.state.trust_center_link_key
+        {
+            chosen.state.tclk_counter_limit = chosen
+                .state
+                .tclk_counter_limit
+                .max(other.state.tclk_counter_limit);
+        }
+        chosen
     }
 
     fn current(&mut self) -> Result<Option<LocatedState>, SecurityStoreError> {
@@ -1614,6 +1673,76 @@ mod tests {
         journal.store(&state(0x400)).unwrap();
         journal.store(&state(0x800)).unwrap();
         assert_eq!(journal.load().unwrap().unwrap().global_counter_limit, 0x800);
+    }
+
+    /// Two committed copies of one generation, one per sector, as left by a
+    /// marginal commit that was retried under the same generation.
+    fn duplicate_generation_journal(
+        sector0: &PersistentSecurityState,
+        sector1: &PersistentSecurityState,
+    ) -> SecurityStateJournal<MockFlash> {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.store(sector0).unwrap();
+        journal.write_record(1, 0, 0, sector1).unwrap();
+        journal.storage_mut();
+        journal
+    }
+
+    #[test]
+    fn duplicate_generations_resolve_deterministically_without_lowering_counters() {
+        let mut high_global = commissioned_state();
+        high_global.global_counter_limit = 0x800;
+        high_global.tclk_counter_limit = 0x100;
+        high_global.parent_address = 0x1111;
+        let mut high_tclk = commissioned_state();
+        high_tclk.global_counter_limit = 0x400;
+        high_tclk.tclk_counter_limit = 0x900;
+        high_tclk.parent_address = 0x2222;
+
+        let mut expected = high_global;
+        expected.tclk_counter_limit = 0x900;
+        for (sector0, sector1) in [(&high_global, &high_tclk), (&high_tclk, &high_global)] {
+            let mut journal = duplicate_generation_journal(sector0, sector1);
+            assert_eq!(
+                journal.load(),
+                Ok(Some(expected)),
+                "the larger global reservation must win in either physical order, \
+                 keeping the larger TCLK reservation for the same link key"
+            );
+        }
+
+        // A different TCLK keeps its own reservation.
+        let mut other_tclk = high_tclk;
+        other_tclk.trust_center_link_key = [9; 16];
+        let mut journal = duplicate_generation_journal(&other_tclk, &high_global);
+        let mut expected = high_global;
+        expected.tclk_counter_limit = 0x100;
+        assert_eq!(journal.load(), Ok(Some(expected)));
+
+        // Equal reservations: the later physical copy wins, independent of content.
+        let mut later = high_global;
+        later.parent_address = 0x3333;
+        let mut journal = duplicate_generation_journal(&high_global, &later);
+        assert_eq!(journal.load(), Ok(Some(later)));
+    }
+
+    #[test]
+    fn duplicate_generation_is_superseded_by_the_next_store() {
+        let mut first = commissioned_state();
+        first.global_counter_limit = 0x800;
+        let mut second = commissioned_state();
+        second.global_counter_limit = 0x400;
+        second.parent_address = 0x2222;
+        let mut journal = duplicate_generation_journal(&first, &second);
+        let resolved = journal.load().unwrap().unwrap();
+        assert_eq!(resolved, first);
+
+        let mut next = resolved;
+        next.global_counter_limit = 0xC00;
+        journal.store(&next).unwrap();
+        journal.storage_mut();
+        assert_eq!(journal.load(), Ok(Some(next)));
     }
 
     #[test]
