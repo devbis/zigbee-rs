@@ -317,14 +317,14 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
                     sector,
                     state,
                 };
-                newest = Some(match newest {
-                    None => candidate,
-                    Some(current) if generation > current.generation => candidate,
+                match &mut newest {
+                    None => newest = Some(candidate),
+                    Some(current) if generation > current.generation => *current = candidate,
                     Some(current) if generation == current.generation => {
-                        Self::resolve_duplicate_generation(current, candidate)
+                        Self::resolve_duplicate_generation(current, &candidate)
                     }
-                    Some(current) => current,
-                });
+                    Some(_) => {}
+                }
             }
         }
         Ok(newest)
@@ -348,9 +348,12 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
     /// Reporting `Corrupt` instead would also block `store()`, so a factory
     /// reset could no longer write a fresh record and the device would need
     /// an external flash erase to recover.
-    fn resolve_duplicate_generation(first: LocatedState, second: LocatedState) -> LocatedState {
+    ///
+    /// `first` (the earlier physical position) is updated in place to the
+    /// chosen copy; `second` is the later one.
+    fn resolve_duplicate_generation(first: &mut LocatedState, second: &LocatedState) {
         if first.state == second.state {
-            return first;
+            return;
         }
         let rank = |located: &LocatedState| {
             (
@@ -358,28 +361,28 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
                 located.state.tclk_counter_limit,
             )
         };
-        // The scan visits sector 0 before sector 1 and lower slots first, so
-        // `second` is always the later physical position.
-        let (mut chosen, other) = if rank(&first) > rank(&second) {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        chosen.state.global_counter_limit = chosen
+        // Both merges are symmetric, so compute them before choosing.
+        let global_counter_limit = first
             .state
             .global_counter_limit
-            .max(other.state.global_counter_limit);
-        if chosen.state.tclk_present
-            && other.state.tclk_present
-            && chosen.state.trust_center_address == other.state.trust_center_address
-            && chosen.state.trust_center_link_key == other.state.trust_center_link_key
-        {
-            chosen.state.tclk_counter_limit = chosen
-                .state
-                .tclk_counter_limit
-                .max(other.state.tclk_counter_limit);
+            .max(second.state.global_counter_limit);
+        let same_tclk = first.state.tclk_present
+            && second.state.tclk_present
+            && first.state.trust_center_address == second.state.trust_center_address
+            && first.state.trust_center_link_key == second.state.trust_center_link_key;
+        let tclk_counter_limit = first
+            .state
+            .tclk_counter_limit
+            .max(second.state.tclk_counter_limit);
+        // The scan visits sector 0 before sector 1 and lower slots first, so
+        // `second` is always the later physical position.
+        if rank(first) <= rank(second) {
+            *first = *second;
         }
-        chosen
+        first.state.global_counter_limit = global_counter_limit;
+        if same_tclk {
+            first.state.tclk_counter_limit = tclk_counter_limit;
+        }
     }
 
     fn current(&mut self) -> Result<Option<LocatedState>, SecurityStoreError> {
