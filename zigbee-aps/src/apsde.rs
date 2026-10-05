@@ -1031,10 +1031,10 @@ impl<M: MacDriver> ApsLayer<M> {
             let end = (start + APS_MAX_PAYLOAD).min(req.payload.len());
             let chunk = &req.payload[start..end];
 
-            let (fragmentation, ack_bitfield) = if block_num == 0 {
-                (FRAG_FIRST, Some(0u8))
+            let fragmentation = if block_num == 0 {
+                FRAG_FIRST
             } else {
-                (FRAG_SUBSEQUENT, None)
+                FRAG_SUBSEQUENT
             };
 
             let frag_header = ApsHeader {
@@ -1071,7 +1071,7 @@ impl<M: MacDriver> ApsLayer<M> {
                     } else {
                         block_num
                     },
-                    ack_bitfield,
+                    ack_bitfield: None,
                 }),
             };
 
@@ -1146,10 +1146,10 @@ impl<M: MacDriver> ApsLayer<M> {
             let end = (start + APS_MAX_PAYLOAD).min(req.payload.len());
             let chunk = &req.payload[start..end];
 
-            let (fragmentation, ack_bitfield) = if block_num == 0 {
-                (FRAG_FIRST, Some(0u8))
+            let fragmentation = if block_num == 0 {
+                FRAG_FIRST
             } else {
-                (FRAG_SUBSEQUENT, None)
+                FRAG_SUBSEQUENT
             };
 
             let frag_header = ApsHeader {
@@ -1186,7 +1186,7 @@ impl<M: MacDriver> ApsLayer<M> {
                     } else {
                         block_num
                     },
-                    ack_bitfield,
+                    ack_bitfield: None,
                 }),
             };
 
