@@ -29,3 +29,5 @@ ASSERT(ORIGIN(BOOT_STATE) + LENGTH(BOOT_STATE) == 0x00100000,
   "PCA10059 UF2 MBR params/settings must occupy the top two pages");
 ASSERT(ORIGIN(RAM) + LENGTH(RAM) == 0x20040000,
   "PCA10059 UF2 RAM map must cover the full 256 KiB");
+ASSERT(_stack_start - __euninit >= 16K,
+  "nRF52840 PCA10059 static data must leave at least 16 KiB for the stack");
