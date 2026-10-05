@@ -903,6 +903,37 @@ enum EventControl {
     Stop,
 }
 
+/// When the next commissioning attempt may run.
+///
+/// A concrete deadline is held only while it is pending: once observed due it
+/// collapses to [`RetrySchedule::Due`], so a deadline left behind while joined
+/// or while a secured rejoin was pending can never alias into the future after
+/// the 32-bit microsecond counter wraps (half range is about 35.8 minutes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrySchedule {
+    Due,
+    At(u32),
+    /// Factory-new after an explicit Leave: no automatic network search until
+    /// the composition root calls `request_commissioning` (or power-cycles).
+    AwaitingRequest,
+}
+
+/// What follows a committed factory reset.
+///
+/// Ordered by precedence: when several reasons are requested before the reset
+/// commits, the most conservative one wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AfterReset {
+    /// Product-requested or recovery reset: steer again immediately.
+    Recommission,
+    /// A failed commissioning attempt left a partial join behind: keep the
+    /// exponential backoff instead of restarting immediately.
+    Backoff,
+    /// Explicit Leave without rejoin (or Trust Center Remove-Device): stay
+    /// factory-new and wait for an explicit commissioning request.
+    AwaitRequest,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaveCascadeControl {
     Inactive,
@@ -923,13 +954,14 @@ where
     policy: &'static RouterPolicy,
     parts: RouterParts<St, Sv, D>,
     last_tick_us: u32,
-    retry_deadline_us: u32,
+    retry: RetrySchedule,
     retry_delay_ms: u32,
     commissioning_attempts: u32,
     secure_rejoin_failures: u8,
     run_again_deadline_us: Option<u32>,
     last_identifying: Option<bool>,
     pending_factory_reset: bool,
+    after_reset: AfterReset,
     pending_security_indication_commit: bool,
     pending_child_lifecycle_replay_commit: bool,
     initialized: bool,
@@ -992,13 +1024,14 @@ where
             policy,
             parts,
             last_tick_us: now,
-            retry_deadline_us: now,
+            retry: RetrySchedule::Due,
             retry_delay_ms: policy.join_retry_initial_ms,
             commissioning_attempts: 0,
             secure_rejoin_failures: 0,
             run_again_deadline_us: None,
             last_identifying: None,
             pending_factory_reset: false,
+            after_reset: AfterReset::Recommission,
             pending_security_indication_commit: false,
             pending_child_lifecycle_replay_commit: false,
             initialized: false,
@@ -1041,9 +1074,32 @@ where
             wait_us = wait_us.min(Self::remaining_us(now, deadline));
         }
         if include_retry {
-            wait_us = wait_us.min(Self::remaining_us(now, self.retry_deadline_us));
+            match self.retry {
+                RetrySchedule::Due => wait_us = 0,
+                RetrySchedule::At(deadline) => {
+                    wait_us = wait_us.min(Self::remaining_us(now, deadline));
+                }
+                RetrySchedule::AwaitingRequest => {}
+            }
         }
         wait_us
+    }
+
+    /// Whether a commissioning attempt is due now. A due concrete deadline is
+    /// consumed (collapsed to [`RetrySchedule::Due`]) so it cannot alias into
+    /// the future after a counter wrap.
+    fn retry_due(&mut self) -> bool {
+        match self.retry {
+            RetrySchedule::Due => true,
+            RetrySchedule::At(deadline) => {
+                let due = Self::deadline_due(self.now_us(), deadline);
+                if due {
+                    self.retry = RetrySchedule::Due;
+                }
+                due
+            }
+            RetrySchedule::AwaitingRequest => false,
+        }
     }
 
     fn elapsed_tick_secs(&mut self) -> u16 {
@@ -1329,6 +1385,9 @@ where
         self.tombstone_retired_core_key_replay_counters()?;
         self.node.reset_remote_reporting();
         self.retry_delay_ms = self.policy.join_retry_initial_ms;
+        // Any older deadline is consumed: a later network loss must not
+        // compare against it after the microsecond counter wraps.
+        self.retry = RetrySchedule::Due;
         self.secure_rejoin_failures = 0;
         self.run_again_deadline_us = None;
         self.last_tick_us = self.now_us();
@@ -1349,7 +1408,7 @@ where
 
     fn schedule_failed_attempt(&mut self) {
         let delay_ms = self.retry_delay_ms;
-        self.retry_deadline_us = self.now_us().wrapping_add(delay_ms.saturating_mul(1_000));
+        self.retry = RetrySchedule::At(self.now_us().wrapping_add(delay_ms.saturating_mul(1_000)));
         self.parts
             .diagnostics
             .record(DiagnosticEvent::RetryScheduled {
@@ -1369,7 +1428,7 @@ where
 
     fn schedule_immediate_recommission(&mut self) {
         self.retry_delay_ms = self.policy.join_retry_initial_ms;
-        self.retry_deadline_us = self.now_us();
+        self.retry = RetrySchedule::Due;
         self.run_again_deadline_us = None;
         self.last_identifying = None;
         self.parts
@@ -1402,7 +1461,64 @@ where
         Ok(())
     }
 
-    fn request_factory_reset(&mut self) {
+    /// Stay factory-new until the composition root explicitly requests
+    /// commissioning. Used after an explicit Leave without rejoin.
+    fn await_commissioning_request(&mut self) {
+        self.retry_delay_ms = self.policy.join_retry_initial_ms;
+        self.retry = RetrySchedule::AwaitingRequest;
+        self.run_again_deadline_us = None;
+        self.last_identifying = None;
+        self.parts
+            .diagnostics
+            .record(DiagnosticEvent::AwaitingCommissioningRequest);
+        self.set_status(RouterStatus::Starting { archetype: K::ID });
+    }
+
+    /// Explicit commissioning request (normally a button press).
+    ///
+    /// Clears a post-Leave wait and any running backoff so Network Steering
+    /// (or formation) runs on the next step. Returns `false` and does nothing
+    /// while joined or while a factory reset is still pending.
+    fn request_commissioning(&mut self) -> bool {
+        if self.pending_factory_reset || self.node.device().is_joined() {
+            return false;
+        }
+        self.parts
+            .diagnostics
+            .record(DiagnosticEvent::CommissioningRequested);
+        self.schedule_immediate_recommission();
+        true
+    }
+
+    const fn awaiting_commissioning_request(&self) -> bool {
+        matches!(self.retry, RetrySchedule::AwaitingRequest)
+    }
+
+    /// Follow-up for a Leave without rejoin.
+    ///
+    /// A joining node (router, relay, always-on End Device) stays factory-new
+    /// and waits for an explicit commissioning request: a coordinator-issued
+    /// Mgmt_Leave/Leave without rejoin or a Trust Center Remove-Device means
+    /// "removed from the network", so it must not search again on its own.
+    /// The runtime reports a local `UserAction::Leave`/`FactoryReset` with the
+    /// same `Left` event; composition roots that want an immediate fresh
+    /// search use [`Self::urgent_factory_reset_and_recommission`] or
+    /// [`Self::request_commissioning`]. A forming PAN coordinator is never
+    /// removed by a parent, so it re-forms immediately.
+    const fn after_leave() -> AfterReset {
+        if matches!(K::ID, NodeArchetype::Coordinator) {
+            AfterReset::Recommission
+        } else {
+            AfterReset::AwaitRequest
+        }
+    }
+
+    fn request_factory_reset(&mut self, after: AfterReset) {
+        self.after_reset = if self.pending_factory_reset {
+            self.after_reset.max(after)
+        } else {
+            after
+        };
         self.pending_factory_reset = true;
         self.run_again_deadline_us = None;
         self.last_identifying = None;
@@ -1424,7 +1540,13 @@ where
         result?;
         self.pending_factory_reset = false;
         self.secure_rejoin_failures = 0;
-        self.schedule_immediate_recommission();
+        match core::mem::replace(&mut self.after_reset, AfterReset::Recommission) {
+            AfterReset::Recommission => self.schedule_immediate_recommission(),
+            // Keep the doubled delay: a repeatable failure must not turn into
+            // a tight reset/steer loop with a journal write per iteration.
+            AfterReset::Backoff => self.schedule_failed_attempt(),
+            AfterReset::AwaitRequest => self.await_commissioning_request(),
+        }
         self.parts.supervisor.heartbeat();
         Ok(())
     }
@@ -1438,7 +1560,7 @@ where
     /// composition root call the operation before [`Self::step`] even when an
     /// older retry deadline is already due.
     async fn urgent_factory_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
-        self.request_factory_reset();
+        self.request_factory_reset(AfterReset::Recommission);
         self.complete_pending_factory_reset_and_recommission().await
     }
 
@@ -1484,7 +1606,7 @@ where
                 failures: self.secure_rejoin_failures,
             });
         self.secure_rejoin_failures = 0;
-        self.request_factory_reset();
+        self.request_factory_reset(AfterReset::Recommission);
         Ok(())
     }
 
@@ -1527,7 +1649,11 @@ where
                         .steering_diagnostics()
                         .device_annce_exhausted()
                     {
-                        self.request_factory_reset();
+                        // The association, network key and counter
+                        // reservation survive a failed announce and must be
+                        // discarded before steering again, but the retry
+                        // stays on the exponential backoff.
+                        self.request_factory_reset(AfterReset::Backoff);
                         return Ok(());
                     }
                     self.schedule_failed_attempt();
@@ -1585,7 +1711,7 @@ where
                 Ok(EventControl::Continue)
             }
             StackEvent::Left => {
-                self.request_factory_reset();
+                self.request_factory_reset(Self::after_leave());
                 Ok(EventControl::Stop)
             }
             StackEvent::AttributeReport { .. } => Ok(EventControl::Continue),
@@ -1646,7 +1772,7 @@ where
             // subsequent maintenance tick.
             StackEvent::BasicResetToFactoryDefaults => Ok(EventControl::Stop),
             StackEvent::LeaveRequested => {
-                self.request_factory_reset();
+                self.request_factory_reset(Self::after_leave());
                 Ok(EventControl::Stop)
             }
             StackEvent::RejoinRequested => {
@@ -1710,7 +1836,7 @@ where
                 return Ok(events);
             }
             LeaveCascadeControl::Completed { rejoin: false } => {
-                self.request_factory_reset();
+                self.request_factory_reset(Self::after_leave());
                 return Ok(events);
             }
             LeaveCascadeControl::Progress => {}
@@ -1780,7 +1906,7 @@ where
                 return Ok(events);
             }
             LeaveCascadeControl::Completed { rejoin: false } => {
-                self.request_factory_reset();
+                self.request_factory_reset(Self::after_leave());
                 return Ok(events);
             }
             LeaveCascadeControl::Progress => {}
@@ -1826,9 +1952,10 @@ where
         let mut events = StepEvents::default();
         self.parts.supervisor.heartbeat();
 
-        if !self.node.device().secure_rejoin_pending()
-            && Self::deadline_due(self.now_us(), self.retry_deadline_us)
-        {
+        // Evaluate (and consume) the deadline on every unjoined step, also
+        // while a secured rejoin is pending, so it cannot age past half range.
+        let retry_due = self.retry_due();
+        if !self.node.device().secure_rejoin_pending() && retry_due {
             await_out_of_line!(self.attempt_start())?;
             self.parts.supervisor.heartbeat();
             return Ok(events);
@@ -2047,6 +2174,23 @@ where
         self.core.urgent_factory_reset_and_recommission().await
     }
 
+    /// Explicitly request commissioning, normally from a button press.
+    ///
+    /// After a Leave without rejoin (or Trust Center Remove-Device) the node
+    /// stays factory-new and performs no automatic network search until this
+    /// is called. It also clears a running retry backoff so the next
+    /// [`Self::step`] attempts immediately. Returns `false` while joined or
+    /// while a factory reset is still pending.
+    pub fn request_commissioning(&mut self) -> bool {
+        self.core.request_commissioning()
+    }
+
+    /// Whether the node is factory-new after a Leave and waits for
+    /// [`Self::request_commissioning`].
+    pub const fn awaiting_commissioning_request(&self) -> bool {
+        self.core.awaiting_commissioning_request()
+    }
+
     pub async fn step(&mut self) -> Result<StepEvents, RouterAppError> {
         self.core.step().await
     }
@@ -2167,6 +2311,23 @@ where
     /// the security journal reset has completed.
     pub async fn urgent_factory_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
         self.core.urgent_factory_reset_and_recommission().await
+    }
+
+    /// Explicitly request commissioning, normally from a button press.
+    ///
+    /// After a Leave without rejoin (or Trust Center Remove-Device) the node
+    /// stays factory-new and performs no automatic network search until this
+    /// is called. It also clears a running retry backoff so the next
+    /// [`Self::step`] attempts immediately. Returns `false` while joined or
+    /// while a factory reset is still pending.
+    pub fn request_commissioning(&mut self) -> bool {
+        self.core.request_commissioning()
+    }
+
+    /// Whether the node is factory-new after a Leave and waits for
+    /// [`Self::request_commissioning`].
+    pub const fn awaiting_commissioning_request(&self) -> bool {
+        self.core.awaiting_commissioning_request()
     }
 
     pub async fn step(&mut self) -> Result<StepEvents, RouterAppError> {
@@ -2308,6 +2469,23 @@ where
     /// before the next `step()` can begin steering.
     pub async fn urgent_factory_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
         self.core.urgent_factory_reset_and_recommission().await
+    }
+
+    /// Explicitly request commissioning, normally from a button press.
+    ///
+    /// After a Leave without rejoin (or Trust Center Remove-Device) the node
+    /// stays factory-new and performs no automatic network search until this
+    /// is called. It also clears a running retry backoff so the next
+    /// [`Self::step`] attempts immediately. Returns `false` while joined or
+    /// while a factory reset is still pending.
+    pub fn request_commissioning(&mut self) -> bool {
+        self.core.request_commissioning()
+    }
+
+    /// Whether the node is factory-new after a Leave and waits for
+    /// [`Self::request_commissioning`].
+    pub const fn awaiting_commissioning_request(&self) -> bool {
+        self.core.awaiting_commissioning_request()
     }
 
     pub async fn step(&mut self) -> Result<StepEvents, RouterAppError> {
@@ -2558,6 +2736,16 @@ where
         self.trust_center
             .clear(self.coordinator.node_mut().device_mut())?;
         Ok(())
+    }
+
+    /// See [`CoordinatorApp::request_commissioning`].
+    pub fn request_commissioning(&mut self) -> bool {
+        self.coordinator.request_commissioning()
+    }
+
+    /// See [`CoordinatorApp::awaiting_commissioning_request`].
+    pub const fn awaiting_commissioning_request(&self) -> bool {
+        self.coordinator.awaiting_commissioning_request()
     }
 
     pub async fn step_deferred_factory_reset(&mut self) -> Result<StepEvents, RouterAppError> {
@@ -3005,6 +3193,23 @@ where
         self.core.urgent_factory_reset_and_recommission().await
     }
 
+    /// Explicitly request commissioning, normally from a button press.
+    ///
+    /// After a Leave without rejoin (or Trust Center Remove-Device) the node
+    /// stays factory-new and performs no automatic network search until this
+    /// is called. It also clears a running retry backoff so the next
+    /// [`Self::step`] attempts immediately. Returns `false` while joined or
+    /// while a factory reset is still pending.
+    pub fn request_commissioning(&mut self) -> bool {
+        self.core.request_commissioning()
+    }
+
+    /// Whether the node is factory-new after a Leave and waits for
+    /// [`Self::request_commissioning`].
+    pub const fn awaiting_commissioning_request(&self) -> bool {
+        self.core.awaiting_commissioning_request()
+    }
+
     pub async fn step(&mut self) -> Result<StepEvents, RouterAppError> {
         self.core.step().await
     }
@@ -3185,6 +3390,23 @@ where
 
     pub async fn urgent_factory_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
         self.core.urgent_factory_reset_and_recommission().await
+    }
+
+    /// Explicitly request commissioning, normally from a button press.
+    ///
+    /// After a Leave without rejoin (or Trust Center Remove-Device) the node
+    /// stays factory-new and performs no automatic network search until this
+    /// is called. It also clears a running retry backoff so the next
+    /// [`Self::step`] attempts immediately. Returns `false` while joined or
+    /// while a factory reset is still pending.
+    pub fn request_commissioning(&mut self) -> bool {
+        self.core.request_commissioning()
+    }
+
+    /// Whether the node is factory-new after a Leave and waits for
+    /// [`Self::request_commissioning`].
+    pub const fn awaiting_commissioning_request(&self) -> bool {
+        self.core.awaiting_commissioning_request()
     }
 
     pub async fn step(&mut self) -> Result<StepEvents, RouterAppError> {
