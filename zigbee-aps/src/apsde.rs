@@ -3182,16 +3182,31 @@ impl<M: MacDriver> ApsLayer<M> {
         }
         // Only APSDE data registers secured retries. Security commands have
         // AR=0, so key-transport/key-load derivation cannot occur here.
-        let key = self.security.key_for_origin(&security.origin)?;
-        let frame_counter = self.next_frame_counter_for(&security.origin)?;
+        let (header, payload) = plaintext_frame.split_at(header_len);
+        self.secure_with_origin(&security.origin, security.src_ieee, header, payload)
+    }
+
+    /// Secure `header || payload` with the current key of `origin` and a
+    /// fresh outgoing frame counter of that key, using the default extended
+    /// nonce with `src_ieee` as the auxiliary-header source address.
+    ///
+    /// Shared by APS retransmissions and secured APS acknowledgements.
+    #[inline(never)]
+    fn secure_with_origin(
+        &mut self,
+        origin: &crate::security::ApsKeyOrigin,
+        src_ieee: IeeeAddress,
+        header: &[u8],
+        payload: &[u8],
+    ) -> Option<heapless::Vec<u8, 128>> {
+        let key = self.security.key_for_origin(origin)?;
+        let frame_counter = self.next_frame_counter_for(origin)?;
         let sec_hdr = crate::security::ApsSecurityHeader {
             security_control: crate::security::ApsSecurityHeader::APS_DEFAULT_EXT_NONCE,
             frame_counter,
-            source_address: Some(security.src_ieee),
+            source_address: Some(src_ieee),
             key_seq_number: None,
         };
-
-        let (header, payload) = plaintext_frame.split_at(header_len);
         self.assemble_secured_frame(header, payload, &key, &sec_hdr)
     }
 
@@ -3325,33 +3340,20 @@ impl<M: MacDriver> ApsLayer<M> {
             None => return Ok(()),
         };
 
-        let aps_counter = ack_info.aps_counter;
         let aps_secured = ack_info.aps_security.is_some() && !ack_info.command;
         let mut buf = [0u8; 16];
         let hdr_len = build_aps_ack_header(&ack_info, aps_secured).serialize(&mut buf);
 
         let secured_frame;
-        let frame: &[u8] = if aps_secured {
-            let origin = ack_info.aps_security.ok_or(ApsStatus::SecurityFail)?;
-            let key = self
-                .security
-                .key_for_origin(&origin)
-                .ok_or(ApsStatus::SecurityFail)?;
-            let frame_counter = self
-                .next_frame_counter_for(&origin)
-                .ok_or(ApsStatus::SecurityFail)?;
-            let sec_hdr = crate::security::ApsSecurityHeader {
-                security_control: crate::security::ApsSecurityHeader::APS_DEFAULT_EXT_NONCE,
-                frame_counter,
-                source_address: Some(self.nwk.nib().ieee_address),
-                key_seq_number: None,
-            };
-            secured_frame = self
-                .assemble_secured_frame(&buf[..hdr_len], &[], &key, &sec_hdr)
-                .ok_or(ApsStatus::SecurityFail)?;
-            &secured_frame
-        } else {
-            &buf[..hdr_len]
+        let frame: &[u8] = match ack_info.aps_security {
+            Some(origin) if aps_secured => {
+                let src_ieee = self.nwk.nib().ieee_address;
+                secured_frame = self
+                    .secure_with_origin(&origin, src_ieee, &buf[..hdr_len], &[])
+                    .ok_or(ApsStatus::SecurityFail)?;
+                &secured_frame
+            }
+            _ => &buf[..hdr_len],
         };
 
         let radius = self.nwk.nib().max_depth.saturating_mul(2);
@@ -3363,7 +3365,7 @@ impl<M: MacDriver> ApsLayer<M> {
 
         log::debug!(
             "[APS] Sent ACK (counter={}) to 0x{:04X}",
-            aps_counter,
+            ack_info.aps_counter,
             ack_info.dst_addr.0
         );
         Ok(())
