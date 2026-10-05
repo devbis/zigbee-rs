@@ -202,6 +202,10 @@ impl AttributeStoreMutAccess for OnOffCluster {
 }
 
 impl Cluster for OnOffCluster {
+    fn scene_role(&mut self) -> super::SceneRole<'_> {
+        super::SceneRole::State(self)
+    }
+
     fn cluster_id(&self) -> ClusterId {
         ClusterId::ON_OFF
     }

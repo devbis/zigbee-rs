@@ -58,6 +58,18 @@ pub mod window_covering;
 use crate::attribute::AttributeStore;
 use crate::{ClusterId, CommandId, ZclStatus};
 
+/// How a cluster takes part in scenes (ZCL r8 §3.7), reachable through a
+/// `dyn Cluster` so an endpoint dispatcher can hand the Scenes cluster the
+/// other clusters of its endpoint.
+pub enum SceneRole<'a> {
+    /// Not involved in scenes.
+    None,
+    /// The endpoint's scene table.
+    Table(&'a mut scenes::ScenesCluster),
+    /// A cluster whose state is stored in and recalled from scenes.
+    State(&'a mut dyn scenes::SceneCapable),
+}
+
 /// Trait that all cluster implementations must satisfy.
 pub trait Cluster {
     /// The cluster identifier for this cluster.
@@ -81,6 +93,13 @@ pub trait Cluster {
     /// Command IDs this cluster can receive (client→server).
     fn received_commands(&self) -> heapless::Vec<u8, 32> {
         heapless::Vec::new()
+    }
+
+    /// This cluster's part in scenes. A cluster implementing
+    /// [`scenes::SceneCapable`] returns [`SceneRole::State`] so its state is
+    /// captured by Store Scene and restored by Recall Scene.
+    fn scene_role(&mut self) -> SceneRole<'_> {
+        SceneRole::None
     }
 
     /// Command IDs this cluster can generate (server→client).

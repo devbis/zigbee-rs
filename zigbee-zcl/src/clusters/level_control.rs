@@ -151,6 +151,10 @@ impl LevelControlCluster {
 }
 
 impl Cluster for LevelControlCluster {
+    fn scene_role(&mut self) -> super::SceneRole<'_> {
+        super::SceneRole::State(self)
+    }
+
     fn cluster_id(&self) -> ClusterId {
         ClusterId::LEVEL_CONTROL
     }

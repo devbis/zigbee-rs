@@ -4315,6 +4315,168 @@ mod resume_tests {
         )
     }
 
+    /// A unicast cluster-specific command to `endpoint` on `cluster`.
+    #[cfg(feature = "groups")]
+    fn cluster_command_frame(
+        endpoint: u8,
+        cluster: u16,
+        command: u8,
+        args: &[u8],
+        counter: u8,
+    ) -> zigbee_mac::MacFrame {
+        let mut payload: heapless::Vec<u8, 32> = heapless::Vec::new();
+        let [cluster_lo, cluster_hi] = cluster.to_le_bytes();
+        payload
+            .extend_from_slice(&[
+                0x00, // APS FC: data frame, unicast
+                endpoint, cluster_lo, cluster_hi, 0x04, 0x01, // HA profile
+                0x01, // source endpoint
+                counter, 0x01, // ZCL FC: cluster-specific, client→server
+                counter, command,
+            ])
+            .unwrap();
+        payload.extend_from_slice(args).unwrap();
+        nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &payload,
+            u32::from(counter),
+            true,
+        )
+    }
+
+    /// Store Scene captures the endpoint's On/Off state and Recall Scene
+    /// restores it, for a group the endpoint joined over ZCL; a group the
+    /// endpoint is not a member of is refused (ZCL r8 §3.7.2.4).
+    #[test]
+    #[cfg(feature = "groups")]
+    fn scenes_store_and_recall_the_endpoint_state_for_member_groups() {
+        use zigbee_zcl::clusters::Cluster;
+        use zigbee_zcl::clusters::groups::{CMD_ADD_GROUP, GroupsCluster};
+        use zigbee_zcl::clusters::on_off::{ATTR_ON_OFF, CMD_OFF, CMD_ON, OnOffCluster};
+        use zigbee_zcl::clusters::scenes::{CMD_RECALL_SCENE, CMD_STORE_SCENE, ScenesCluster};
+        use zigbee_zcl::data_types::ZclValue;
+
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .endpoint(1, 0x0104, crate::DeviceId::ON_OFF_LIGHT, |endpoint| {
+                endpoint
+                    .cluster_server(crate::ClusterId::IDENTIFY)
+                    .cluster_server(crate::ClusterId::GROUPS)
+                    .cluster_server(crate::ClusterId::SCENES)
+                    .cluster_server(crate::ClusterId::ON_OFF)
+            })
+            .build();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        let mut groups = GroupsCluster::new();
+        let mut scenes = ScenesCluster::new();
+        let mut on_off = OnOffCluster::new();
+        let mut counter = 1u8;
+        let mut send = |device: &mut ZigbeeDevice<MockMac>,
+                        groups: &mut GroupsCluster,
+                        scenes: &mut ScenesCluster,
+                        on_off: &mut OnOffCluster,
+                        cluster: u16,
+                        command: u8,
+                        args: &[u8]| {
+            let mut clusters = [
+                crate::ClusterRef {
+                    endpoint: 1,
+                    cluster: groups,
+                },
+                crate::ClusterRef {
+                    endpoint: 1,
+                    cluster: scenes,
+                },
+                crate::ClusterRef {
+                    endpoint: 1,
+                    cluster: on_off,
+                },
+            ];
+            let frame = if cluster == crate::ClusterId::GROUPS.0 {
+                groups_command_frame(1, command, Some(0x0010), counter, u32::from(counter))
+            } else {
+                cluster_command_frame(1, cluster, command, args, counter)
+            };
+            counter += 1;
+            block_on(device.process_incoming(&indication(frame), &mut clusters));
+        };
+        let on = |cluster: &OnOffCluster| cluster.attributes().get(ATTR_ON_OFF).cloned();
+        let scenes_id = crate::ClusterId::SCENES.0;
+        let on_off_id = crate::ClusterId::ON_OFF.0;
+
+        send(
+            &mut device,
+            &mut groups,
+            &mut scenes,
+            &mut on_off,
+            crate::ClusterId::GROUPS.0,
+            CMD_ADD_GROUP.0,
+            &[],
+        );
+        assert_eq!(device.bdb.zdo().aps().group_member_endpoints(0x0010), &[1]);
+
+        send(
+            &mut device,
+            &mut groups,
+            &mut scenes,
+            &mut on_off,
+            on_off_id,
+            CMD_ON.0,
+            &[],
+        );
+        assert_eq!(on(&on_off), Some(ZclValue::Bool(true)));
+        // Store scene 3 of group 0x0010 while on.
+        send(
+            &mut device,
+            &mut groups,
+            &mut scenes,
+            &mut on_off,
+            scenes_id,
+            CMD_STORE_SCENE.0,
+            &[0x10, 0x00, 0x03],
+        );
+        assert_eq!(scenes.scene_count(), 1);
+
+        send(
+            &mut device,
+            &mut groups,
+            &mut scenes,
+            &mut on_off,
+            on_off_id,
+            CMD_OFF.0,
+            &[],
+        );
+        assert_eq!(on(&on_off), Some(ZclValue::Bool(false)));
+        send(
+            &mut device,
+            &mut groups,
+            &mut scenes,
+            &mut on_off,
+            scenes_id,
+            CMD_RECALL_SCENE.0,
+            &[0x10, 0x00, 0x03],
+        );
+        assert_eq!(
+            on(&on_off),
+            Some(ZclValue::Bool(true)),
+            "Recall Scene restores the stored On/Off state"
+        );
+
+        // Group 0x0011 has no member endpoint here: nothing is stored.
+        send(
+            &mut device,
+            &mut groups,
+            &mut scenes,
+            &mut on_off,
+            scenes_id,
+            CMD_STORE_SCENE.0,
+            &[0x11, 0x00, 0x04],
+        );
+        assert_eq!(scenes.scene_count(), 1);
+    }
+
     /// End to end: Add Group received over ZCL puts the endpoint into the
     /// APS group table, so APS stops dropping that group and the runtime
     /// fans the frame out to the member endpoint only; Remove Group and
@@ -4442,17 +4604,19 @@ mod resume_tests {
     /// rather than advertised and silently never receiving a groupcast.
     #[test]
     #[cfg(not(feature = "groups"))]
-    fn groups_server_is_refused_without_the_groups_feature() {
+    fn groups_and_scenes_servers_are_refused_without_the_groups_feature() {
         let device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
             .endpoint(1, 0x0104, crate::DeviceId::ON_OFF_LIGHT, |endpoint| {
                 endpoint
                     .cluster_server(crate::ClusterId::IDENTIFY)
                     .cluster_server(crate::ClusterId::GROUPS)
+                    .cluster_server(crate::ClusterId::SCENES)
             })
             .build();
         let servers = &device.endpoints[0].server_clusters;
         assert!(servers.contains(&crate::ClusterId::IDENTIFY));
         assert!(!servers.contains(&crate::ClusterId::GROUPS));
+        assert!(!servers.contains(&crate::ClusterId::SCENES));
     }
 
     #[test]
@@ -13709,7 +13873,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         let mut event = None;
         for target in targets {
             let zcl_scratch = unsafe { &mut *self.scratch.zcl.get() };
-            let outcome = zcl_dispatch::LocalZclCtx::new(
+            let ctx = zcl_dispatch::LocalZclCtx::new(
                 &self.endpoints,
                 &mut self.basic_cluster,
                 &mut self.identify_clusters,
@@ -13719,8 +13883,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 clusters,
                 zcl_scratch,
             )
-            .with_unicast(unicast)
-            .dispatch(
+            .with_unicast(unicast);
+            #[cfg(any(feature = "groups", test))]
+            let ctx = ctx.with_group_table(self.bdb.zdo().aps().group_table());
+            let outcome = ctx.dispatch(
                 target,
                 aps_indication.src_endpoint,
                 cluster_id,

@@ -129,6 +129,10 @@ pub(crate) struct LocalZclCtx<'a, 'c, const N: usize> {
     /// Response to unicast commands, and the Groups cluster (§3.6.2.3)
     /// suppresses its responses to groupcast/broadcast requests.
     unicast: bool,
+    /// APS group table: the group membership Scenes commands are checked
+    /// against (ZCL r8 §3.7.2.4).
+    #[cfg(any(feature = "groups", test))]
+    group_table: Option<&'a zigbee_aps::group::GroupTable>,
     #[cfg(any(feature = "groups", test))]
     group_action: Option<GroupTableAction>,
     #[cfg(any(feature = "finding-binding", test))]
@@ -158,6 +162,8 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
             zcl_scratch,
             unicast: true,
             #[cfg(any(feature = "groups", test))]
+            group_table: None,
+            #[cfg(any(feature = "groups", test))]
             group_action: None,
             #[cfg(any(feature = "finding-binding", test))]
             fb_identify_target: None,
@@ -169,6 +175,63 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
     pub(crate) fn with_unicast(mut self, unicast: bool) -> Self {
         self.unicast = unicast;
         self
+    }
+
+    /// Check Scenes group arguments against the APS group table.
+    #[cfg(any(feature = "groups", test))]
+    pub(crate) fn with_group_table(mut self, table: &'a zigbee_aps::group::GroupTable) -> Self {
+        self.group_table = Some(table);
+        self
+    }
+
+    /// Run a Scenes command against the endpoint's scene table with the
+    /// endpoint's scene-capable clusters and group membership, so Store
+    /// Scene captures and Recall Scene restores their state (ZCL r8 §3.7).
+    ///
+    /// `None` when the endpoint has no Scenes server.
+    #[cfg(any(feature = "groups", test))]
+    fn handle_scenes_command(
+        &mut self,
+        endpoint: u8,
+        cmd_id: CommandId,
+        payload: &[u8],
+    ) -> Option<Result<heapless::Vec<u8, 64>, ZclStatus>> {
+        use zigbee_zcl::clusters::SceneRole;
+        use zigbee_zcl::clusters::scenes::{SceneCapable, SceneEndpoint};
+
+        if !self.endpoint_has_server_cluster(endpoint, ClusterId::SCENES) {
+            return None;
+        }
+        let mut table = None;
+        // OnOff, Level Control and Color Control.
+        let mut state = heapless::Vec::<&mut dyn SceneCapable, 4>::new();
+        for cluster in self.clusters.iter_mut() {
+            if cluster.endpoint != endpoint {
+                continue;
+            }
+            match cluster.cluster.scene_role() {
+                SceneRole::Table(scenes) => table = Some(scenes),
+                SceneRole::State(capable) => {
+                    if state.push(capable).is_err() {
+                        log::warn!(
+                            "[Runtime] Scenes: extra scene cluster on ep {} ignored",
+                            endpoint
+                        );
+                    }
+                }
+                SceneRole::None => {}
+            }
+        }
+        let groups = self.group_table;
+        let is_member = |group: u16| groups.is_some_and(|table| table.is_member(group, endpoint));
+        Some(table?.handle_command_with(
+            cmd_id,
+            payload,
+            &mut SceneEndpoint {
+                clusters: &mut state,
+                is_member: &is_member,
+            },
+        ))
     }
 
     /// Queue a Default Response for the received command when ZCL r8
@@ -1172,8 +1235,18 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
                 None;
             let mut cluster_found = false;
 
-            if let Some(result) = self.with_cluster_mut(dst_ep, ClusterId(cluster_id), |cluster| {
-                cluster.handle_command(CommandId(cmd_id), zcl_frame.payload.as_slice())
+            #[cfg(any(feature = "groups", test))]
+            let result = if cluster_id == ClusterId::SCENES.0 {
+                self.handle_scenes_command(dst_ep, CommandId(cmd_id), zcl_frame.payload.as_slice())
+            } else {
+                None
+            };
+            #[cfg(not(any(feature = "groups", test)))]
+            let result = None;
+            if let Some(result) = result.or_else(|| {
+                self.with_cluster_mut(dst_ep, ClusterId(cluster_id), |cluster| {
+                    cluster.handle_command(CommandId(cmd_id), zcl_frame.payload.as_slice())
+                })
             }) {
                 cluster_found = true;
                 // Status carried by a Groups Add/Remove response (byte 0).

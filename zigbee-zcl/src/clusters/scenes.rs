@@ -509,6 +509,10 @@ impl ScenesCluster {
 }
 
 impl Cluster for ScenesCluster {
+    fn scene_role(&mut self) -> super::SceneRole<'_> {
+        super::SceneRole::Table(self)
+    }
+
     fn cluster_id(&self) -> ClusterId {
         ClusterId::SCENES
     }

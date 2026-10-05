@@ -904,10 +904,15 @@ impl EndpointBuilder {
     /// while the Groups cluster acknowledged Add Group. A Groups server is
     /// therefore refused (not advertised, commands answer
     /// UNSUPPORTED_CLUSTER) instead of silently never receiving groupcasts.
+    /// So is a Scenes server, which depends on the endpoint's group
+    /// membership (ZCL r8 §3.7.1) and is only given its endpoint's clusters
+    /// to store and recall with the `groups` feature.
     pub fn cluster_server(mut self, cluster_id: ClusterId) -> Self {
         #[cfg(not(feature = "groups"))]
-        if cluster_id == ClusterId::GROUPS {
-            log::warn!("EndpointBuilder: Groups server needs the `groups` feature; not added");
+        if matches!(cluster_id, ClusterId::GROUPS | ClusterId::SCENES) {
+            log::warn!(
+                "EndpointBuilder: Groups/Scenes server needs the `groups` feature; not added"
+            );
             return self;
         }
         if self.server_clusters.push(cluster_id).is_err() {
