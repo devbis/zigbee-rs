@@ -59,7 +59,10 @@ struct OutgoingApsSecurity {
 #[derive(Debug, Clone, Copy)]
 struct IncomingCommandSecurity {
     nwk_secured: bool,
+    /// Last hop that applied NWK security (auxiliary header source).
     nwk_source: Option<IeeeAddress>,
+    /// End-to-end originator named by the NWK header source.
+    nwk_originator: Option<IeeeAddress>,
     aps_secured: bool,
     aps_source: Option<IeeeAddress>,
     aps_key_identifier: Option<u8>,
@@ -764,15 +767,35 @@ pub struct ApsdeDataIndication<'a> {
 // ── APS frame buffer for parsed indication ──────────────────────
 
 /// NWK authentication metadata accompanying an APS payload.
+///
+/// `source` is the IEEE address from the NWK auxiliary security header:
+/// the device that applied NWK security, i.e. the **last hop** (every
+/// relay re-secures the frame). The end-to-end originator is identified by
+/// the NWK header source; supply its IEEE address with
+/// [`Self::with_originator`] when the NWK header carried the extended source
+/// (R22 §3.3.1.6). Without it, APS resolves the originator from the NWK
+/// source short address.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IncomingNwkSecurity {
     secured: bool,
     source: Option<IeeeAddress>,
+    originator: Option<IeeeAddress>,
 }
 
 impl IncomingNwkSecurity {
     pub const fn new(secured: bool, source: Option<IeeeAddress>) -> Self {
-        Self { secured, source }
+        Self {
+            secured,
+            source,
+            originator: None,
+        }
+    }
+
+    /// Attach the originator's IEEE address taken from the NWK header
+    /// extended source field (not the auxiliary security header).
+    pub const fn with_originator(mut self, originator: IeeeAddress) -> Self {
+        self.originator = Some(originator);
+        self
     }
 }
 
@@ -1406,6 +1429,7 @@ impl<M: MacDriver> ApsLayer<M> {
                 let command_security = IncomingCommandSecurity {
                     nwk_secured: nwk_security.secured,
                     nwk_source: nwk_security.source,
+                    nwk_originator: self.nwk_originator(nwk_src, nwk_security),
                     aps_secured,
                     aps_source: aps_security_source,
                     aps_key_identifier,
@@ -1867,12 +1891,14 @@ impl<M: MacDriver> ApsLayer<M> {
         &mut self,
         security: IncomingCommandSecurity,
     ) -> Option<IeeeAddress> {
-        // NWK authenticates the last relay, whereas APS authenticates the
-        // end-to-end command originator.
+        // APS security authenticates the end-to-end command originator. NWK
+        // security only proves that the last relay holds the network key, so
+        // the auxiliary header source is a relay for any multi-hop frame; the
+        // command source is the NWK header source (the originator).
         let source = if security.aps_secured {
             security.aps_source
         } else {
-            security.nwk_source
+            security.nwk_originator
         };
         let Some(source) = source else {
             self.ignore_security_command();
@@ -1883,6 +1909,28 @@ impl<M: MacDriver> ApsLayer<M> {
             return None;
         }
         Some(source)
+    }
+
+    /// IEEE address of the NWK originator (`nwk_src`): the NWK header
+    /// extended source when supplied, otherwise the neighbour table entry for
+    /// the short address, otherwise — for 0x0000 — the centralized Trust
+    /// Center. `None` when the originator cannot be identified; the NWK
+    /// auxiliary-header source (last hop) is never substituted.
+    fn nwk_originator(
+        &self,
+        nwk_src: ShortAddress,
+        nwk_security: IncomingNwkSecurity,
+    ) -> Option<IeeeAddress> {
+        nwk_security
+            .originator
+            .or_else(|| self.nwk.find_ieee_by_short(nwk_src))
+            .or_else(|| {
+                (nwk_src == ShortAddress::COORDINATOR)
+                    .then(|| centralized_trust_center(self.aib.aps_trust_center_address))
+                    .flatten()
+            })
+            .and_then(nonzero_ieee)
+            .filter(|address| *address != BROADCAST_IEEE)
     }
 
     fn has_unique_trust_center_link_key(&self, source: &IeeeAddress) -> bool {
@@ -2108,15 +2156,24 @@ impl<M: MacDriver> ApsLayer<M> {
             log::warn!("[APS] Switch-Key too short");
             return;
         }
-        if self.aib.aps_trust_center_address == BROADCAST_IEEE
+        let trust_center = if self.aib.aps_trust_center_address == BROADCAST_IEEE
             || !security.nwk_authenticated()
-            || self
-                .authenticated_trust_center_source(src, security)
-                .is_none()
-            || (security.aps_secured
-                && security.aps_key_identifier != Some(crate::security::KEY_ID_DATA_KEY))
         {
+            None
+        } else {
+            self.authenticated_trust_center_source(src, security)
+        };
+        // R22 Table 4-6: APS encryption is not required, but extra APS
+        // security is accepted only if it is a data key from the Trust Center
+        // — never the well-known global key once a unique TC link key is
+        // installed (the same rule as Remove-Device and Request-Key).
+        let Some(trust_center) = trust_center else {
             log::warn!("[APS] rejecting unauthenticated Switch-Key command");
+            self.ignore_security_command();
+            return;
+        };
+        if !self.valid_data_key_security(trust_center, security, false) {
+            log::warn!("[APS] rejecting Switch-Key secured with a non-data or global key");
             return;
         }
         let key_seq = data[0];
@@ -4237,6 +4294,7 @@ mod tests {
             IncomingCommandSecurity {
                 nwk_secured: true,
                 nwk_source: Some(TC_IEEE),
+                nwk_originator: Some(TC_IEEE),
                 aps_secured: true,
                 aps_source: Some(TC_IEEE),
                 aps_key_identifier: Some(crate::security::KEY_ID_KEY_LOAD),
@@ -4283,6 +4341,7 @@ mod tests {
             IncomingCommandSecurity {
                 nwk_secured: true,
                 nwk_source: Some(TC_IEEE),
+                nwk_originator: Some(TC_IEEE),
                 aps_secured: true,
                 aps_source: Some(TC_IEEE),
                 aps_key_identifier: Some(crate::security::KEY_ID_KEY_LOAD),
@@ -4331,6 +4390,7 @@ mod tests {
             IncomingCommandSecurity {
                 nwk_secured: true,
                 nwk_source: Some(TC_IEEE),
+                nwk_originator: Some(TC_IEEE),
                 aps_secured: true,
                 aps_source: Some(TC_IEEE),
                 aps_key_identifier: Some(crate::security::KEY_ID_KEY_LOAD),
@@ -4368,6 +4428,7 @@ mod tests {
             IncomingCommandSecurity {
                 nwk_secured: true,
                 nwk_source: Some(TC_IEEE),
+                nwk_originator: Some(TC_IEEE),
                 aps_secured: true,
                 aps_source: Some(TC_IEEE),
                 aps_key_identifier: Some(crate::security::KEY_ID_KEY_LOAD),
@@ -4403,6 +4464,7 @@ mod tests {
             IncomingCommandSecurity {
                 nwk_secured: true,
                 nwk_source: Some(TC_IEEE),
+                nwk_originator: Some(TC_IEEE),
                 aps_secured: true,
                 aps_source: Some(TC_IEEE),
                 aps_key_identifier: Some(crate::security::KEY_ID_KEY_LOAD),
@@ -5313,11 +5375,95 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "router")]
+    const UPDATE_ORIGINATOR: IeeeAddress = [0x44; 8];
+    #[cfg(feature = "router")]
+    const UPDATE_RELAY: IeeeAddress = [0x55; 8];
+
+    /// Finding F5: a NWK-only-secured Update-Device relayed over several hops
+    /// carries the relay's IEEE address in the NWK auxiliary header. The
+    /// reported source must be the originating router named by the NWK
+    /// header source, never the last hop; an unidentifiable originator is
+    /// ignored rather than attributed to the relay.
+    #[test]
+    #[cfg(feature = "router")]
+    fn nwk_only_update_device_source_is_the_nwk_originator_not_the_last_hop() {
+        let mut command = [0u8; 12];
+        command[0] = crate::frames::ApsCommandId::UpdateDevice as u8;
+        command[1..9].copy_from_slice(&CHILD_IEEE);
+        command[9..11].copy_from_slice(&CHILD_SHORT.0.to_le_bytes());
+        command[11] = crate::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin as u8;
+        let expected = |source_address| {
+            Some(crate::apsme::ApsmeSecurityIndication::UpdateDevice(
+                crate::apsme::ApsmeUpdateDeviceIndication {
+                    source_address,
+                    device_address: CHILD_IEEE,
+                    device_short_address: CHILD_SHORT,
+                    status: crate::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
+                },
+            ))
+        };
+        let tc = || {
+            let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+            aps.aib_mut().aps_trust_center_address = LOCAL_IEEE;
+            aps
+        };
+        let mut scratch = ApsFrameBuffer::new();
+
+        // Originator unknown: the relay must not be blamed or trusted.
+        let mut aps = tc();
+        aps.nwk_mut()
+            .update_neighbor_address(ShortAddress(0x6677), UPDATE_RELAY);
+        aps.process_incoming_aps_frame(
+            &unsecured_command_frame(&command, 1),
+            ShortAddress(0x4455),
+            ShortAddress::COORDINATOR,
+            200,
+            IncomingNwkSecurity::new(true, Some(UPDATE_RELAY)),
+            &mut scratch,
+        );
+        assert_eq!(aps.take_pending_security_indication(), None);
+
+        // Originator resolved from the NWK source short address.
+        let mut aps = tc();
+        aps.nwk_mut()
+            .update_neighbor_address(ShortAddress(0x4455), UPDATE_ORIGINATOR);
+        aps.process_incoming_aps_frame(
+            &unsecured_command_frame(&command, 1),
+            ShortAddress(0x4455),
+            ShortAddress::COORDINATOR,
+            200,
+            IncomingNwkSecurity::new(true, Some(UPDATE_RELAY)),
+            &mut scratch,
+        );
+        assert_eq!(
+            aps.take_pending_security_indication(),
+            expected(UPDATE_ORIGINATOR)
+        );
+
+        // Originator supplied from the NWK header extended source.
+        let mut aps = tc();
+        aps.process_incoming_aps_frame(
+            &unsecured_command_frame(&command, 1),
+            ShortAddress(0x4455),
+            ShortAddress::COORDINATOR,
+            200,
+            IncomingNwkSecurity::new(true, Some(UPDATE_RELAY)).with_originator(UPDATE_ORIGINATOR),
+            &mut scratch,
+        );
+        assert_eq!(
+            aps.take_pending_security_indication(),
+            expected(UPDATE_ORIGINATOR)
+        );
+    }
+
     #[test]
     #[cfg(feature = "router")]
     fn update_device_indication_rejects_reserved_status_and_own_identity() {
         let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
         aps.aib_mut().aps_trust_center_address = LOCAL_IEEE;
+        aps.nwk_mut()
+            .update_neighbor_address(ShortAddress(0x4455), UPDATE_ORIGINATOR);
         let mut command = [0u8; 12];
         command[0] = crate::frames::ApsCommandId::UpdateDevice as u8;
         command[1..9].copy_from_slice(&CHILD_IEEE);
@@ -5331,14 +5477,14 @@ mod tests {
             ShortAddress(0x4455),
             ShortAddress::COORDINATOR,
             200,
-            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            IncomingNwkSecurity::new(true, Some(UPDATE_RELAY)),
             &mut scratch,
         );
         assert_eq!(
             aps.take_pending_security_indication(),
             Some(crate::apsme::ApsmeSecurityIndication::UpdateDevice(
                 crate::apsme::ApsmeUpdateDeviceIndication {
-                    source_address: TC_IEEE,
+                    source_address: UPDATE_ORIGINATOR,
                     device_address: CHILD_IEEE,
                     device_short_address: CHILD_SHORT,
                     status: crate::apsme::ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
@@ -5354,7 +5500,7 @@ mod tests {
             ShortAddress(0x4455),
             ShortAddress::COORDINATOR,
             200,
-            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            IncomingNwkSecurity::new(true, Some(UPDATE_RELAY)),
             &mut scratch,
         );
         assert!(aps.take_pending_security_indication().is_none());
@@ -5367,7 +5513,7 @@ mod tests {
             ShortAddress(0x4455),
             ShortAddress::COORDINATOR,
             200,
-            IncomingNwkSecurity::new(true, Some(TC_IEEE)),
+            IncomingNwkSecurity::new(true, Some(UPDATE_RELAY)),
             &mut scratch,
         );
         assert!(aps.take_pending_security_indication().is_none());
@@ -5971,6 +6117,58 @@ mod tests {
         assert_eq!(aps.nwk().nib().active_key_seq_number, 1);
     }
 
+    /// Finding F11: once a unique Trust Center link key is installed, a
+    /// Switch-Key APS-secured with the well-known global key must be
+    /// rejected; the same command under the unique key, or NWK-only
+    /// secured from the Trust Center, is accepted.
+    #[test]
+    #[cfg(feature = "router")]
+    fn switch_key_secured_with_the_global_key_is_rejected_after_unique_key() {
+        let security = |aps_secured, default_key| IncomingCommandSecurity {
+            nwk_secured: true,
+            nwk_source: Some(TC_IEEE),
+            nwk_originator: Some(TC_IEEE),
+            aps_secured,
+            aps_source: aps_secured.then_some(TC_IEEE),
+            aps_key_identifier: aps_secured.then_some(crate::security::KEY_ID_DATA_KEY),
+            aps_used_default_link_key: default_key,
+            aps_used_distributed_link_key: false,
+        };
+        let node = || {
+            let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+            aps.aib_mut().aps_trust_center_address = TC_IEEE;
+            aps.security_mut()
+                .add_key(crate::security::ApsLinkKeyEntry {
+                    partner_address: TC_IEEE,
+                    key: [0x5A; 16],
+                    key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                    outgoing_frame_counter: 0,
+                    outgoing_frame_counter_limit: 0x400,
+                    incoming_frame_counter: 0,
+                    incoming_frame_counter_valid: false,
+                })
+                .unwrap();
+            assert!(
+                aps.nwk_mut()
+                    .security_mut()
+                    .stage_network_key([0xB6; 16], 1)
+            );
+            aps
+        };
+
+        let mut aps = node();
+        aps.handle_switch_key(&[1], ShortAddress::COORDINATOR, security(true, true));
+        assert_eq!(aps.nwk().security().active_key().unwrap().seq_number, 0);
+
+        let mut aps = node();
+        aps.handle_switch_key(&[1], ShortAddress::COORDINATOR, security(true, false));
+        assert_eq!(aps.nwk().security().active_key().unwrap().seq_number, 1);
+
+        let mut aps = node();
+        aps.handle_switch_key(&[1], ShortAddress::COORDINATOR, security(false, false));
+        assert_eq!(aps.nwk().security().active_key().unwrap().seq_number, 1);
+    }
+
     #[test]
     #[cfg(feature = "router")]
     fn parent_network_key_copy_preserves_zero_destination_and_tc_source() {
@@ -6078,6 +6276,7 @@ mod tests {
             IncomingCommandSecurity {
                 nwk_secured: false,
                 nwk_source: None,
+                nwk_originator: None,
                 aps_secured: true,
                 aps_source: Some(TC_IEEE),
                 aps_key_identifier: Some(crate::security::KEY_ID_KEY_TRANSPORT),
@@ -6118,6 +6317,7 @@ mod tests {
             let mut security = IncomingCommandSecurity {
                 nwk_secured: true,
                 nwk_source: Some(TC_IEEE),
+                nwk_originator: Some(TC_IEEE),
                 aps_secured: false,
                 aps_source: None,
                 aps_key_identifier: None,
