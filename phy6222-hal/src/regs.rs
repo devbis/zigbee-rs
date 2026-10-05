@@ -47,12 +47,15 @@ pub const I2C_IC_RAW_INTR_STAT: u32 = 0x34;
 pub const I2C_IC_RX_TL: u32 = 0x38;
 pub const I2C_IC_TX_TL: u32 = 0x3C;
 pub const I2C_IC_CLR_TX_ABRT: u32 = 0x54;
+pub const I2C_IC_CLR_STOP_DET: u32 = 0x60;
 pub const I2C_IC_ENABLE: u32 = 0x6C;
 pub const I2C_IC_STATUS: u32 = 0x70;
 pub const I2C_IC_TXFLR: u32 = 0x74;
 pub const I2C_IC_RXFLR: u32 = 0x78;
+pub const I2C_IC_ENABLE_STATUS: u32 = 0x9C;
 
 // I2C status bits
+pub const I2C_STATUS_MST_ACTIVITY: u32 = 0x20;
 pub const I2C_STATUS_RFNE: u32 = 0x08;
 pub const I2C_STATUS_TFE: u32 = 0x04;
 pub const I2C_STATUS_TFNF: u32 = 0x02;
