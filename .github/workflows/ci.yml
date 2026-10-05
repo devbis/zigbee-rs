@@ -973,12 +973,15 @@ jobs:
           python-version: 3.11.9
       - name: Install pinned Bouffalo image tool
         run: |
-          PACKAGE="$RUNNER_TEMP/bflb-mcu-tool-1.10.0.tar.gz"
-          python3 -m pip download --disable-pip-version-check --no-deps \
-            --dest "$RUNNER_TEMP" bflb-mcu-tool==1.10.0
-          echo "cd09a9b2a5652ad8623ae275a49179c48edd8c90a893851000b08e3b104a46ac  $PACKAGE" \
-            | sha256sum --check
-          python3 -m pip install --disable-pip-version-check "$PACKAGE"
+          # Every distribution in the tool's closure is pinned by version and
+          # SHA-256. The two source-only packages are built with the
+          # separately hash-pinned setuptools rather than an unpinned
+          # isolated build environment.
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --no-deps -r tools/bl702-image-tool/build-requirements.txt
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --no-deps --no-build-isolation -r tools/bl702-image-tool/requirements.txt
+          python3 -m pip check
       - name: Create firmware artifacts
         working-directory: examples/bl702-sensor
         run: ./build-image.sh

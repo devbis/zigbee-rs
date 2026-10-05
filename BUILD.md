@@ -225,8 +225,11 @@ has since been removed; physical OTA and other validation checks remain.
 ## BL702 XT-ZB1
 
 ```bash
+python3 -m pip install --require-hashes --no-deps \
+  -r tools/bl702-image-tool/build-requirements.txt
+python3 -m pip install --require-hashes --no-deps --no-build-isolation \
+  -r tools/bl702-image-tool/requirements.txt
 cd examples/bl702-sensor
-python3 -m pip install bflb-mcu-tool==1.10.0 pyserial
 ./build-image.sh
 ```
 
