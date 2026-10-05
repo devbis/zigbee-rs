@@ -625,8 +625,7 @@ impl<M: MacDriver> NwkLayer<M> {
             crate::security::NwkSecurityHeader::parse(&frame[header_len..])
                 .ok_or(NwkStatus::BadCcmOutput)?;
         if security_header.source_address != self.nib.ieee_address
-            || security_header.security_control & !0x07
-                != crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT & !0x07
+            || !security_header.uses_network_key_with_extended_nonce()
         {
             // The queue holds frames already secured by this hop, not raw
             // received frames that would still need admission/replay checks.
@@ -1661,7 +1660,12 @@ impl<M: MacDriver> NwkLayer<M> {
             self.rx_security_stats.secured_frames.wrapping_add(1);
 
         let after_header = mac_payload.get(header_len..)?;
+        // R22 §4.3.1.2 step 1: NWK frames are secured with the network key
+        // (key identifier 1) and carry the extended nonce; anything else
+        // (a link/transport key identifier, or a missing source address
+        // the 14-byte auxiliary layout would otherwise misread) is rejected.
         let Some((sec_hdr, sec_consumed)) = crate::security::NwkSecurityHeader::parse(after_header)
+            .filter(|(hdr, _)| hdr.uses_network_key_with_extended_nonce())
         else {
             self.rx_security_stats.security_header_parse_failures = self
                 .rx_security_stats
@@ -3725,6 +3729,29 @@ mod tests {
             .build_nwk_frame(&header, payload, &mut bytes)
             .unwrap();
         heapless::Vec::from_slice(&bytes[..len]).unwrap()
+    }
+
+    #[test]
+    fn incoming_frames_must_name_the_network_key_with_the_extended_nonce() {
+        let header = frame(NwkFrameType::Data, ORIGIN, OUR_ADDR);
+        let on_air = frame_with_network_key(&header, &[0xCA, 0xFE], NETWORK_KEY, KEY_SEQ, 10);
+        let (_, header_len) = NwkHeader::parse(&on_air).unwrap();
+        // Key identifier 0 (data/link key), 2 (key-transport), and the
+        // extended nonce cleared, each with an otherwise valid frame.
+        for tamper in [
+            |sc: u8| sc & !0x18,
+            |sc: u8| (sc & !0x18) | 0x10,
+            |sc: u8| sc & !0x20,
+        ] {
+            let mut receiver = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
+            let mut bad = on_air.clone();
+            bad[header_len] = tamper(bad[header_len]);
+            assert!(block_on(receiver.process_incoming_nwk_frame(&bad, 42)).is_none());
+            assert_eq!(receiver.rx_security_stats.security_header_parse_failures, 1);
+            assert_eq!(receiver.rx_security_stats.decrypt_failures, 0);
+            // Nothing was committed, so the genuine frame still authenticates.
+            assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_some());
+        }
     }
 
     #[test]

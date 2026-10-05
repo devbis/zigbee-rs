@@ -83,6 +83,14 @@ impl NwkSecurityHeader {
     /// Per Zigbee PRO R22 §4.5.1.1: extended nonce SHALL be set to 1.
     pub const ZIGBEE_DEFAULT: u8 = 0x05 | (0x01 << 3) | (1 << 5); // 0x2D
 
+    /// `true` when the over-the-air security control names the network key
+    /// (key identifier 1) with the extended nonce, i.e. the only NWK-layer
+    /// form R22 §4.3.1.2 / §4.5.1.1 allows. The security level bits are
+    /// ignored because they are zeroed on the air (§4.3.1.1 step 6).
+    pub fn uses_network_key_with_extended_nonce(&self) -> bool {
+        self.security_control & !0x07 == Self::ZIGBEE_DEFAULT & !0x07
+    }
+
     pub fn parse(data: &[u8]) -> Option<(Self, usize)> {
         if data.len() < NWK_AUX_HEADER_LEN {
             return None;
