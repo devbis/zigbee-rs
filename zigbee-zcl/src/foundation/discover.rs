@@ -61,20 +61,20 @@ impl DiscoverAttributesResponse {
         if buf.is_empty() {
             return 0;
         }
-        buf[0] = if self.complete { 1 } else { 0 };
+        let mut complete = self.complete;
         let mut pos = 1;
         for info in &self.attributes {
             // Need 2 (id) + 1 (type) = 3 bytes
-            if pos + 3 > buf.len() {
+            let Some(rec) = buf.get_mut(pos..pos + 3) else {
+                // Truncated: the requester must continue discovery.
+                complete = false;
                 break;
-            }
-            let b = info.id.0.to_le_bytes();
-            buf[pos] = b[0];
-            buf[pos + 1] = b[1];
-            pos += 2;
-            buf[pos] = info.data_type as u8;
-            pos += 1;
+            };
+            rec[..2].copy_from_slice(&info.id.0.to_le_bytes());
+            rec[2] = info.data_type as u8;
+            pos += 3;
         }
+        buf[0] = complete as u8;
         pos
     }
 }
@@ -84,31 +84,18 @@ pub fn process_discover_dyn(
     store: &dyn crate::clusters::AttributeStoreAccess,
     request: &DiscoverAttributesRequest,
 ) -> DiscoverAttributesResponse {
-    let ids = store.all_ids();
-    let mut attributes = heapless::Vec::new();
-    let max = request.max_results as usize;
-    let mut count = 0;
-    let mut complete = true;
-
-    for id in &ids {
-        if id.0 >= request.start_id.0 {
-            if count >= max {
-                complete = false;
-                break;
-            }
-            if let Some(def) = store.find(*id) {
-                let _ = attributes.push(DiscoverAttributeInfo {
-                    id: *id,
-                    data_type: def.data_type,
-                });
-                count += 1;
-            }
-        }
-    }
-
+    // Same selection as the extended variant, without the access flags.
+    let ext = process_discover_extended_dyn(store, request);
     DiscoverAttributesResponse {
-        complete,
-        attributes,
+        complete: ext.complete,
+        attributes: ext
+            .attributes
+            .iter()
+            .map(|a| DiscoverAttributeInfo {
+                id: a.id,
+                data_type: a.data_type,
+            })
+            .collect(),
     }
 }
 
@@ -163,38 +150,38 @@ impl DiscoverCommandsResponse {
         if buf.is_empty() {
             return 0;
         }
-        buf[0] = u8::from(self.complete);
-        let mut pos = 1;
-        for &id in &self.command_ids {
-            if pos >= buf.len() {
-                break;
-            }
-            buf[pos] = id;
-            pos += 1;
-        }
-        pos
+        let n = self.command_ids.len().min(buf.len() - 1);
+        buf[0] = u8::from(self.complete && n == self.command_ids.len());
+        buf[1..1 + n].copy_from_slice(&self.command_ids[..n]);
+        1 + n
     }
 }
 
-/// Filter `all_commands` starting from `start_id`, returning up to `max_results`.
+/// Return the command IDs of `all_commands` that are `>= start_id`, in
+/// ascending order, up to `max_results` (ZCL r8 §2.5.19/§2.5.21).
 pub fn process_discover_commands(
     all_commands: &[u8],
     start_id: u8,
     max_results: u8,
 ) -> DiscoverCommandsResponse {
-    let max = max_results as usize;
     let mut command_ids: heapless::Vec<u8, MAX_DISCOVER_COMMANDS> = heapless::Vec::new();
-    let mut complete = true;
-
-    for &id in all_commands {
-        if id >= start_id {
-            if command_ids.len() >= max {
-                complete = false;
-                break;
+    let mut floor = start_id as u16;
+    let complete = loop {
+        // Smallest command ID >= floor (0x100 = none left).
+        let mut next = 0x100u16;
+        for &c in all_commands {
+            if c as u16 >= floor && (c as u16) < next {
+                next = c as u16;
             }
-            let _ = command_ids.push(id);
         }
-    }
+        let Ok(id) = u8::try_from(next) else {
+            break true;
+        };
+        if command_ids.len() >= max_results as usize || command_ids.push(id).is_err() {
+            break false;
+        }
+        floor = id as u16 + 1;
+    };
 
     DiscoverCommandsResponse {
         complete,
@@ -227,19 +214,19 @@ impl DiscoverAttributesExtendedResponse {
         if buf.is_empty() {
             return 0;
         }
-        buf[0] = if self.complete { 1 } else { 0 };
+        let mut complete = self.complete;
         let mut pos = 1;
         for info in &self.attributes {
-            if pos + 4 > buf.len() {
+            let Some(rec) = buf.get_mut(pos..pos + 4) else {
+                complete = false;
                 break;
-            }
-            let b = info.id.0.to_le_bytes();
-            buf[pos] = b[0];
-            buf[pos + 1] = b[1];
-            buf[pos + 2] = info.data_type as u8;
-            buf[pos + 3] = info.access_control;
+            };
+            rec[..2].copy_from_slice(&info.id.0.to_le_bytes());
+            rec[2] = info.data_type as u8;
+            rec[3] = info.access_control;
             pos += 4;
         }
+        buf[0] = complete as u8;
         pos
     }
 }
@@ -250,42 +237,176 @@ pub fn process_discover_extended_dyn(
     store: &dyn crate::clusters::AttributeStoreAccess,
     request: &DiscoverAttributesRequest,
 ) -> DiscoverAttributesExtendedResponse {
-    let ids = store.all_ids();
+    // Attributes are reported in ascending ID order starting at the start
+    // ID (ZCL r8 §2.5.13/§2.5.23); a selection pass per entry keeps this
+    // allocation-free. `complete` is false whenever any attribute remains.
+    let all = store.all_ids();
     let mut attributes = heapless::Vec::new();
-    let max = request.max_results as usize;
-    let mut count = 0;
-    let mut complete = true;
-
-    for id in &ids {
-        if id.0 >= request.start_id.0 {
-            if count >= max {
-                complete = false;
-                break;
-            }
-            if let Some(def) = store.find(*id) {
-                // Bit 0: readable, Bit 1: writable, Bit 2: reportable
-                let mut access_control: u8 = 0;
-                if def.access.is_readable() {
-                    access_control |= 0x01;
-                }
-                if def.access.is_writable() {
-                    access_control |= 0x02;
-                }
-                if def.access.is_reportable() {
-                    access_control |= 0x04;
-                }
-                let _ = attributes.push(DiscoverAttributeExtendedInfo {
-                    id: *id,
-                    data_type: def.data_type,
-                    access_control,
-                });
-                count += 1;
+    let mut floor = request.start_id.0 as u32;
+    let complete = loop {
+        // Smallest ID >= floor (0x1_0000 = none left).
+        let mut next = 0x1_0000u32;
+        for a in &all {
+            let v = a.0 as u32;
+            if v >= floor && v < next {
+                next = v;
             }
         }
-    }
+        let Ok(id) = u16::try_from(next) else {
+            break true;
+        };
+        if attributes.len() >= request.max_results as usize {
+            break false;
+        }
+        if let Some(def) = store.find(AttributeId(id)) {
+            // Bit 0: readable, Bit 1: writable, Bit 2: reportable
+            // (indexed by `AttributeAccess` declaration order).
+            const AC: [u8; 4] = [0b101, 0b010, 0b111, 0b101];
+            let access_control = AC[def.access as usize];
+            let info = DiscoverAttributeExtendedInfo {
+                id: def.id,
+                data_type: def.data_type,
+                access_control,
+            };
+            if attributes.push(info).is_err() {
+                break false;
+            }
+        }
+        floor = id as u32 + 1;
+    };
 
     DiscoverAttributesExtendedResponse {
         complete,
         attributes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attribute::{AttributeAccess, AttributeDefinition, AttributeStore};
+    use crate::data_types::ZclValue;
+
+    fn store(ids: &[u16]) -> AttributeStore<24> {
+        let mut s = AttributeStore::new();
+        for &id in ids {
+            s.register(
+                AttributeDefinition {
+                    id: AttributeId(id),
+                    data_type: ZclDataType::U8,
+                    access: AttributeAccess::ReadOnly,
+                    name: "a",
+                },
+                ZclValue::U8(0),
+            )
+            .unwrap();
+        }
+        s
+    }
+
+    fn ids(r: &DiscoverAttributesResponse) -> heapless::Vec<u16, MAX_DISCOVER> {
+        r.attributes.iter().map(|a| a.id.0).collect()
+    }
+
+    #[test]
+    fn attributes_are_returned_ascending_from_start_id() {
+        let s = store(&[0x0010, 0x0002, 0xFFFD, 0x0000, 0x0005]);
+        let r = process_discover_dyn(
+            &s,
+            &DiscoverAttributesRequest {
+                start_id: AttributeId(1),
+                max_results: 10,
+            },
+        );
+        assert_eq!(&ids(&r)[..], &[0x0002, 0x0005, 0x0010, 0xFFFD]);
+        assert!(r.complete);
+    }
+
+    #[test]
+    fn truncation_clears_the_complete_flag() {
+        let s = store(&[3, 1, 2]);
+        let req = |start, max| DiscoverAttributesRequest {
+            start_id: AttributeId(start),
+            max_results: max,
+        };
+        let r = process_discover_dyn(&s, &req(0, 2));
+        assert_eq!(&ids(&r)[..], &[1, 2]);
+        assert!(!r.complete);
+        // Exactly the remaining attributes: complete.
+        let r = process_discover_dyn(&s, &req(3, 1));
+        assert_eq!(&ids(&r)[..], &[3]);
+        assert!(r.complete);
+        // More attributes than MAX_DISCOVER.
+        let many: heapless::Vec<u16, 24> = (0..20u16).rev().collect();
+        let s = store(&many);
+        let r = process_discover_dyn(&s, &req(0, 0xFF));
+        assert_eq!(r.attributes.len(), MAX_DISCOVER);
+        assert_eq!(r.attributes[15].id, AttributeId(15));
+        assert!(!r.complete);
+        let r = process_discover_extended_dyn(&s, &req(0, 0xFF));
+        assert_eq!(r.attributes.len(), MAX_DISCOVER);
+        assert!(!r.complete);
+        // Buffer truncation also clears the flag in the serialized frame.
+        let r = process_discover_dyn(&store(&[1, 2]), &req(0, 10));
+        assert!(r.complete);
+        let mut buf = [0u8; 5];
+        assert_eq!(r.serialize(&mut buf), 4);
+        assert_eq!(buf[0], 0);
+    }
+
+    #[test]
+    fn commands_are_sorted_and_flag_reflects_truncation() {
+        let r = process_discover_commands(&[5, 0, 3, 1], 1, 10);
+        assert_eq!(&r.command_ids[..], &[1, 3, 5]);
+        assert!(r.complete);
+        let r = process_discover_commands(&[5, 0, 3, 1], 0, 2);
+        assert_eq!(&r.command_ids[..], &[0, 1]);
+        assert!(!r.complete);
+        let mut buf = [0u8; 2];
+        let r = process_discover_commands(&[1, 2], 0, 10);
+        assert_eq!(r.serialize(&mut buf), 2);
+        assert_eq!(buf, [0, 1]);
+    }
+
+    #[test]
+    fn access_control_bits_match_access_predicates_and_edge_ids() {
+        for access in [
+            AttributeAccess::ReadOnly,
+            AttributeAccess::WriteOnly,
+            AttributeAccess::ReadWrite,
+            AttributeAccess::Reportable,
+        ] {
+            let mut s: AttributeStore<2> = AttributeStore::new();
+            for id in [0xFFFF, 0] {
+                s.register(
+                    AttributeDefinition {
+                        id: AttributeId(id),
+                        data_type: ZclDataType::U8,
+                        access,
+                        name: "a",
+                    },
+                    ZclValue::U8(0),
+                )
+                .unwrap();
+            }
+            let all = DiscoverAttributesRequest {
+                start_id: AttributeId(0),
+                max_results: 10,
+            };
+            let r = process_discover_extended_dyn(&s, &all);
+            assert!(r.complete);
+            assert_eq!(r.attributes.len(), 2);
+            assert_eq!(
+                (r.attributes[0].id, r.attributes[1].id),
+                (AttributeId(0), AttributeId(0xFFFF))
+            );
+            let want = access.is_readable() as u8
+                | (access.is_writable() as u8) << 1
+                | (access.is_reportable() as u8) << 2;
+            assert_eq!(r.attributes[0].access_control, want);
+        }
+        let r = process_discover_commands(&[0xFF, 0], 0xFF, 10);
+        assert_eq!(&r.command_ids[..], &[0xFF]);
+        assert!(r.complete);
     }
 }
