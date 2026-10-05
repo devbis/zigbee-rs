@@ -1440,6 +1440,20 @@ impl<M: MacDriver> NwkLayer<M> {
         #[cfg(feature = "router")]
         let relayable_broadcast = is_data || self.broadcast_command_is_relayable(src, command_id);
 
+        // R22 §3.6.1.5 / §3.6.3.1: every authenticated frame refreshes the
+        // transmitting neighbour's LQI average and incoming link cost; a
+        // router heard for the first time becomes a neighbour.
+        #[cfg(feature = "router")]
+        if self.rx_authenticated {
+            self.observe_transmitting_neighbor(
+                &header,
+                prev_hop.unwrap_or(src),
+                lqi,
+                payload.security_source(),
+                command_id,
+            );
+        }
+
         // Check a broadcast transaction before staging its replay. Recording
         // is delayed until the replay floor is durable, otherwise a failed
         // journal write would make the legitimate retransmission look like a
@@ -2033,6 +2047,76 @@ impl<M: MacDriver> NwkLayer<M> {
         }
     }
 
+    /// Refresh (or learn) the neighbour that transmitted an authenticated
+    /// frame (R22 §3.6.1.5, §3.6.3.1).
+    ///
+    /// An existing entry folds the frame's LQI into its average and has its
+    /// age reset. An unknown transmitter is only added when it is provably a
+    /// router: it relayed or rebroadcast the frame (MAC source differs from
+    /// the NWK source — only routers forward), or the frame is a Link Status,
+    /// Route Request or Route Reply, which only routers send. Its IEEE
+    /// address must be authenticated: NWK security is hop by hop, so the
+    /// auxiliary header names the transmitter; on an unsecured network only
+    /// a directly sent frame's source IEEE address can name it. An IEEE
+    /// address already bound to another short address is left to address
+    /// conflict processing instead of being remapped here.
+    #[cfg(feature = "router")]
+    #[inline(never)]
+    fn observe_transmitting_neighbor(
+        &mut self,
+        header: &NwkHeader,
+        hop: ShortAddress,
+        lqi: u8,
+        security_source: Option<IeeeAddress>,
+        command_id: Option<u8>,
+    ) {
+        if !self.can_route() || !is_unicast_address(hop) || hop == self.nib.network_address {
+            return;
+        }
+        if let Some(entry) = self.neighbors.find_by_short_mut(hop) {
+            if security_source.is_none_or(|ieee| ieee == entry.ieee_address) {
+                entry.observe_frame(lqi);
+                entry.age = 0;
+            }
+            return;
+        }
+        let direct = hop == header.src_addr;
+        let router_command = matches!(
+            command_id.and_then(NwkCommandId::from_u8),
+            Some(NwkCommandId::LinkStatus | NwkCommandId::RouteRequest | NwkCommandId::RouteReply)
+        );
+        if direct && !router_command {
+            return;
+        }
+        let ieee = match security_source {
+            Some(ieee) => ieee,
+            None if !self.nib.security_enabled && direct => match header.src_ieee {
+                Some(ieee) => ieee,
+                None => return,
+            },
+            None => return,
+        };
+        if ieee == [0; 8]
+            || ieee == [0xFF; 8]
+            || ieee == self.nib.ieee_address
+            || self.neighbors.find_by_ieee(&ieee).is_some()
+        {
+            return;
+        }
+        let mut entry = crate::neighbor::NeighborEntry::new_from_annce(hop, ieee);
+        entry.device_type = if hop == ShortAddress::COORDINATOR {
+            crate::neighbor::NeighborDeviceType::Coordinator
+        } else {
+            crate::neighbor::NeighborDeviceType::Router
+        };
+        entry.rx_on_when_idle = true;
+        entry.relationship = crate::neighbor::Relationship::Sibling;
+        entry.observe_frame(lqi);
+        if self.neighbors.add_or_update(entry).is_ok() {
+            log::debug!("[NWK] Learned router neighbor 0x{:04X}", hop.0);
+        }
+    }
+
     /// Whether `addr` is a child of ours that sleeps, and therefore can only
     /// be reached through indirect (polled) delivery.
     ///
@@ -2486,7 +2570,11 @@ impl<M: MacDriver> NwkLayer<M> {
             #[cfg(feature = "router")]
             Some(NwkCommandId::RouteRecord) => self.handle_route_record(src, cmd_payload),
             #[cfg(feature = "router")]
-            Some(NwkCommandId::LinkStatus) => self.handle_link_status(src, cmd_payload),
+            // Link Status is a one-hop frame (radius 1): a copy that did not
+            // come straight from its sender describes somebody else's links.
+            Some(NwkCommandId::LinkStatus) if prev_hop == src => {
+                self.handle_link_status(src, cmd_payload)
+            }
             Some(NwkCommandId::NetworkStatus) => {
                 return self.handle_network_status(src, cmd_payload);
             }
@@ -3102,35 +3190,22 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Cost of the path the request travelled to reach us: what the
         // previous hop advertised plus our link from it.
-        let link_cost = if is_many_to_one {
-            let Some(neighbor) = self.neighbors.find_by_short(prev_hop) else {
-                log::debug!(
-                    "[NWK] MTOR RREQ from unknown previous hop 0x{:04X} dropped",
-                    prev_hop.0,
-                );
-                return;
-            };
-            if neighbor.outgoing_cost == 0 {
-                log::debug!(
-                    "[NWK] MTOR RREQ via 0x{:04X} has no reciprocal link cost",
-                    prev_hop.0,
-                );
-                return;
+        //
+        // R22 §3.6.3.1: the link cost is estimated from the LQI of this very
+        // frame; once the previous hop has reported its view of the link in a
+        // Link Status (outgoing cost != 0) the worse of the two directions is
+        // used, so a many-to-one route — which is used in the *opposite*
+        // direction — never prefers a link the neighbour cannot hear well.
+        // A request from a neighbour that has not exchanged Link Status yet
+        // (e.g. a concentrator's first MTORR after boot) is accepted with the
+        // incoming estimate instead of leaving the router without any route
+        // to the concentrator until its next advertisement.
+        let incoming_cost = crate::neighbor::link_cost_from_lqi(lqi);
+        let link_cost = match self.neighbors.find_by_short(prev_hop) {
+            Some(neighbor) if neighbor.outgoing_cost != 0 => {
+                core::cmp::max(incoming_cost, neighbor.outgoing_cost)
             }
-            let incoming_cost = crate::neighbor::link_cost_from_lqi(lqi);
-            core::cmp::max(incoming_cost, neighbor.outgoing_cost)
-        } else {
-            self.neighbors
-                .find_by_short(prev_hop)
-                .map(|neighbor| {
-                    let incoming_cost = crate::neighbor::link_cost_from_lqi(lqi);
-                    if neighbor.outgoing_cost == 0 {
-                        incoming_cost
-                    } else {
-                        core::cmp::max(incoming_cost, neighbor.outgoing_cost)
-                    }
-                })
-                .unwrap_or(7)
+            _ => incoming_cost,
         };
         let forward_cost = rreq.path_cost.saturating_add(link_cost);
 
@@ -3517,10 +3592,21 @@ impl<M: MacDriver> NwkLayer<M> {
         };
 
         let our_addr = self.nib.network_address;
+        // The receive path has already learned an authenticated router sender
+        // as a neighbour (R22 §3.6.3.4.2: "identified, or created").
         let Some(neighbor) = self.neighbors.find_by_short_mut(src) else {
             log::debug!("[NWK] LinkStatus from unknown neighbor 0x{:04X}", src.0);
             return;
         };
+        if neighbor.device_type == crate::neighbor::NeighborDeviceType::Unknown {
+            // Only routers send Link Status; an entry learned with an unknown
+            // type (e.g. from a Device_annce) is a router after all.
+            neighbor.device_type = if src == ShortAddress::COORDINATOR {
+                crate::neighbor::NeighborDeviceType::Coordinator
+            } else {
+                crate::neighbor::NeighborDeviceType::Router
+            };
+        }
         // R22 §3.6.3.4.2: reset the age of the transmitting device's entry.
         neighbor.link_status_age = 0;
         neighbor.age = 0;
@@ -3772,6 +3858,20 @@ mod tests {
         nwk.security.set_network_key(NETWORK_KEY, KEY_SEQ);
         assert!(nwk.nib.set_frame_counter_reservation(0, RESERVED_FLOOR));
         nwk
+    }
+
+    /// Re-secure a plaintext on-air frame as `transmitter` would send it:
+    /// NWK security is hop by hop, so the auxiliary header names the
+    /// transmitter, not the NWK source.
+    #[cfg(feature = "router")]
+    fn secure_as(transmitter: &mut NwkLayer<MockMac>, plain: &[u8]) -> heapless::Vec<u8, 128> {
+        let (mut header, consumed) = NwkHeader::parse(plain).expect("plain frame parses");
+        header.frame_control.security = true;
+        let mut bytes = [0; 128];
+        let len = transmitter
+            .build_nwk_frame(&header, &plain[consumed..], &mut bytes)
+            .expect("the transmitter secures the frame");
+        heapless::Vec::from_slice(&bytes[..len]).unwrap()
     }
 
     fn frame_with_network_key(
@@ -4802,20 +4902,60 @@ mod tests {
 
     #[test]
     #[cfg(feature = "router")]
-    fn mtor_requires_a_known_nonzero_reciprocal_link_cost() {
+    fn mtor_without_link_status_yet_uses_the_incoming_link_estimate() {
         let mut router = node(DeviceType::Router, OUR_ADDR);
         router.update_neighbor_address(CONCENTRATOR, [0xC0; 8]);
         let neighbor = router.neighbors.find_by_short_mut(CONCENTRATOR).unwrap();
         neighbor.device_type = crate::neighbor::NeighborDeviceType::Router;
         neighbor.outgoing_cost = 0;
+        // LQI 120 → incoming link cost 3.
         let on_air = rreq_on_air(CONCENTRATOR, 0x32, 5, &many_to_one_rreq(5, 0));
 
         assert!(
-            block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(CONCENTRATOR),))
+            block_on(router.process_incoming_nwk_frame_from(&on_air, 120, Some(CONCENTRATOR),))
                 .is_none()
         );
-        assert!(router.routing.get_entry(CONCENTRATOR).is_none());
-        assert!(router.pending_rreq_forwards.is_empty());
+        let route = router
+            .routing
+            .get_entry(CONCENTRATOR)
+            .expect("the many-to-one route is installed");
+        assert_eq!(route.next_hop, CONCENTRATOR);
+        assert_eq!(route.path_cost, 3);
+        assert_eq!(router.pending_rreq_forwards.len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn mtor_from_an_unknown_relaying_router_teaches_a_neighbour_and_a_route() {
+        // The concentrator is two hops away; NEXT_HOP rebroadcasts its MTORR
+        // and has never been heard before.
+        let mut router = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let mut rebroadcaster = secured_node(DeviceType::Router, NEXT_HOP, [0x44; 8]);
+        let on_air = rreq_on_air(CONCENTRATOR, 0x32, 5, &many_to_one_rreq(5, 2));
+        let secured = secure_as(&mut rebroadcaster, &on_air);
+
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&secured, 220, Some(NEXT_HOP)))
+                .is_none()
+        );
+
+        let neighbor = router
+            .neighbors
+            .find_by_short(NEXT_HOP)
+            .expect("an authenticated relaying router becomes a neighbour");
+        assert_eq!(neighbor.ieee_address, [0x44; 8]);
+        assert!(neighbor.is_router());
+        assert_eq!(neighbor.incoming_cost, 1);
+        let route = router
+            .routing
+            .get_entry(CONCENTRATOR)
+            .expect("the many-to-one route is installed");
+        assert_eq!(route.next_hop, NEXT_HOP);
+        assert_eq!(route.path_cost, 3);
+        assert!(
+            router.neighbors.find_by_short(CONCENTRATOR).is_none(),
+            "the concentrator itself is not one hop away"
+        );
     }
 
     #[test]
@@ -5767,6 +5907,103 @@ mod tests {
             })
         );
         assert!(!nwk.is_joined());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn link_status_from_an_unknown_router_creates_a_neighbour_with_its_cost() {
+        // Two routers that have never met: B advertises A (incoming cost 2).
+        let mut a = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let mut b = secured_node(DeviceType::Router, NEXT_HOP, [0x44; 8]);
+        neighbour_with_cost(&mut b, OUR_ADDR, 2);
+        block_on(b.send_link_status()).expect("B sends its link status");
+        let on_air = recorded_frame(&b, 0);
+
+        assert!(
+            block_on(a.process_incoming_nwk_frame_from(&on_air, 220, Some(NEXT_HOP))).is_none()
+        );
+
+        let learned = a
+            .neighbors
+            .find_by_short(NEXT_HOP)
+            .expect("R22 §3.6.3.4.2: the sender's entry is created");
+        assert_eq!(learned.ieee_address, [0x44; 8]);
+        assert!(learned.is_router());
+        assert_eq!(learned.outgoing_cost, 2, "B's view of the link to A");
+        assert_eq!(learned.incoming_cost, 1, "A's own LQI estimate");
+        assert_eq!(learned.link_status_age, 0);
+
+        // A now advertises B in its own Link Status.
+        block_on(a.send_link_status()).expect("A sends its link status");
+        let (_, _, payload) = decrypt_recorded(&recorded_frame(&a, 0));
+        let report = crate::frames::LinkStatusReport::parse(&payload[1..]).expect("parses");
+        assert_eq!(report.incoming_cost_for(NEXT_HOP), Some(1));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relayed_link_status_teaches_nothing() {
+        let mut a = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let mut b = secured_node(DeviceType::Router, NEXT_HOP, [0x44; 8]);
+        neighbour_with_cost(&mut b, OUR_ADDR, 2);
+        block_on(b.send_link_status()).expect("B sends its link status");
+        let on_air = recorded_frame(&b, 0);
+
+        // Claimed to have arrived through PEER: not B's one-hop report.
+        let _ = block_on(a.process_incoming_nwk_frame_from(&on_air, 220, Some(PEER)));
+
+        assert!(
+            a.neighbors
+                .find_by_short(NEXT_HOP)
+                .is_none_or(|entry| entry.outgoing_cost == 0)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn every_frame_from_a_neighbour_refreshes_its_lqi_and_incoming_cost() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        router.update_neighbor_address(PEER, [0x33; 8]);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(NwkFrameType::Data, PEER, OUR_ADDR),
+            &[0x01],
+            &mut buf,
+        );
+
+        let _ = block_on(router.process_incoming_nwk_frame(&buf[..len], 220));
+        let entry = router.neighbors.find_by_short(PEER).unwrap();
+        assert_eq!(entry.lqi, 220);
+        assert_eq!(entry.incoming_cost, 1);
+
+        for _ in 0..20 {
+            let _ = block_on(router.process_incoming_nwk_frame(&buf[..len], 40));
+        }
+        let entry = router.neighbors.find_by_short(PEER).unwrap();
+        assert!(
+            entry.lqi <= 50,
+            "the average follows the link: {}",
+            entry.lqi
+        );
+        assert_eq!(entry.incoming_cost, 7);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_direct_data_frame_from_a_stranger_does_not_create_a_neighbour() {
+        // It may be somebody else's end device; only router evidence counts.
+        let mut router = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let mut stranger = secured_node(DeviceType::EndDevice, PEER, [0x33; 8]);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(NwkFrameType::Data, PEER, OUR_ADDR),
+            &[0x01],
+            &mut buf,
+        );
+        let secured = secure_as(&mut stranger, &buf[..len]);
+
+        assert!(block_on(router.process_incoming_nwk_frame(&secured, 220)).is_some());
+        assert!(router.neighbors.find_by_short(PEER).is_none());
     }
 
     #[test]
