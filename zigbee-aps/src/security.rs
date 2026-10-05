@@ -360,6 +360,15 @@ pub struct ApsSecurity {
     /// mistaken for production provisioning.
     distributed_security_link_key: Option<AesKey>,
     /// Aggregate replay state for the two global commissioning keys.
+    ///
+    /// One floor per global key regardless of sender (finding F15, kept by
+    /// design): per-sender floors would let attacker-chosen IEEE addresses
+    /// exhaust the table or evict the Trust Center's floor. The accepted
+    /// cost is that a *second* legitimate sender under the same global key
+    /// (or a Trust Center whose APS counter restarted, e.g. after its own
+    /// factory reset) is rejected until its counter passes the floor. The
+    /// floor is dropped by [`Self::clear_keys`] (leave / factory reset) and
+    /// whenever the global key value changes.
     global_replay_table: heapless::Vec<ApsReplayCounter, MAX_ACTIVE_GLOBAL_REPLAY_DOMAINS>,
     /// Key-pair entries whose key was replaced by [`Self::add_key`] while
     /// carrying a committed incoming floor: that floor was established under
