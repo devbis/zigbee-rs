@@ -1442,8 +1442,10 @@ fn is_foundation_response(cmd_id: u8) -> bool {
 /// Local endpoints an application APS indication is delivered to
 /// (R22 §2.2.4.1.1).
 ///
-/// * Group addressing: every configured endpoint that is a member of `group`
-///   in the APS group table (possibly none — the frame is then dropped).
+/// * Group addressing (`group_members` is `Some`): the APS group table's
+///   member endpoints for the group ([`zigbee_aps::ApsLayer::group_member_endpoints`],
+///   the single source of group membership), restricted to configured
+///   endpoints (possibly none — the frame is then dropped).
 /// * Broadcast endpoint `0xFF`: every configured application endpoint.
 /// * Otherwise: the addressed endpoint, unchanged (an unknown endpoint is
 ///   still handed to the dispatcher, which reports it as before).
@@ -1451,15 +1453,17 @@ fn is_foundation_response(cmd_id: u8) -> bool {
 pub(crate) fn delivery_endpoints(
     endpoints: &[EndpointConfig],
     dst_ep: u8,
-    group: Option<u16>,
-    group_table: &zigbee_aps::group::GroupTable,
+    group_members: Option<&[u8]>,
 ) -> heapless::Vec<u8, { crate::MAX_ENDPOINTS }> {
     let mut targets = heapless::Vec::new();
-    match group {
-        Some(group) => {
-            for configured in endpoints {
-                if group_table.is_member(group, configured.endpoint) {
-                    let _ = targets.push(configured.endpoint);
+    match group_members {
+        Some(members) => {
+            for &member in members {
+                if endpoints
+                    .iter()
+                    .any(|configured| configured.endpoint == member)
+                {
+                    let _ = targets.push(member);
                 }
             }
         }
@@ -3236,16 +3240,14 @@ mod tests {
     #[test]
     fn delivery_endpoints_follow_group_membership_and_broadcast_endpoint() {
         let fx = Fixture::with_second_endpoint(&[ClusterId::IDENTIFY]);
-        let mut table = zigbee_aps::group::GroupTable::new();
-        assert!(table.add_group(0x0042, EP2));
-
-        let members = super::delivery_endpoints(&fx.endpoints, 0xFF, Some(0x0042), &table);
+        // 0x63 is an APS group member that is not a configured endpoint.
+        let members = super::delivery_endpoints(&fx.endpoints, 0xFF, Some(&[EP2, 0x63]));
         assert_eq!(members.as_slice(), &[EP2]);
-        let none = super::delivery_endpoints(&fx.endpoints, 0xFF, Some(0x0043), &table);
+        let none = super::delivery_endpoints(&fx.endpoints, 0xFF, Some(&[]));
         assert!(none.is_empty());
-        let all = super::delivery_endpoints(&fx.endpoints, 0xFF, None, &table);
+        let all = super::delivery_endpoints(&fx.endpoints, 0xFF, None);
         assert_eq!(all.as_slice(), &[EP, EP2]);
-        let one = super::delivery_endpoints(&fx.endpoints, EP2, None, &table);
+        let one = super::delivery_endpoints(&fx.endpoints, EP2, None);
         assert_eq!(one.as_slice(), &[EP2]);
     }
 

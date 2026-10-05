@@ -4274,6 +4274,187 @@ mod resume_tests {
         assert!(device.pending_responses.is_empty());
     }
 
+    /// Unicast Groups-cluster command to `endpoint` (APS unicast, ZCL
+    /// cluster-specific client→server).
+    #[cfg(feature = "groups")]
+    fn groups_command_frame(
+        endpoint: u8,
+        command: u8,
+        group: Option<u16>,
+        aps_counter: u8,
+        frame_counter: u32,
+    ) -> zigbee_mac::MacFrame {
+        let mut payload: heapless::Vec<u8, 32> = heapless::Vec::new();
+        payload
+            .extend_from_slice(&[
+                0x00, // APS FC: data frame, unicast
+                endpoint,
+                0x04,
+                0x00, // Groups cluster
+                0x04,
+                0x01, // HA profile
+                0x01, // source endpoint
+                aps_counter,
+                0x01, // ZCL FC: cluster-specific, client→server
+                aps_counter,
+                command,
+            ])
+            .unwrap();
+        if let Some(group) = group {
+            payload.extend_from_slice(&group.to_le_bytes()).unwrap();
+        }
+        if command == zigbee_zcl::clusters::groups::CMD_ADD_GROUP.0 {
+            payload.push(0x00).unwrap(); // empty group name
+        }
+        nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &payload,
+            frame_counter,
+            true,
+        )
+    }
+
+    /// End to end: Add Group received over ZCL puts the endpoint into the
+    /// APS group table, so APS stops dropping that group and the runtime
+    /// fans the frame out to the member endpoint only; Remove Group and
+    /// Remove All Groups take it out again.
+    #[test]
+    #[cfg(feature = "groups")]
+    fn zcl_group_membership_drives_aps_group_delivery() {
+        use zigbee_zcl::clusters::groups::{
+            CMD_ADD_GROUP, CMD_REMOVE_ALL_GROUPS, CMD_REMOVE_GROUP, GroupsCluster,
+        };
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .endpoint(1, 0x0104, crate::DeviceId::ON_OFF_LIGHT, |endpoint| {
+                endpoint
+                    .cluster_server(crate::ClusterId::IDENTIFY)
+                    .cluster_server(crate::ClusterId::GROUPS)
+            })
+            .endpoint(2, 0x0104, crate::DeviceId::ON_OFF_LIGHT, |endpoint| {
+                endpoint
+                    .cluster_server(crate::ClusterId::IDENTIFY)
+                    .cluster_server(crate::ClusterId::GROUPS)
+            })
+            .build();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        let mut groups_1 = GroupsCluster::new();
+        let mut groups_2 = GroupsCluster::new();
+        let zero = Some(zigbee_zcl::data_types::ZclValue::U16(0));
+        let five = Some(zigbee_zcl::data_types::ZclValue::U16(5));
+        let mut counter = 1u8;
+        let mut send = |device: &mut ZigbeeDevice<MockMac>,
+                        groups_1: &mut GroupsCluster,
+                        groups_2: &mut GroupsCluster,
+                        frame: &dyn Fn(u8) -> zigbee_mac::MacFrame| {
+            let mut clusters = [
+                crate::ClusterRef {
+                    endpoint: 1,
+                    cluster: groups_1,
+                },
+                crate::ClusterRef {
+                    endpoint: 2,
+                    cluster: groups_2,
+                },
+            ];
+            let frame = frame(counter);
+            counter += 1;
+            block_on(device.process_incoming(&indication(frame), &mut clusters))
+        };
+
+        // Before any Add Group, APS has no member endpoint: dropped.
+        send(&mut device, &mut groups_1, &mut groups_2, &|n| {
+            group_identify_frame(0x0010, n, u32::from(n))
+        });
+        assert_eq!(identify_time(&device, 1), zero);
+        assert_eq!(identify_time(&device, 2), zero);
+
+        // Add Group 0x0010 on endpoint 2 via ZCL.
+        send(&mut device, &mut groups_1, &mut groups_2, &|n| {
+            groups_command_frame(2, CMD_ADD_GROUP.0, Some(0x0010), n, u32::from(n))
+        });
+        assert_eq!(
+            device.bdb.zdo().aps().group_member_endpoints(0x0010),
+            &[2],
+            "a successful Add Group populates the APS group table"
+        );
+
+        // Group 0x0010 reaches endpoint 2 only.
+        device.reset_identify_clusters();
+        send(&mut device, &mut groups_1, &mut groups_2, &|n| {
+            group_identify_frame(0x0010, n, u32::from(n))
+        });
+        assert_eq!(identify_time(&device, 1), zero);
+        assert_eq!(identify_time(&device, 2), five);
+
+        // A group no endpoint belongs to is dropped.
+        device.reset_identify_clusters();
+        send(&mut device, &mut groups_1, &mut groups_2, &|n| {
+            group_identify_frame(0x0011, n, u32::from(n))
+        });
+        assert_eq!(identify_time(&device, 1), zero);
+        assert_eq!(identify_time(&device, 2), zero);
+
+        // Remove Group: the group is dropped again.
+        send(&mut device, &mut groups_1, &mut groups_2, &|n| {
+            groups_command_frame(2, CMD_REMOVE_GROUP.0, Some(0x0010), n, u32::from(n))
+        });
+        assert!(
+            device
+                .bdb
+                .zdo()
+                .aps()
+                .group_member_endpoints(0x0010)
+                .is_empty()
+        );
+        device.reset_identify_clusters();
+        send(&mut device, &mut groups_1, &mut groups_2, &|n| {
+            group_identify_frame(0x0010, n, u32::from(n))
+        });
+        assert_eq!(identify_time(&device, 2), zero);
+
+        // Remove All Groups on endpoint 1 leaves endpoint 2 a member.
+        for endpoint in [1, 2] {
+            send(&mut device, &mut groups_1, &mut groups_2, &|n| {
+                groups_command_frame(endpoint, CMD_ADD_GROUP.0, Some(0x0020), n, u32::from(n))
+            });
+        }
+        assert_eq!(
+            device.bdb.zdo().aps().group_member_endpoints(0x0020),
+            &[1, 2]
+        );
+        send(&mut device, &mut groups_1, &mut groups_2, &|n| {
+            groups_command_frame(1, CMD_REMOVE_ALL_GROUPS.0, None, n, u32::from(n))
+        });
+        assert_eq!(device.bdb.zdo().aps().group_member_endpoints(0x0020), &[2]);
+        device.reset_identify_clusters();
+        send(&mut device, &mut groups_1, &mut groups_2, &|n| {
+            group_identify_frame(0x0020, n, u32::from(n))
+        });
+        assert_eq!(identify_time(&device, 1), zero);
+        assert_eq!(identify_time(&device, 2), five);
+    }
+
+    /// Without the `groups` feature nothing would mirror Groups-cluster
+    /// membership into the APS group table, so a Groups server is refused
+    /// rather than advertised and silently never receiving a groupcast.
+    #[test]
+    #[cfg(not(feature = "groups"))]
+    fn groups_server_is_refused_without_the_groups_feature() {
+        let device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .endpoint(1, 0x0104, crate::DeviceId::ON_OFF_LIGHT, |endpoint| {
+                endpoint
+                    .cluster_server(crate::ClusterId::IDENTIFY)
+                    .cluster_server(crate::ClusterId::GROUPS)
+            })
+            .build();
+        let servers = &device.endpoints[0].server_clusters;
+        assert!(servers.contains(&crate::ClusterId::IDENTIFY));
+        assert!(!servers.contains(&crate::ClusterId::GROUPS));
+    }
+
     #[test]
     fn nwk_leave_with_rejoin_clears_remote_reporting_immediately() {
         let mut device = resumed_device(DeviceType::EndDevice);
@@ -13308,11 +13489,11 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             _ => None,
         };
         let unicast = group.is_none() && nwk_dst.0 < 0xFFF8;
+        let aps = self.bdb.zdo().aps();
         let targets = zcl_dispatch::delivery_endpoints(
             &self.endpoints,
             dst_ep,
-            group,
-            self.bdb.zdo().aps().group_table(),
+            group.map(|group| aps.group_member_endpoints(group)),
         );
         if targets.is_empty() {
             rt_trace!("[RT] zcl_rx no member endpoint for dst_ep={}", dst_ep);

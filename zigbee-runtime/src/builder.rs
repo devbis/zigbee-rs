@@ -896,7 +896,18 @@ impl EndpointBuilder {
     ///
     /// Basic and Identify use the runtime-owned instances configured by
     /// `DeviceBuilder`; other clusters must also be supplied as `ClusterRef`s.
+    ///
+    /// Without the `groups` feature the runtime has no Groups cluster → APS
+    /// group table bridge, so APS would drop every group-addressed frame
+    /// while the Groups cluster acknowledged Add Group. A Groups server is
+    /// therefore refused (not advertised, commands answer
+    /// UNSUPPORTED_CLUSTER) instead of silently never receiving groupcasts.
     pub fn cluster_server(mut self, cluster_id: ClusterId) -> Self {
+        #[cfg(not(feature = "groups"))]
+        if cluster_id == ClusterId::GROUPS {
+            log::warn!("EndpointBuilder: Groups server needs the `groups` feature; not added");
+            return self;
+        }
         if self.server_clusters.push(cluster_id).is_err() {
             log::warn!(
                 "EndpointBuilder: server cluster table full, dropping cluster 0x{:04X}",
