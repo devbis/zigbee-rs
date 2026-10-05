@@ -264,9 +264,16 @@ where
             .start_or_resume_distributed_network_with_security_store(&mut *self.security_store)
     }
 
+    /// Recover the parent relationship of a commissioned device.
+    ///
+    /// Attempts the R22 secured rejoin first. On a centralized network a
+    /// failed secured exchange falls back to an unsecured Trust Center rejoin
+    /// (the same policy the runtime's own retry uses), so a device whose
+    /// network key rotated while it was away can still recover. Distributed
+    /// and self-formed networks keep the secured attempt only.
     pub async fn secure_rejoin(&mut self) -> Result<u16, StartError> {
         self.device
-            .secure_rejoin_with_security_store(&mut *self.security_store)
+            .secure_rejoin_with_fallback_with_security_store(&mut *self.security_store)
             .await
     }
 

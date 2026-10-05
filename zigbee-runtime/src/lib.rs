@@ -2744,6 +2744,100 @@ mod resume_tests {
     }
 
     #[test]
+    fn application_secure_rejoin_falls_back_to_trust_center_rejoin() {
+        // `ZigbeeNode::secure_rejoin()` is what applications call after a
+        // Leave-with-rejoin or a lost parent. It used to stop after the
+        // secured attempt, so a device that missed a key rotation could only
+        // recover through the runtime's own retry timer.
+        use crate::node::ZigbeeNode;
+        use crate::profile::{DeviceProfile, RangeExtender};
+
+        const CURRENT_KEY: [u8; 16] = [0x9C; 16];
+        const CURRENT_SEQUENCE: u8 = 5;
+        const NEW_SHORT: ShortAddress = ShortAddress(0x6791);
+
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+        device.mac_mut().add_beacon(rejoin_beacon());
+        // The parent refuses the secured rejoin (stale key) ...
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            secured_rejoin_response(0x57, ShortAddress(OUR_SHORT), 1),
+            ShortAddress(OUR_SHORT),
+        ));
+        // ... and accepts the Trust Center rejoin with the current key.
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            trust_center_rejoin_transport_key(NEW_SHORT, CURRENT_KEY, CURRENT_SEQUENCE),
+            NEW_SHORT,
+        ));
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            unsecured_rejoin_response(ShortAddress(OUR_SHORT), NEW_SHORT),
+            ShortAddress(OUR_SHORT),
+        ));
+
+        let mut profile = DeviceProfile::new(
+            1,
+            zigbee_aps::PROFILE_HOME_AUTOMATION,
+            zigbee_zcl::DeviceId::RANGE_EXTENDER,
+            RangeExtender,
+        );
+        let mut node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        assert_eq!(block_on(node.secure_rejoin()), Ok(NEW_SHORT.0));
+
+        assert!(device.is_joined());
+        let history = device.mac().tx_history();
+        let (secured_request, _) =
+            zigbee_nwk::frames::NwkHeader::parse(history[0].payload.as_slice()).unwrap();
+        let (tc_request, _) =
+            zigbee_nwk::frames::NwkHeader::parse(history[1].payload.as_slice()).unwrap();
+        assert!(secured_request.frame_control.security);
+        assert!(!tc_request.frame_control.security);
+        let persisted = store.load().unwrap().unwrap();
+        assert_eq!(persisted.network_key, CURRENT_KEY);
+        assert_eq!(persisted.short_address, NEW_SHORT.0);
+        assert!(!persisted.rejoin_pending);
+    }
+
+    #[test]
+    fn application_secure_rejoin_never_falls_back_on_distributed_networks() {
+        use crate::node::ZigbeeNode;
+        use crate::profile::{DeviceProfile, RangeExtender};
+
+        let mut state = commissioned_state();
+        state.node_join_link_key_type =
+            zigbee_bdb::NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey;
+        state.tclk_present = false;
+        state.trust_center_address = [0xFF; 8];
+        state.trust_center_link_key = [0; 16];
+        state.tclk_counter_limit = 0;
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+        device.mac_mut().add_beacon(rejoin_beacon());
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            secured_rejoin_response(0x58, ShortAddress(OUR_SHORT), 1),
+            ShortAddress(OUR_SHORT),
+        ));
+
+        let mut profile = DeviceProfile::new(
+            1,
+            zigbee_aps::PROFILE_HOME_AUTOMATION,
+            zigbee_zcl::DeviceId::RANGE_EXTENDER,
+            RangeExtender,
+        );
+        let mut node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        assert!(matches!(
+            block_on(node.secure_rejoin()),
+            Err(crate::event_loop::StartError::CommissioningFailed(_))
+        ));
+        assert_eq!(device.mac().tx_history().len(), 1);
+    }
+
+    #[test]
     fn distributed_persisted_rejoin_never_uses_trust_center_fallback() {
         let mut state = commissioned_state();
         state.rejoin_pending = true;
@@ -6057,6 +6151,17 @@ pub const MAX_ENDPOINTS: usize = 4;
 #[cfg(feature = "compact-single-endpoint")]
 const _: () = assert!(MAX_ENDPOINTS <= zigbee_zdo::MAX_LOCAL_ENDPOINTS);
 
+/// Which rejoin procedures the persisted security regime permits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RejoinFallback {
+    /// Not a joined, commissioned record (factory-new or self-formed).
+    NotRejoinable,
+    /// Distributed security: only the secured NWK rejoin is allowed.
+    SecureOnly,
+    /// Centralized security: secured rejoin, then unsecured TC rejoin.
+    TrustCenterRejoin,
+}
+
 /// Counters the legacy NV restore skips past the stored floor. Older records
 /// stored the live counter rather than a write-ahead limit.
 #[cfg(feature = "legacy-nv")]
@@ -8193,6 +8298,47 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         &mut self,
         store: &mut S,
     ) -> Result<u16, event_loop::StartError> {
+        match Self::rejoin_fallback_policy(store)? {
+            RejoinFallback::NotRejoinable => Err(event_loop::StartError::PersistenceFailed(
+                SecurityStoreError::Corrupt,
+            )),
+            RejoinFallback::SecureOnly => self.secure_rejoin_with_security_store(store).await,
+            RejoinFallback::TrustCenterRejoin => {
+                self.secure_then_trust_center_rejoin_with_security_store(store)
+                    .await
+            }
+        }
+    }
+
+    /// Secured rejoin with the persisted fallback policy, for application
+    /// driven recovery (Leave-with-rejoin, lost parent).
+    ///
+    /// Behaves like [`Self::rejoin_with_security_store`] for a commissioned
+    /// centralized end device or router — a failed secured rejoin falls back
+    /// to an unsecured Trust Center rejoin — but, unlike it, keeps the plain
+    /// secured attempt (no fallback) for a distributed or self-formed network
+    /// instead of rejecting the request.
+    pub async fn secure_rejoin_with_fallback_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<u16, event_loop::StartError> {
+        match Self::rejoin_fallback_policy(store)? {
+            RejoinFallback::TrustCenterRejoin => {
+                self.secure_then_trust_center_rejoin_with_security_store(store)
+                    .await
+            }
+            RejoinFallback::NotRejoinable | RejoinFallback::SecureOnly => {
+                self.secure_rejoin_with_security_store(store).await
+            }
+        }
+    }
+
+    /// Classify the persisted record without keeping it alive across the
+    /// rejoin awaits (the full record would otherwise sit in every caller's
+    /// future for the whole multi-second exchange).
+    fn rejoin_fallback_policy<S: SecurityStateStore>(
+        store: &mut S,
+    ) -> Result<RejoinFallback, event_loop::StartError> {
         let state = store
             .load()
             .map_err(event_loop::StartError::PersistenceFailed)?
@@ -8202,19 +8348,57 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         state
             .validate()
             .map_err(event_loop::StartError::PersistenceFailed)?;
-        if !state.commissioned || state.is_formed_network() {
+        Ok(if !state.commissioned || state.is_formed_network() {
+            RejoinFallback::NotRejoinable
+        } else if state.node_join_link_key_type.is_distributed() {
+            RejoinFallback::SecureOnly
+        } else {
+            RejoinFallback::TrustCenterRejoin
+        })
+    }
+
+    async fn secure_then_trust_center_rejoin_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<u16, event_loop::StartError> {
+        match self.secure_rejoin_with_security_store(store).await {
+            // Only a failed over-the-air exchange may widen to the unsecured
+            // Trust Center rejoin; persistence failures stop here.
+            Err(event_loop::StartError::CommissioningFailed(status)) => {
+                log::info!(
+                    "[Runtime] Secured rejoin failed ({:?}); falling back to Trust Center rejoin",
+                    status
+                );
+            }
+            other => return other,
+        }
+        self.trust_center_rejoin_fallback_with_security_store(store)
+            .await
+    }
+
+    async fn trust_center_rejoin_fallback_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<u16, event_loop::StartError> {
+        // Reload after the secured attempt: its failure path refreshed the
+        // stored counters, and the record is only needed from here on.
+        let state = store
+            .load()
+            .map_err(event_loop::StartError::PersistenceFailed)?
+            .ok_or(event_loop::StartError::PersistenceFailed(
+                SecurityStoreError::NotFound,
+            ))?;
+        state
+            .validate()
+            .map_err(event_loop::StartError::PersistenceFailed)?;
+        if !state.commissioned
+            || state.is_formed_network()
+            || state.node_join_link_key_type.is_distributed()
+        {
             return Err(event_loop::StartError::PersistenceFailed(
                 SecurityStoreError::Corrupt,
             ));
         }
-
-        match self.secure_rejoin_with_security_store(store).await {
-            Ok(address) => return Ok(address),
-            Err(error @ event_loop::StartError::PersistenceFailed(_)) => return Err(error),
-            Err(error) if state.node_join_link_key_type.is_distributed() => return Err(error),
-            Err(_) => {}
-        }
-
         // The secured attempt may have moved the MAC to a candidate channel.
         // Restore the persisted parent-facing PIB values before starting the
         // unsecured centralized fallback.
