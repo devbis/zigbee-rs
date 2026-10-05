@@ -1,14 +1,12 @@
 //! ESP32-H2 capabilities for the shared sleepy-sensor application.
 
-use core::convert::Infallible;
-
 use esp_hal::gpio::Output;
 use sensor_sed_app::{
     DiagnosticEvent, Diagnostics, EnvironmentReading, EnvironmentSource, SensorStatus, StatusSink,
     Supervisor,
 };
 
-use crate::chip_temperature::H2TemperatureSensor;
+use crate::chip_temperature::{self, H2TemperatureSensor};
 
 /// GPIO8 status LED, active low.
 pub struct ActiveLowStatus<'d> {
@@ -56,12 +54,12 @@ impl H2Environment {
 }
 
 impl EnvironmentSource for H2Environment {
-    type Error = Infallible;
+    type Error = chip_temperature::Error;
 
     async fn sample(&mut self) -> Result<EnvironmentReading, Self::Error> {
         self.humidity_tick = self.humidity_tick.wrapping_add(1);
         Ok(EnvironmentReading {
-            temperature_centi_celsius: self.sensor.read_centi_celsius(),
+            temperature_centi_celsius: self.sensor.read_centi_celsius()?,
             humidity_centi_percent: 5_000 + ((self.humidity_tick % 100) as u16) * 10,
             pressure_tenth_kpa: None,
         })
@@ -72,7 +70,9 @@ impl EnvironmentSource for H2Environment {
 pub struct EspSupervisor;
 
 impl Supervisor for EspSupervisor {
-    fn heartbeat(&mut self) {}
+    fn heartbeat(&mut self) {
+        esp32_zigbee_devkit_product::ota_boot::poll();
+    }
 
     fn max_wait_ms(&self) -> Option<u32> {
         None
@@ -89,5 +89,6 @@ pub struct EspDiagnostics;
 impl Diagnostics for EspDiagnostics {
     fn record(&mut self, event: DiagnosticEvent) {
         esp_println::println!("[ESP32-H2] {:?}", event);
+        esp32_zigbee_devkit_product::ota_boot::observe(&event);
     }
 }

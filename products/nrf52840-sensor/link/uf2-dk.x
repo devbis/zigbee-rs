@@ -20,3 +20,5 @@ ASSERT(ORIGIN(SECURITY_JOURNAL) + LENGTH(SECURITY_JOURNAL) == 0x00100000,
   "nRF52840 DK journal must occupy the top two pages");
 ASSERT(ORIGIN(RAM) + LENGTH(RAM) == 0x20040000,
   "nRF52840 DK RAM map must cover the full 256 KiB");
+ASSERT(_stack_start - __euninit >= 16K,
+  "nRF52840 DK static data must leave at least 16 KiB for the stack");

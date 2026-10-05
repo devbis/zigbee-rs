@@ -24,7 +24,9 @@ fn main() -> ! {
             + efr32mg1_tradfri_product::storage::APP_NV_PARTITION_SIZE as u32
     );
 
-    let mut nv = match efr32mg1_tradfri_product::storage::application_nv() {
+    let chip = efr32mg1_hal::peripherals::Peripherals::take().unwrap_or_else(|| platform::halt());
+    let (_, nv_partition) = efr32mg1_tradfri_product::storage::split_flash(chip.flash);
+    let mut nv = match efr32mg1_tradfri_product::storage::application_nv(nv_partition) {
         Ok(nv) => nv,
         Err(error) => {
             rtt_target::rprintln!("[EFR32][diag-nv] OPEN_FAIL error={:?}", error);

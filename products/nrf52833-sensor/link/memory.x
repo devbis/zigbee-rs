@@ -31,3 +31,5 @@ ASSERT(_security_partition_end == 512K,
   "nRF52833 security journal must occupy the top of the 512 KiB flash");
 ASSERT(ORIGIN(RAM) + LENGTH(RAM) == 0x20020000,
   "nRF52833 RAM region must end at the top of the part's 128 KiB SRAM");
+ASSERT(_stack_start - __euninit >= 16K,
+  "nRF52833 static data must leave at least 16 KiB for the stack");

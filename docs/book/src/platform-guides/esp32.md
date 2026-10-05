@@ -80,9 +80,15 @@ successful compilation.
 
 The reported temperature is the on-chip sensor reading, not ambient
 temperature. Real self-heating is possible. No guessed temperature offset is
-applied. C6, like H2, now powers its temperature sensor only around samples.
-Validating TSENS range and calibration is separate from measuring the effect
-of sleep.
+applied. Both chips select ESP-IDF's default −10…80 °C TSENS range (DAC 15,
+offset 0) before every sample, verify it by read-back, and subtract the
+per-chip sign-magnitude `TEMP_CALIB` eFuse delta exactly as ESP-IDF v5.5
+does (`products/esp32-zigbee-devkit/src/chip_temperature.rs`). Earlier C6
+builds used esp-hal's hard-coded offset −1 without programming the DAC,
+which over-reports by 27.88 °C when the DAC is in the default range. C6,
+like H2, powers its temperature sensor only around samples. Accuracy against
+a reference thermometer is still a hardware gate, separate from measuring the
+effect of sleep.
 
 OTA cluster events reach `OtaTransport` before generic application handling.
 When the image is ready, `SensorApp` checkpoints Zigbee security state before
@@ -123,14 +129,45 @@ The writer:
   chip/revision compatibility, entry address, XOR checksum, exact image length,
   and appended SHA-256;
 - rechecks staged flash before activation;
-- writes one redundant `otadata` entry for activation.
+- writes one redundant `otadata` entry in the `ESP_OTA_IMG_NEW` state for
+  activation, and refuses to stage while the running image is unconfirmed,
+  because the other slot is then the rollback target.
+
+### Pending verification and rollback
+
+The espflash-bundled ESP-IDF bootloader is built without
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`. It still honours the entry states
+and sequence numbers, so rollback is application-driven
+(`esp32_zigbee_devkit_product::ota::{check_boot, confirm_boot, roll_back}` and
+the `ota_boot` policy):
+
+1. Before persistence opens, `ota_boot::begin()` checks `otadata`. The first
+   boot of a `NEW` image programs a boot-attempt mark into the entry's unused
+   `seq_label` bytes, which only clears bits and needs no erase.
+2. A fresh join, a secured rejoin, or an inbound decrypted ZCL frame confirms
+   the image: its entry is rewritten as `VALID`.
+3. A silent resume has no radio exchange. It confirms only after the image has
+   run for 15 minutes without a failed rejoin, commissioning or wake.
+4. A boot that finds its own mark without confirmation (crash, watchdog or
+   power loss), the 15-minute deadline without evidence, a reached
+   secure-rejoin limit (before the application wipes network state), or a
+   security-store failure selects the previous slot. A `VALID` entry with a
+   higher sequence is written to the spare sector first, then the abandoned
+   entry is marked `ABORTED`, and the chip resets.
+5. If the bootloader itself fell back from an invalid new image, the running
+   slot is recorded as `VALID`.
+
+Confirmation erases and rewrites the active sector. A power loss inside that
+window boots the previous image. Any deliberate reset before confirmation also
+rolls back.
 
 `EspFirmwareWriter::new()` returns an initialization error if its flash
 implementation cannot supply running-slot and image-compatibility evidence.
 The standard sensor profile propagates this error instead of guessing a slot.
 
 These checks cover unsigned plaintext image structure and integrity, not
-secure-boot signatures, anti-rollback policy, or program correctness. The
+secure-boot signatures, anti-rollback (version downgrade) policy, or program
+correctness. The
 offline size checker and OTA packager share the same Python structural
 validator; on-device revision compatibility is checked by the writer rather
 than guessed by offline tooling.
@@ -241,7 +278,8 @@ An earlier 4 MiB ESP32-H2 revision 1.2 image demonstrated:
 - retained IEEE address, PAN, parent, network credentials, and counters.
 
 Fresh factory-reset commissioning and long-duration power behavior remain
-separate gates. Neither current H2 variant above has hardware execution
+separate gates. Pending verification, confirmation and rollback are host-tested
+only; no OTA boot of either chip has exercised them. Neither current H2 variant above has hardware execution
 evidence. Removing artificial size budgets does not close those hardware gates.
 
 ### ESP32-C6

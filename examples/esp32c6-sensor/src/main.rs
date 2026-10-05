@@ -143,6 +143,22 @@ fn main() -> ! {
     let temp_sensor = TemperatureSensor::new(peripherals.TSENS, TsensConfig::default())
         .expect("temp sensor init failed");
 
+    // OTA pending verification runs before persistence is opened, so an
+    // image that never confirmed resets into the previous slot before it
+    // touches the network state again.
+    // A freshly installed image is confirmed once it proves network
+    // operation; see `esp32_zigbee_devkit_product::ota_boot`.
+    match product::ota_boot::begin() {
+        Ok(product::ota::BootCheck::RolledBack { slot }) => {
+            esp_println::println!(
+                "[ESP32-C6] OTA image unconfirmed; rolling back to slot {}",
+                slot
+            );
+            esp_hal::system::software_reset();
+        }
+        check => esp_println::println!("[ESP32-C6] OTA boot check: {:?}", check),
+    }
+
     // Product-owned durable security store and endpoint/OTA profile.
     //
     // `open_security_store` also runs the one-time legacy persistence

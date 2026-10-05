@@ -18,6 +18,9 @@ impl Crypto {
 pub struct Peripherals {
     /// CRYPTO AES-128 accelerator (see [`crate::crypto`]).
     pub crypto: Crypto,
+    /// Internal MSC flash (whole chip). Products split it into bounded
+    /// persistence partitions; see [`crate::flash::Efr32mg1Flash`].
+    pub flash: crate::flash::Efr32mg1Flash,
 }
 
 static TAKEN: AtomicBool = AtomicBool::new(false);
@@ -30,6 +33,9 @@ impl Peripherals {
             .ok()
             .map(|_| Self {
                 crypto: Crypto::new(),
+                // SAFETY: `TAKEN` guarantees this is the only flash handle
+                // minted by safe code.
+                flash: unsafe { crate::flash::Efr32mg1Flash::new() },
             })
     }
 }
@@ -48,5 +54,10 @@ mod tests {
     #[test]
     fn crypto_token_is_zero_sized() {
         assert_eq!(size_of::<Crypto>(), 0);
+    }
+
+    #[test]
+    fn flash_handle_is_zero_sized() {
+        assert_eq!(size_of::<crate::flash::Efr32mg1Flash>(), 0);
     }
 }

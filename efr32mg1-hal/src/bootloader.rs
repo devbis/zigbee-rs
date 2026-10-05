@@ -16,7 +16,11 @@ const FIRST_STAGE_END: u32 = 0x0000_0800;
 const MAIN_STAGE_START: u32 = FIRST_STAGE_END;
 const APPLICATION_START: u32 = 0x0000_4000;
 const SRAM_START: u32 = 0x2000_0000;
-const SRAM_END: u32 = 0x2000_8000;
+/// End of the SRAM window this HAL accepts for bootloader-provided records.
+/// The proven EFR32MG1P product treats only `0x2000_0000..0x2000_7C00`
+/// (`0x7C00` bytes) as usable SRAM; a storage-information pointer outside
+/// that window is rejected rather than dereferenced.
+const SRAM_END: u32 = 0x2000_7C00;
 
 const BARE_TABLE_POINTER_OFFSET: u32 = core::mem::offset_of!(RawBareBootTable, table) as u32;
 const FIRST_TABLE_POINTER_ADDRESS: u32 = BARE_TABLE_POINTER_OFFSET;
@@ -572,6 +576,13 @@ fn address_range_valid(address: u32, size: usize, start: u32, end: u32) -> bool 
             .is_some_and(|range_end| address >= start && range_end <= end)
 }
 
+/// The storage-implementation record must lie in the bootloader main stage
+/// or in implemented SRAM.
+fn storage_information_address_valid(address: u32, size: usize) -> bool {
+    address_range_valid(address, size, MAIN_STAGE_START, APPLICATION_START)
+        || address_range_valid(address, size, SRAM_START, SRAM_END)
+}
+
 fn thumb_function_valid(address: u32) -> bool {
     address & 1 != 0 && (MAIN_STAGE_START..APPLICATION_START).contains(&(address & !1))
 }
@@ -746,9 +757,7 @@ unsafe fn read_storage_implementation(
     address: u32,
 ) -> Result<RawStorageImplementationInformation, Error> {
     let size = core::mem::size_of::<RawStorageImplementationInformation>();
-    if !address_range_valid(address, size, MAIN_STAGE_START, APPLICATION_START)
-        && !address_range_valid(address, size, SRAM_START, SRAM_END)
-    {
+    if !storage_information_address_valid(address, size) {
         return Err(Error::InvalidStorageInformation);
     }
     #[cfg(target_arch = "arm")]
@@ -902,6 +911,24 @@ const _: Option<StorageDmaChannelFn> = None;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_information_must_be_in_implemented_sram_or_main_stage() {
+        let size = core::mem::size_of::<RawStorageImplementationInformation>();
+        let size_u32 = size as u32;
+        assert!(storage_information_address_valid(0x2000_0000, size));
+        assert!(storage_information_address_valid(SRAM_END - size_u32, size));
+        // 0x2000_7C00.. is outside the usable SRAM window.
+        assert!(!storage_information_address_valid(
+            SRAM_END - size_u32 + 4,
+            size
+        ));
+        assert!(!storage_information_address_valid(0x2000_7C00, size));
+        assert!(!storage_information_address_valid(0x2000_7FF0, 4));
+        assert!(storage_information_address_valid(MAIN_STAGE_START, size));
+        assert!(!storage_information_address_valid(APPLICATION_START, size));
+        assert!(!storage_information_address_valid(0x2000_0002, size));
+    }
 
     fn valid_tables() -> (
         u32,
