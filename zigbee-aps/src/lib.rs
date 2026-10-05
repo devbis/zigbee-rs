@@ -52,6 +52,35 @@ use zigbee_nwk::NwkLayer;
 /// Volatile wipe of secret material (re-exported from `zigbee-crypto`).
 pub(crate) use zigbee_crypto::zeroize;
 
+/// Stack buffer holding secret material (plaintext keys, derived keys,
+/// key-bearing command payloads) that is wiped on drop, on every return path.
+pub(crate) struct Secret<const N: usize>(pub(crate) [u8; N]);
+
+impl<const N: usize> Secret<N> {
+    pub(crate) const fn zeroed() -> Self {
+        Self([0u8; N])
+    }
+}
+
+impl<const N: usize> Drop for Secret<N> {
+    fn drop(&mut self) {
+        zeroize(&mut self.0);
+    }
+}
+
+impl<const N: usize> core::ops::Deref for Secret<N> {
+    type Target = [u8; N];
+    fn deref(&self) -> &[u8; N] {
+        &self.0
+    }
+}
+
+impl<const N: usize> core::ops::DerefMut for Secret<N> {
+    fn deref_mut(&mut self) -> &mut [u8; N] {
+        &mut self.0
+    }
+}
+
 // ── Well-known endpoints ────────────────────────────────────────
 
 /// ZDO endpoint (Zigbee Device Object)

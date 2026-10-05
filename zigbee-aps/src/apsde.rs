@@ -1484,6 +1484,11 @@ impl<M: MacDriver> ApsLayer<M> {
                         log::debug!("Unknown APS command 0x{:02X}", cmd_id);
                     }
                 }
+                // Decrypted security commands carry key material (Transport-Key)
+                // and are never delivered upward: wipe the plaintext now.
+                if used_decrypted_buf {
+                    decrypted_buf.clear();
+                }
                 if let Some(replay) = deferred_application_key_replay {
                     if self.pending_application_key_persistence {
                         self.pending_application_key_replay = Some(replay);
@@ -2434,13 +2439,14 @@ impl<M: MacDriver> ApsLayer<M> {
                 .await
         };
 
-        if result.is_ok()
-            && let Some(entry) = self
-                .security
-                .find_key_mut(destination, crate::security::ApsKeyType::TrustCenterLinkKey)
-        {
-            entry.incoming_frame_counter = 0;
-            entry.incoming_frame_counter_valid = false;
+        // A floor committed under the confirmed key itself is kept: lowering
+        // it would re-admit replays of frames already accepted with this key.
+        // Only a floor inherited from the previous key value is reset.
+        if result.is_ok() {
+            self.security.reset_stale_incoming_floor(
+                destination,
+                crate::security::ApsKeyType::TrustCenterLinkKey,
+            );
         }
         result.map(|_| ())
     }
@@ -2512,11 +2518,12 @@ impl<M: MacDriver> ApsLayer<M> {
         let material = self
             .next_installed_tc_link_key_material(child_address)
             .ok_or(ApsStatus::SecurityFail)?;
-        let key_transport_key =
+        let key_transport_key = crate::Secret(
             crate::security::derive_key_transport_key_with(self.nwk.mac_mut(), &material.key)
-                .ok_or(ApsStatus::SecurityFail)?;
+                .ok_or(ApsStatus::SecurityFail)?,
+        );
 
-        let mut transport_command = [0u8; 35];
+        let mut transport_command = crate::Secret::<35>::zeroed();
         transport_command[0] = crate::frames::ApsCommandId::TransportKey as u8;
         transport_command[1] = WIRE_KEY_TYPE_NETWORK;
         transport_command[2..18].copy_from_slice(network_key);
@@ -2535,7 +2542,7 @@ impl<M: MacDriver> ApsLayer<M> {
             material.frame_counter,
             crate::security::KEY_ID_KEY_TRANSPORT,
             false,
-            &transport_command,
+            &transport_command[..],
             &mut tunneled_frame,
         )
         .ok_or(ApsStatus::SecurityFail)?;
@@ -2598,10 +2605,11 @@ impl<M: MacDriver> ApsLayer<M> {
         let material = self
             .next_installed_tc_link_key_material(destination)
             .ok_or(ApsStatus::SecurityFail)?;
-        let key_load_key =
+        let key_load_key = crate::Secret(
             crate::security::derive_key_load_key_with(self.nwk.mac_mut(), &material.key)
-                .ok_or(ApsStatus::SecurityFail)?;
-        let mut command = [0u8; 27];
+                .ok_or(ApsStatus::SecurityFail)?,
+        );
+        let mut command = crate::Secret::<27>::zeroed();
         command[0] = crate::frames::ApsCommandId::TransportKey as u8;
         command[1] = WIRE_KEY_TYPE_APPLICATION_LINK;
         command[2..18].copy_from_slice(key);
@@ -2615,7 +2623,7 @@ impl<M: MacDriver> ApsLayer<M> {
             material.frame_counter,
             crate::security::KEY_ID_KEY_LOAD,
             true,
-            &command,
+            &command[..],
         )
         .await
         .map(|_| ())
@@ -2835,7 +2843,7 @@ impl<M: MacDriver> ApsLayer<M> {
             .ok_or(ApsStatus::SecurityFail)?;
         let local_ieee = self.nwk.nib().ieee_address;
 
-        let mut command = [0u8; 35];
+        let mut command = crate::Secret::<35>::zeroed();
         command[0] = crate::frames::ApsCommandId::TransportKey as u8;
         command[1] = WIRE_KEY_TYPE_NETWORK;
         command[2..18].copy_from_slice(network_key);
@@ -2850,7 +2858,7 @@ impl<M: MacDriver> ApsLayer<M> {
             frame_counter,
             crate::security::KEY_ID_KEY_TRANSPORT,
             false,
-            &command,
+            &command[..],
         )
         .await
         .map(|_| ())
@@ -2870,7 +2878,7 @@ impl<M: MacDriver> ApsLayer<M> {
             "[APS] Sending Transport-Key to 0x{:04X} type={key_type}",
             dst.0
         );
-        let mut payload = [0u8; 35];
+        let mut payload = crate::Secret::<35>::zeroed();
         payload[0] = crate::frames::ApsCommandId::TransportKey as u8;
         payload[1] = key_type;
         payload[2..18].copy_from_slice(key);
@@ -2913,14 +2921,21 @@ impl<M: MacDriver> ApsLayer<M> {
             .ok_or(ApsStatus::SecurityFail)?;
         let (security_key, key_identifier) = if key_type == 0x01 {
             (
-                crate::security::derive_key_transport_key_with(self.nwk.mac_mut(), &material.key)
+                crate::Secret(
+                    crate::security::derive_key_transport_key_with(
+                        self.nwk.mac_mut(),
+                        &material.key,
+                    )
                     .ok_or(ApsStatus::SecurityFail)?,
+                ),
                 crate::security::KEY_ID_KEY_TRANSPORT,
             )
         } else {
             (
-                crate::security::derive_key_load_key_with(self.nwk.mac_mut(), &material.key)
-                    .ok_or(ApsStatus::SecurityFail)?,
+                crate::Secret(
+                    crate::security::derive_key_load_key_with(self.nwk.mac_mut(), &material.key)
+                        .ok_or(ApsStatus::SecurityFail)?,
+                ),
                 crate::security::KEY_ID_KEY_LOAD,
             )
         };
@@ -3378,10 +3393,22 @@ impl<M: MacDriver> ApsLayer<M> {
             aps_diag!("[APS] Transport-Key payload too short");
             return;
         }
-
-        let key_type = data[0];
+        // Work on a local copy of the transported key and wipe it once the
+        // command is handled, whichever branch returns (finding F14).
         let mut key = [0u8; 16];
         key.copy_from_slice(&data[1..17]);
+        self.handle_transport_key_with(data, src, security, &key);
+        zigbee_crypto::zeroize_key(&mut key);
+    }
+
+    fn handle_transport_key_with(
+        &mut self,
+        data: &[u8],
+        src: ShortAddress,
+        security: IncomingCommandSecurity,
+        key: &crate::security::AesKey,
+    ) {
+        let key_type = data[0];
         aps_diag!("[APS] Transport-Key type={}", key_type);
         if self.nwk.security().active_key().is_some() && !security.nwk_authenticated() {
             log::warn!("[APS] rejecting Transport-Key without NWK authentication");
@@ -3512,7 +3539,7 @@ impl<M: MacDriver> ApsLayer<M> {
                 }
                 aps_diag!("[APS] Installing NWK key seq={}", key_seq);
                 if initial_key {
-                    self.nwk_mut().security_mut().set_network_key(key, key_seq);
+                    self.nwk_mut().security_mut().set_network_key(*key, key_seq);
                     let nib = self.nwk_mut().nib_mut();
                     nib.active_key_seq_number = key_seq;
                     nib.security_enabled = true;
@@ -3524,7 +3551,7 @@ impl<M: MacDriver> ApsLayer<M> {
                 } else if !self
                     .nwk_mut()
                     .security_mut()
-                    .stage_network_key(key, key_seq)
+                    .stage_network_key(*key, key_seq)
                 {
                     log::warn!(
                         "[APS] Transport-Key: sequence {} conflicts with the active key",
@@ -3573,6 +3600,20 @@ impl<M: MacDriver> ApsLayer<M> {
                 }
                 let mut partner_ieee = [0u8; 8];
                 partner_ieee.copy_from_slice(&data[17..25]);
+                // An application link key is pairwise with a real remote
+                // device: never the unassigned or broadcast IEEE address, and
+                // never this device itself.
+                if partner_ieee == [0u8; 8]
+                    || partner_ieee == BROADCAST_IEEE
+                    || partner_ieee == self.nwk.nib().ieee_address
+                {
+                    log::warn!(
+                        "[APS] Transport-Key: invalid application-key partner {:02X?}",
+                        partner_ieee
+                    );
+                    self.ignore_security_command();
+                    return;
+                }
                 log::info!(
                     "[APS] Transport-Key: App Link Key from 0x{:04X}, partner={:02X?}",
                     src.0,
@@ -3584,7 +3625,7 @@ impl<M: MacDriver> ApsLayer<M> {
                         &partner_ieee,
                         crate::security::ApsKeyType::ApplicationLinkKey,
                     )
-                    .is_some_and(|existing| existing.key == key)
+                    .is_some_and(|existing| existing.key == *key)
                 {
                     log::info!(
                         "[APS] Duplicate application link key retained for partner {:02X?}",
@@ -3594,7 +3635,7 @@ impl<M: MacDriver> ApsLayer<M> {
                 }
                 let entry = crate::security::ApsLinkKeyEntry {
                     partner_address: partner_ieee,
-                    key,
+                    key: *key,
                     key_type: crate::security::ApsKeyType::ApplicationLinkKey,
                     outgoing_frame_counter: 0,
                     outgoing_frame_counter_limit: 0,
@@ -3688,7 +3729,7 @@ impl<M: MacDriver> ApsLayer<M> {
                     incoming_frame_counter,
                     incoming_frame_counter_valid,
                 ) = match prior {
-                    Some((prior_key, outgoing, limit, incoming, valid)) if prior_key == key => {
+                    Some((prior_key, outgoing, limit, incoming, valid)) if prior_key == *key => {
                         (outgoing, limit, incoming, valid)
                     }
                     _ => {
@@ -3698,7 +3739,7 @@ impl<M: MacDriver> ApsLayer<M> {
                 };
                 let entry = crate::security::ApsLinkKeyEntry {
                     partner_address: tc_ieee,
-                    key,
+                    key: *key,
                     key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
                     outgoing_frame_counter,
                     outgoing_frame_counter_limit,
@@ -4410,6 +4451,73 @@ mod tests {
         assert!(!aps.application_key_persistence_pending());
     }
 
+    /// Finding F12: an application link key naming an unassigned,
+    /// broadcast or the local IEEE address as partner is ignored.
+    #[test]
+    #[cfg(feature = "router")]
+    fn application_transport_key_rejects_invalid_partner_addresses() {
+        for partner in [[0u8; 8], [0xFF; 8], LOCAL_IEEE] {
+            let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+            aps.set_application_link_key_installation_enabled(true);
+            aps.aib_mut().aps_trust_center_address = TC_IEEE;
+            let mut transport_key = [0u8; 26];
+            transport_key[0] = WIRE_KEY_TYPE_APPLICATION_LINK;
+            transport_key[1..17].copy_from_slice(&[0xA3; 16]);
+            transport_key[17..25].copy_from_slice(&partner);
+            transport_key[25] = 1;
+            aps.handle_transport_key(
+                &transport_key,
+                ShortAddress::COORDINATOR,
+                IncomingCommandSecurity {
+                    nwk_secured: true,
+                    nwk_source: Some(TC_IEEE),
+                    nwk_originator: Some(TC_IEEE),
+                    aps_secured: true,
+                    aps_source: Some(TC_IEEE),
+                    aps_key_identifier: Some(crate::security::KEY_ID_KEY_LOAD),
+                    aps_used_default_link_key: false,
+                    aps_used_distributed_link_key: false,
+                },
+            );
+            assert!(
+                aps.security()
+                    .find_key(&partner, crate::security::ApsKeyType::ApplicationLinkKey)
+                    .is_none(),
+                "partner {partner:02X?} must be rejected"
+            );
+            assert!(!aps.application_key_persistence_pending());
+        }
+
+        // A valid partner is still installed.
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        aps.set_application_link_key_installation_enabled(true);
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        let mut transport_key = [0u8; 26];
+        transport_key[0] = WIRE_KEY_TYPE_APPLICATION_LINK;
+        transport_key[1..17].copy_from_slice(&[0xA3; 16]);
+        transport_key[17..25].copy_from_slice(&[0x44; 8]);
+        transport_key[25] = 1;
+        aps.handle_transport_key(
+            &transport_key,
+            ShortAddress::COORDINATOR,
+            IncomingCommandSecurity {
+                nwk_secured: true,
+                nwk_source: Some(TC_IEEE),
+                nwk_originator: Some(TC_IEEE),
+                aps_secured: true,
+                aps_source: Some(TC_IEEE),
+                aps_key_identifier: Some(crate::security::KEY_ID_KEY_LOAD),
+                aps_used_default_link_key: false,
+                aps_used_distributed_link_key: false,
+            },
+        );
+        assert!(
+            aps.security()
+                .find_key(&[0x44; 8], crate::security::ApsKeyType::ApplicationLinkKey)
+                .is_some()
+        );
+    }
+
     #[test]
     #[cfg(feature = "router")]
     fn application_transport_key_is_disabled_without_durable_table_ownership() {
@@ -4806,7 +4914,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "router")]
-    fn confirm_key_success_uses_the_candidate_key_and_resets_replay_state() {
+    fn confirm_key_success_uses_the_candidate_key_and_resets_only_a_stale_floor() {
         let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
         aps.aib_mut().aps_trust_center_address = LOCAL_IEEE;
         aps.nwk_mut().nib_mut().permit_joining = true;
@@ -4824,6 +4932,18 @@ mod tests {
             )
             .unwrap();
         let candidate_key = [0x6B; 16];
+        // The previous key's committed floor is carried into the candidate.
+        aps.security_mut()
+            .add_key(crate::security::ApsLinkKeyEntry {
+                partner_address: CHILD_IEEE,
+                key: [0x6A; 16],
+                key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0x1000,
+                outgoing_frame_counter_limit: 0x2400,
+                incoming_frame_counter: 77,
+                incoming_frame_counter_valid: true,
+            })
+            .unwrap();
         aps.security_mut()
             .add_key(crate::security::ApsLinkKeyEntry {
                 partner_address: CHILD_IEEE,
@@ -4871,6 +4991,64 @@ mod tests {
         assert_eq!(entry.outgoing_frame_counter, 0x2001);
         assert_eq!(entry.incoming_frame_counter, 0);
         assert!(!entry.incoming_frame_counter_valid);
+
+        // Finding F9: once a frame has been verified under the confirmed
+        // key, a later Confirm-Key for the same key must not lower the floor.
+        aps.security_mut().commit_frame_counter(
+            &CHILD_IEEE,
+            crate::security::ApsKeyType::TrustCenterLinkKey,
+            90,
+        );
+        block_on(aps.send_confirm_key(
+            &CHILD_IEEE,
+            ApsStatus::Success as u8,
+            WIRE_KEY_TYPE_TC_LINK,
+        ))
+        .unwrap();
+        let entry = aps
+            .security()
+            .find_key(&CHILD_IEEE, crate::security::ApsKeyType::TrustCenterLinkKey)
+            .unwrap();
+        assert_eq!(entry.incoming_frame_counter, 90);
+        assert!(entry.incoming_frame_counter_valid);
+    }
+
+    /// Finding F9: a Confirm-Key for a key whose replay floor was committed
+    /// under that same key (e.g. re-verification after a TC reboot restored
+    /// the key table) keeps the floor.
+    #[test]
+    #[cfg(feature = "router")]
+    fn confirm_key_for_an_unchanged_key_keeps_the_replay_floor() {
+        let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        aps.aib_mut().aps_trust_center_address = LOCAL_IEEE;
+        aps.nwk_mut()
+            .update_neighbor_address(CHILD_SHORT, CHILD_IEEE);
+        let key = [0x6B; 16];
+        let entry = crate::security::ApsLinkKeyEntry {
+            partner_address: CHILD_IEEE,
+            key,
+            key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+            outgoing_frame_counter: 0x2000,
+            outgoing_frame_counter_limit: 0x2400,
+            incoming_frame_counter: 77,
+            incoming_frame_counter_valid: true,
+        };
+        aps.security_mut().add_key(entry.clone()).unwrap();
+        // Re-installing the same key value does not make the floor stale.
+        aps.security_mut().add_key(entry).unwrap();
+        block_on(aps.send_confirm_key_to(
+            CHILD_SHORT,
+            &CHILD_IEEE,
+            ApsStatus::Success as u8,
+            WIRE_KEY_TYPE_TC_LINK,
+        ))
+        .unwrap();
+        let entry = aps
+            .security()
+            .find_key(&CHILD_IEEE, crate::security::ApsKeyType::TrustCenterLinkKey)
+            .unwrap();
+        assert_eq!(entry.incoming_frame_counter, 77);
+        assert!(entry.incoming_frame_counter_valid);
     }
 
     #[test]
@@ -7138,6 +7316,9 @@ mod tests {
         );
         assert_eq!(aps.security_handshake_stats().confirm_key_received, 1);
         assert_eq!(aps.security_handshake_stats().confirm_key_successes, 1);
+        // Finding F14: the decrypted command plaintext is wiped after use.
+        assert_eq!(buf.len, 0);
+        assert!(buf.data.iter().all(|byte| *byte == 0));
         let entry = aps
             .security()
             .find_key(&TC_IEEE, crate::security::ApsKeyType::TrustCenterLinkKey)
