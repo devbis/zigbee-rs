@@ -162,10 +162,7 @@ impl RuntimeScratch {
     const fn new() -> Self {
         Self {
             nwk: core::cell::UnsafeCell::new([0; 128]),
-            aps: core::cell::UnsafeCell::new(zigbee_aps::apsde::ApsFrameBuffer {
-                data: [0; 128],
-                len: 0,
-            }),
+            aps: core::cell::UnsafeCell::new(zigbee_aps::apsde::ApsFrameBuffer::new()),
             zcl: core::cell::UnsafeCell::new([0; 253]),
         }
     }

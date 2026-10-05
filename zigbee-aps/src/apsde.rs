@@ -81,6 +81,37 @@ struct ConfirmKeyCommand {
     destination: IeeeAddress,
 }
 
+/// APS acknowledgement header for a queued [`PendingApsAck`].
+///
+/// A command ACK carries no addressing fields and a data ACK echoes them
+/// (R22 §2.2.5.1.1.5). Acknowledging a fragment adds the extended header with
+/// the receive window's first block number and the ACK bitfield
+/// (R22 §2.2.5.2.3).
+fn build_aps_ack_header(ack: &PendingApsAck, aps_secured: bool) -> ApsHeader {
+    let addressed = !ack.command;
+    ApsHeader {
+        frame_control: ApsFrameControl {
+            frame_type: ApsFrameType::Ack as u8,
+            delivery_mode: ApsDeliveryMode::Unicast as u8,
+            ack_format: ack.command,
+            security: aps_secured,
+            ack_request: false,
+            extended_header: ack.fragment.is_some(),
+        },
+        dst_endpoint: addressed.then_some(ack.dst_endpoint),
+        group_address: None,
+        cluster_id: addressed.then_some(ack.cluster_id),
+        profile_id: addressed.then_some(ack.profile_id),
+        src_endpoint: addressed.then_some(ack.src_endpoint),
+        aps_counter: ack.aps_counter,
+        extended_header: ack.fragment.map(|fragment| ApsExtendedHeader {
+            fragmentation: fragment.fragmentation,
+            block_number: fragment.window_start,
+            ack_bitfield: Some(fragment.bitfield),
+        }),
+    }
+}
+
 fn parse_confirm_key_command(data: &[u8]) -> Option<ConfirmKeyCommand> {
     if data.len() < 10 {
         return None;
@@ -286,6 +317,8 @@ struct ApsDecryptOutcome {
     deferred_security_indication_replay: Option<crate::security::ApsReplayCounter>,
     /// The frame authenticated but its counter was already durably accepted.
     replay_duplicate: bool,
+    /// Key-pair entry (or global key) whose key verified the MIC.
+    key_origin: crate::security::ApsKeyOrigin,
 }
 
 /// Verify and decrypt a secured incoming APS frame into `decrypted_buf`.
@@ -426,7 +459,12 @@ where
     let aad_raw = &nwk_payload[..aad_end.min(nwk_payload.len())];
     let default_link_key = *security.default_tc_link_key();
     let replay_source = sec_hdr.source_address?;
-    let mut accepted: Option<(crate::security::ApsReplayCounter, bool, bool)> = None;
+    let mut accepted: Option<(
+        crate::security::ApsReplayCounter,
+        bool,
+        bool,
+        crate::security::ApsKeyOrigin,
+    )> = None;
     for (origin, base_link_key) in candidates.iter().copied() {
         let replay = crate::security::ApsReplayCounter::from_verified(
             origin,
@@ -463,7 +501,7 @@ where
             &sec_hdr,
             decrypted_buf,
         ) {
-            accepted = Some((replay, uses_default_link_key, replay_duplicate));
+            accepted = Some((replay, uses_default_link_key, replay_duplicate, origin));
             break;
         }
     }
@@ -471,7 +509,7 @@ where
     // `aps_diag!` compiles away without the `trace` feature, which is why this
     // reads like a bare `?` to clippy — the log line is the point.
     #[allow(clippy::question_mark)]
-    let Some((replay, uses_default_link_key, replay_duplicate)) = accepted else {
+    let Some((replay, uses_default_link_key, replay_duplicate, key_origin)) = accepted else {
         aps_diag!(
             "[APS] decrypt ALL FAILED key_id={} ct_len={}",
             key_id,
@@ -542,6 +580,7 @@ where
         #[cfg(feature = "router")]
         deferred_security_indication_replay,
         replay_duplicate,
+        key_origin,
     })
 }
 
@@ -738,21 +777,35 @@ impl IncomingNwkSecurity {
     }
 }
 
+/// Capacity of [`ApsFrameBuffer`]: one decrypted frame, or — with the
+/// `fragmentation` feature — the largest reassembled ASDU
+/// ([`crate::fragment::APS_MAX_FRAGMENTED_ASDU`]), so a completed fragmented
+/// transaction is never truncated on delivery.
+pub const APS_FRAME_BUFFER_LEN: usize = crate::fragment::APS_MAX_FRAGMENTED_ASDU;
+
 /// Internal buffer that owns the payload for a parsed APS indication.
 ///
 /// Since `ApsdeDataIndication` borrows its payload, we need this to
-/// hold the data while the upper layer processes it.
+/// hold the data while the upper layer processes it. Construct it with
+/// [`ApsFrameBuffer::new`] (usable in `const` context): its capacity is
+/// [`APS_FRAME_BUFFER_LEN`] and depends on the `fragmentation` feature.
 pub struct ApsFrameBuffer {
-    pub data: [u8; 128],
+    pub data: [u8; APS_FRAME_BUFFER_LEN],
     pub len: usize,
 }
 
 impl ApsFrameBuffer {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            data: [0u8; 128],
+            data: [0u8; APS_FRAME_BUFFER_LEN],
             len: 0,
         }
+    }
+
+    /// Wipe the buffer (it may hold decrypted key material).
+    pub fn clear(&mut self) {
+        crate::zeroize(&mut self.data);
+        self.len = 0;
     }
 
     pub fn payload(&self) -> &[u8] {
@@ -1341,6 +1394,11 @@ impl<M: MacDriver> ApsLayer<M> {
             log::error!("[APS] Dropping frame while a security-command durable commit is pending");
             return None;
         }
+        // The previous frame's durable outcome is settled once the caller
+        // hands over the next one: its reception state is final.
+        self.pending_rx_rollback = None;
+        #[cfg(feature = "fragmentation")]
+        self.fragment_rx.finalize_delivered();
 
         let (header, consumed) = ApsHeader::parse(nwk_payload)?;
         aps_diag!(
@@ -1362,6 +1420,9 @@ impl<M: MacDriver> ApsLayer<M> {
         #[cfg(feature = "router")]
         let mut deferred_security_indication_replay = None;
         let mut aps_replay_duplicate = false;
+        let mut aps_key_origin = None;
+        #[allow(unused_mut)]
+        let mut data_ack_queued = false;
 
         // Phase 1: APS security decryption.
         //
@@ -1408,85 +1469,83 @@ impl<M: MacDriver> ApsLayer<M> {
                 deferred_security_indication_replay = outcome.deferred_security_indication_replay;
             }
             aps_replay_duplicate = outcome.replay_duplicate;
+            aps_key_origin = Some(outcome.key_origin);
         }
 
         // Phase 2: Frame type dispatch
         let ft = crate::frames::ApsFrameType::from_u8(header.frame_control.frame_type)?;
         match ft {
             ApsFrameType::Data => {
-                if aps_replay_duplicate {
-                    self.queue_data_ack(&header, nwk_src);
-                    return None;
-                }
-                if self.is_aps_duplicate(nwk_src.0, header.aps_counter) {
-                    log::info!(
-                        "APS duplicate rejected: src=0x{:04X} counter={}",
-                        nwk_src.0,
-                        header.aps_counter
-                    );
-                    // R22 §2.2.4.1.3: a duplicate is discarded *after* the
-                    // acknowledgement is regenerated. A duplicate only exists
-                    // because the sender did not see the first ACK, so
-                    // answering with silence guarantees it keeps retrying
-                    // until its own APS retry budget runs out.
-                    self.queue_data_ack(&header, nwk_src);
-                    return None;
-                }
-
-                // Handle fragmented frames
-                if header.frame_control.extended_header
-                    && let Some(ref ext) = header.extended_header
-                    && ext.fragmentation != FRAG_NONE
+                // R22 §2.2.4.1.2: a group-addressed frame is only for this
+                // device when at least one local endpoint is a member.
+                if header.frame_control.delivery_mode == ApsDeliveryMode::Group as u8
+                    && header
+                        .group_address
+                        .is_none_or(|group| self.group_table.find(group).is_none())
                 {
-                    let total_blocks = if ext.fragmentation == FRAG_FIRST {
-                        ext.block_number
-                    } else {
-                        0
-                    };
-                    let block_num = if ext.fragmentation == FRAG_FIRST {
-                        0
-                    } else {
-                        ext.block_number
-                    };
-
-                    // Copy fragment data to temp buffer to avoid borrow conflict
-                    let mut frag_tmp = [0u8; 128];
-                    let frag_len = if used_decrypted_buf {
-                        let l = decrypted_buf.len.min(frag_tmp.len());
-                        frag_tmp[..l].copy_from_slice(&decrypted_buf.data[..l]);
-                        l
-                    } else {
-                        let l = after_header.len().min(frag_tmp.len());
-                        frag_tmp[..l].copy_from_slice(&after_header[..l]);
-                        l
-                    };
-
-                    let is_complete;
+                    log::debug!(
+                        "[APS] dropping group frame for non-member group {:?}",
+                        header.group_address
+                    );
+                    return None;
+                }
+                let fragmented = header
+                    .extended_header
+                    .as_ref()
+                    .is_some_and(|ext| ext.fragmentation != FRAG_NONE);
+                if fragmented {
+                    // Fragment blocks share one APS counter, so duplicate
+                    // rejection for them is block-aware and lives in the
+                    // reassembly path (R22 §2.2.8.4.2 / §2.2.8.4.5.2).
+                    #[cfg(feature = "fragmentation")]
                     {
-                        let result = self.fragment_rx.insert_fragment(
-                            nwk_src.0,
-                            header.aps_counter,
-                            block_num,
-                            total_blocks,
-                            &frag_tmp[..frag_len],
-                        );
-                        if let Some(reassembled) = result {
-                            let rlen = reassembled.len().min(decrypted_buf.data.len());
-                            decrypted_buf.data[..rlen].copy_from_slice(&reassembled[..rlen]);
-                            decrypted_buf.len = rlen;
-                            is_complete = true;
-                        } else {
-                            is_complete = false;
-                        }
-                    }
-
-                    if is_complete {
-                        self.fragment_rx
-                            .complete_entry(nwk_src.0, header.aps_counter);
+                        self.receive_fragment(
+                            &header,
+                            nwk_src,
+                            aps_replay_duplicate,
+                            aps_key_origin,
+                            used_decrypted_buf,
+                            after_header,
+                            decrypted_buf,
+                        )?;
                         used_decrypted_buf = true;
-                    } else {
+                        data_ack_queued = true;
+                    }
+                    #[cfg(not(feature = "fragmentation"))]
+                    {
+                        log::warn!(
+                            "[APS] dropping fragmented frame from 0x{:04X}: defragmentation \
+                             unsupported",
+                            nwk_src.0
+                        );
                         return None;
                     }
+                } else {
+                    if aps_replay_duplicate {
+                        self.queue_data_ack(&header, nwk_src, aps_key_origin);
+                        return None;
+                    }
+                    if self.is_aps_duplicate(nwk_src.0, header.aps_counter) {
+                        log::info!(
+                            "APS duplicate rejected: src=0x{:04X} counter={}",
+                            nwk_src.0,
+                            header.aps_counter
+                        );
+                        // R22 §2.2.4.1.3: a duplicate is discarded *after* the
+                        // acknowledgement is regenerated. A duplicate only
+                        // exists because the sender did not see the first ACK,
+                        // so answering with silence guarantees it keeps
+                        // retrying until its own APS retry budget runs out.
+                        self.queue_data_ack(&header, nwk_src, aps_key_origin);
+                        return None;
+                    }
+                    // Undone by `abort_data_persistence` if the upper layer
+                    // cannot durably accept this frame, so its retry is
+                    // delivered rather than ACKed and dropped.
+                    self.pending_rx_rollback = Some(crate::ApsRxRollback::Duplicate {
+                        src_addr: nwk_src.0,
+                        aps_counter: header.aps_counter,
+                    });
                 }
             }
             ApsFrameType::Ack => {
@@ -1535,6 +1594,8 @@ impl<M: MacDriver> ApsLayer<M> {
                         profile_id: 0,
                         aps_counter: header.aps_counter,
                         command: true,
+                        fragment: None,
+                        aps_security: None,
                     });
                 }
                 if aps_replay_duplicate {
@@ -1652,8 +1713,10 @@ impl<M: MacDriver> ApsLayer<M> {
             }
         }
 
-        // Generate APS ACK if requested
-        self.queue_data_ack(&header, nwk_src);
+        // Generate APS ACK if requested (fragments queued their windowed ACK).
+        if !data_ack_queued {
+            self.queue_data_ack(&header, nwk_src, aps_key_origin);
+        }
 
         // Determine addressing
         let dm = crate::frames::ApsDeliveryMode::from_u8(header.frame_control.delivery_mode)?;
@@ -1703,8 +1766,31 @@ impl<M: MacDriver> ApsLayer<M> {
     /// Acknowledging is a *reception* acknowledgement, never acceptance: the
     /// frame may still be dropped as a duplicate, or fail application-level
     /// handling, after the acknowledgement is queued.
-    fn queue_data_ack(&mut self, header: &ApsHeader, nwk_src: ShortAddress) {
-        if !header.frame_control.ack_request {
+    ///
+    /// An acknowledgement of an APS-secured data frame is APS-secured with the
+    /// key that verified the frame (`aps_security`), so the originator can
+    /// tell it apart from an acknowledgement forged by a device that only
+    /// holds the network key.
+    fn queue_data_ack(
+        &mut self,
+        header: &ApsHeader,
+        nwk_src: ShortAddress,
+        aps_security: Option<crate::security::ApsKeyOrigin>,
+    ) {
+        self.queue_data_ack_inner(header, nwk_src, aps_security, None);
+    }
+
+    fn queue_data_ack_inner(
+        &mut self,
+        header: &ApsHeader,
+        nwk_src: ShortAddress,
+        aps_security: Option<crate::security::ApsKeyOrigin>,
+        fragment: Option<crate::fragment::FragmentAck>,
+    ) {
+        // Only an acknowledged unicast is ever acknowledged (R22 §2.2.4.1.3).
+        if !header.frame_control.ack_request
+            || header.frame_control.delivery_mode != ApsDeliveryMode::Unicast as u8
+        {
             return;
         }
         self.pending_aps_ack = Some(PendingApsAck {
@@ -1715,7 +1801,138 @@ impl<M: MacDriver> ApsLayer<M> {
             profile_id: header.profile_id.unwrap_or(0),
             aps_counter: header.aps_counter,
             command: false,
+            fragment,
+            aps_security,
         });
+    }
+
+    /// Feed one received fragment into reassembly (R22 §2.2.8.4.5.2).
+    ///
+    /// Returns `Some(())` once the transaction is complete and the ASDU — in
+    /// block order — is in `decrypted_buf`; `None` while blocks are missing or
+    /// when the fragment is dropped. The windowed acknowledgement R22 asks for
+    /// is queued here.
+    #[cfg(feature = "fragmentation")]
+    #[allow(clippy::too_many_arguments)]
+    fn receive_fragment(
+        &mut self,
+        header: &ApsHeader,
+        nwk_src: ShortAddress,
+        replay_duplicate: bool,
+        aps_security: Option<crate::security::ApsKeyOrigin>,
+        block_in_decrypted_buf: bool,
+        after_header: &[u8],
+        decrypted_buf: &mut ApsFrameBuffer,
+    ) -> Option<()> {
+        let ext = header.extended_header?;
+        // Fragmentation is only defined for acknowledged unicast
+        // (R22 §2.2.8.4.5).
+        if !header.frame_control.ack_request
+            || header.frame_control.delivery_mode != ApsDeliveryMode::Unicast as u8
+        {
+            log::warn!(
+                "[APS] dropping fragment from 0x{:04X}: not an acknowledged unicast",
+                nwk_src.0
+            );
+            return None;
+        }
+        // A replayed APS frame counter is never a retransmission: every
+        // retransmitted block is secured again under a fresh counter.
+        if replay_duplicate {
+            return None;
+        }
+        let src = nwk_src.0;
+        let counter = header.aps_counter;
+        if let Some(index) = self.find_duplicate(src, counter, true) {
+            // The transaction was already delivered: the originator missed
+            // the final acknowledgement, so repeat it (R22 §2.2.4.1.3).
+            let window_start = self.dup_table[index].fragment_window.unwrap_or(0);
+            self.queue_data_ack_inner(
+                header,
+                nwk_src,
+                aps_security,
+                Some(crate::fragment::FragmentAck {
+                    fragmentation: ext.fragmentation,
+                    window_start,
+                    bitfield: 0xFF,
+                }),
+            );
+            return None;
+        }
+
+        let src_ieee = self.nwk.find_ieee_by_short(nwk_src).and_then(nonzero_ieee);
+        let now = self.nwk.mac().monotonic_micros();
+        let window_size = self.aib.aps_max_window_size;
+        let block = if ext.fragmentation == FRAG_FIRST {
+            0
+        } else {
+            ext.block_number
+        };
+        let outcome = {
+            let payload: &[u8] = if block_in_decrypted_buf {
+                &decrypted_buf.data[..decrypted_buf.len]
+            } else {
+                after_header
+            };
+            self.fragment_rx.insert_block(
+                now,
+                window_size,
+                src,
+                src_ieee,
+                counter,
+                ext.fragmentation,
+                ext.block_number,
+                payload,
+            )
+        };
+        if block_in_decrypted_buf {
+            // The block now lives in the reassembly session.
+            decrypted_buf.clear();
+        }
+        let rollback = crate::ApsRxRollback::FragmentBlock {
+            src_addr: src,
+            aps_counter: counter,
+            block,
+        };
+        match outcome {
+            crate::fragment::FragmentOutcome::Pending { ack, stored } => {
+                if stored {
+                    self.pending_rx_rollback = Some(rollback);
+                }
+                if ack.is_some() {
+                    self.queue_data_ack_inner(header, nwk_src, aps_security, ack);
+                }
+                None
+            }
+            crate::fragment::FragmentOutcome::Complete { ack } => {
+                let len = self.fragment_rx.take_reassembled(
+                    src,
+                    src_ieee,
+                    counter,
+                    &mut decrypted_buf.data,
+                )?;
+                decrypted_buf.len = len;
+                self.record_duplicate(src, counter, Some(ack.window_start));
+                self.pending_rx_rollback = Some(rollback);
+                self.queue_data_ack_inner(header, nwk_src, aps_security, Some(ack));
+                log::debug!(
+                    "[APS] reassembled {} octets from 0x{:04X} counter={}",
+                    len,
+                    src,
+                    counter
+                );
+                Some(())
+            }
+            crate::fragment::FragmentOutcome::Rejected => {
+                log::warn!(
+                    "[APS] rejected fragment block {} from 0x{:04X} counter={}",
+                    block,
+                    src,
+                    counter
+                );
+                None
+            }
+        }
     }
 
     /// Handle an incoming APS Confirm-Key command (R21+ §4.7.3.6).
@@ -3204,33 +3421,37 @@ impl<M: MacDriver> ApsLayer<M> {
         };
 
         let aps_counter = ack_info.aps_counter;
-        // An ACK for an APS command frame carries no addressing fields
-        // (R22 §2.2.5.1.1.5); one for a data frame echoes them.
-        let addressed = !ack_info.command;
-        let aps_header = ApsHeader {
-            frame_control: ApsFrameControl {
-                frame_type: ApsFrameType::Ack as u8,
-                delivery_mode: ApsDeliveryMode::Unicast as u8,
-                ack_format: ack_info.command,
-                security: false,
-                ack_request: false,
-                extended_header: false,
-            },
-            dst_endpoint: addressed.then_some(ack_info.dst_endpoint),
-            group_address: None,
-            cluster_id: addressed.then_some(ack_info.cluster_id),
-            profile_id: addressed.then_some(ack_info.profile_id),
-            src_endpoint: addressed.then_some(ack_info.src_endpoint),
-            aps_counter,
-            extended_header: None,
-        };
-
+        let aps_secured = ack_info.aps_security.is_some() && !ack_info.command;
         let mut buf = [0u8; 16];
-        let hdr_len = aps_header.serialize(&mut buf);
+        let hdr_len = build_aps_ack_header(&ack_info, aps_secured).serialize(&mut buf);
+
+        let secured_frame;
+        let frame: &[u8] = if aps_secured {
+            let origin = ack_info.aps_security.ok_or(ApsStatus::SecurityFail)?;
+            let key = self
+                .security
+                .key_for_origin(&origin)
+                .ok_or(ApsStatus::SecurityFail)?;
+            let frame_counter = self
+                .next_frame_counter_for(&origin)
+                .ok_or(ApsStatus::SecurityFail)?;
+            let sec_hdr = crate::security::ApsSecurityHeader {
+                security_control: crate::security::ApsSecurityHeader::APS_DEFAULT_EXT_NONCE,
+                frame_counter,
+                source_address: Some(self.nwk.nib().ieee_address),
+                key_seq_number: None,
+            };
+            secured_frame = self
+                .assemble_secured_frame(&buf[..hdr_len], &[], &key, &sec_hdr)
+                .ok_or(ApsStatus::SecurityFail)?;
+            &secured_frame
+        } else {
+            &buf[..hdr_len]
+        };
 
         let radius = self.nwk.nib().max_depth.saturating_mul(2);
         self.nwk
-            .nlde_data_request(ack_info.dst_addr, radius, &buf[..hdr_len], true, false)
+            .nlde_data_request(ack_info.dst_addr, radius, frame, true, false)
             .await
             .map_err(|_| ApsStatus::NoAck)?;
         self.pending_aps_ack = None;
@@ -7513,5 +7734,259 @@ mod tests {
             aps.ack_handle(CHILD_SHORT.0, original_header.aps_counter)
                 .is_none()
         );
+    }
+
+    // ── Fragmentation, duplicate rejection and group filtering ──────────
+
+    #[cfg(feature = "router")]
+    const PEER_SHORT: ShortAddress = ShortAddress(0x3333);
+
+    /// Unsecured unicast data frame, optionally a fragment.
+    #[cfg(feature = "router")]
+    fn data_frame(
+        aps_counter: u8,
+        fragment: Option<(u8, u8)>,
+        ack_request: bool,
+        payload: &[u8],
+    ) -> heapless::Vec<u8, 128> {
+        let header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Data as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request,
+                extended_header: fragment.is_some(),
+            },
+            dst_endpoint: Some(0x01),
+            group_address: None,
+            cluster_id: Some(0x0006),
+            profile_id: Some(0x0104),
+            src_endpoint: Some(0x02),
+            aps_counter,
+            extended_header: fragment.map(|(fragmentation, block_number)| ApsExtendedHeader {
+                fragmentation,
+                block_number,
+                ack_bitfield: None,
+            }),
+        };
+        let mut frame = [0u8; 128];
+        let header_len = header.serialize(&mut frame);
+        frame[header_len..header_len + payload.len()].copy_from_slice(payload);
+        heapless::Vec::from_slice(&frame[..header_len + payload.len()]).unwrap()
+    }
+
+    /// Feed a frame and return the delivered payload, if any.
+    #[cfg(feature = "router")]
+    fn deliver(aps: &mut ApsLayer<MockMac>, frame: &[u8]) -> Option<heapless::Vec<u8, 256>> {
+        let mut buf = ApsFrameBuffer::new();
+        aps.process_incoming_aps_frame(
+            frame,
+            PEER_SHORT,
+            LOCAL_SHORT,
+            200,
+            IncomingNwkSecurity::new(true, Some(PARENT_IEEE)),
+            &mut buf,
+        )
+        .map(|indication| heapless::Vec::from_slice(indication.payload).unwrap())
+    }
+
+    /// R22 §2.2.8.4.5.2: every block of a fragmented transaction carries the
+    /// same APS counter, so blocks after the first must not be discarded as
+    /// duplicates, and blocks are placed by number, not by arrival order.
+    #[test]
+    #[cfg(feature = "router")]
+    fn fragments_sharing_one_counter_reassemble_in_block_order() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        let counter = 0x42;
+        assert!(
+            deliver(
+                &mut aps,
+                &data_frame(counter, Some((FRAG_SUBSEQUENT, 2)), true, b"CC")
+            )
+            .is_none()
+        );
+        assert!(
+            aps.pending_aps_ack.is_none(),
+            "block 2 of an unknown-size window is not ACKed yet"
+        );
+        assert!(
+            deliver(
+                &mut aps,
+                &data_frame(counter, Some((FRAG_SUBSEQUENT, 1)), true, b"BBB")
+            )
+            .is_none()
+        );
+        let asdu = deliver(
+            &mut aps,
+            &data_frame(counter, Some((FRAG_FIRST, 3)), true, b"A"),
+        )
+        .expect("the final block delivers the ASDU");
+        assert_eq!(asdu.as_slice(), b"ABBBCC");
+
+        let ack = aps
+            .pending_aps_ack
+            .clone()
+            .expect("the transaction is acknowledged");
+        assert_eq!(ack.aps_counter, counter);
+        assert_eq!(
+            ack.fragment,
+            Some(crate::fragment::FragmentAck {
+                fragmentation: FRAG_FIRST,
+                window_start: 0,
+                bitfield: 0xFF,
+            })
+        );
+
+        // On air: ACK frame with extended header, block number and bitfield.
+        block_on(aps.send_pending_aps_ack()).unwrap();
+        let history = aps.nwk().mac().tx_history();
+        let frame = nwk_payload(history.last().unwrap());
+        assert_eq!(
+            frame.as_slice(),
+            &[
+                0x82, 0x02, 0x06, 0x00, 0x04, 0x01, 0x01, 0x42, 0x01, 0x00, 0xFF
+            ],
+            "ACK: FC(ack|ext) dst-ep cluster profile src-ep counter | ext-FC block bitfield"
+        );
+    }
+
+    /// A block retransmitted after the transaction completed (its final ACK
+    /// was lost) is acknowledged again — never delivered twice.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_block_repeated_after_completion_is_reacknowledged_not_redelivered() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        assert!(deliver(&mut aps, &data_frame(9, Some((FRAG_FIRST, 2)), true, b"A")).is_none());
+        let last = data_frame(9, Some((FRAG_SUBSEQUENT, 1)), true, b"B");
+        assert_eq!(deliver(&mut aps, &last).unwrap().as_slice(), b"AB");
+        aps.complete_data_persistence();
+        aps.pending_aps_ack = None;
+
+        assert!(deliver(&mut aps, &last).is_none());
+        let ack = aps
+            .pending_aps_ack
+            .clone()
+            .expect("the repeat is re-acknowledged");
+        assert_eq!(ack.fragment.map(|f| f.bitfield), Some(0xFF));
+        assert!(deliver(&mut aps, &data_frame(9, Some((FRAG_FIRST, 2)), true, b"A")).is_none());
+    }
+
+    /// A fragment that is not an acknowledged unicast is dropped.
+    #[test]
+    #[cfg(feature = "router")]
+    fn unacknowledged_fragments_are_dropped() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        assert!(deliver(&mut aps, &data_frame(3, Some((FRAG_FIRST, 2)), false, b"A")).is_none());
+        assert!(
+            deliver(
+                &mut aps,
+                &data_frame(3, Some((FRAG_SUBSEQUENT, 1)), false, b"B")
+            )
+            .is_none()
+        );
+        assert_eq!(aps.fragment_rx().active_sessions(), 0);
+    }
+
+    /// A frame whose durable commit was aborted must be accepted when the
+    /// sender retries it — not ACKed and dropped as a duplicate.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_aborted_data_frame_is_accepted_on_retry() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        let frame = data_frame(0x55, None, true, b"payload");
+        assert!(deliver(&mut aps, &frame).is_some());
+        aps.abort_data_persistence();
+        assert!(
+            deliver(&mut aps, &frame).is_some(),
+            "the retry is delivered"
+        );
+        aps.complete_data_persistence();
+        assert!(deliver(&mut aps, &frame).is_none(), "now it is a duplicate");
+    }
+
+    /// The same for the block that completed a fragmented transaction.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_aborted_final_fragment_is_accepted_on_retry() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        assert!(deliver(&mut aps, &data_frame(7, Some((FRAG_FIRST, 2)), true, b"A")).is_none());
+        aps.complete_data_persistence();
+        let last = data_frame(7, Some((FRAG_SUBSEQUENT, 1)), true, b"B");
+        assert!(deliver(&mut aps, &last).is_some());
+        aps.abort_data_persistence();
+        assert_eq!(deliver(&mut aps, &last).unwrap().as_slice(), b"AB");
+        aps.complete_data_persistence();
+        assert!(deliver(&mut aps, &last).is_none());
+    }
+
+    /// `apsDuplicateRejectionTimeout` is in milliseconds of real time: no
+    /// number of maintenance calls expires an entry early, and the entry
+    /// expires after the timeout even without any maintenance call.
+    #[test]
+    #[cfg(feature = "router")]
+    fn duplicate_rejection_expires_by_elapsed_time_not_call_count() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        let timeout_ms = u32::from(aps.aib().aps_duplicate_rejection_timeout);
+        assert!(!aps.is_aps_duplicate(0x1234, 1));
+        for _ in 0..10_000 {
+            aps.age_dup_table();
+        }
+        assert!(aps.is_aps_duplicate(0x1234, 1));
+        advance_aps_clock(&mut aps, timeout_ms * 1000 - 1);
+        assert!(aps.is_aps_duplicate(0x1234, 1));
+        advance_aps_clock(&mut aps, 1);
+        assert!(
+            !aps.is_aps_duplicate(0x1234, 1),
+            "expired without age_dup_table"
+        );
+    }
+
+    /// R22 §2.2.4.1.2: a group-addressed frame is discarded unless a local
+    /// endpoint is a member; members are reported for fan-out.
+    #[test]
+    #[cfg(feature = "router")]
+    fn group_frames_require_local_membership() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        let header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Data as u8,
+                delivery_mode: ApsDeliveryMode::Group as u8,
+                ack_format: false,
+                security: false,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: None,
+            group_address: Some(0x4321),
+            cluster_id: Some(0x0006),
+            profile_id: Some(0x0104),
+            src_endpoint: Some(0x01),
+            aps_counter: 1,
+            extended_header: None,
+        };
+        let mut frame = [0u8; 16];
+        let len = header.serialize(&mut frame);
+        frame[len] = 0x01;
+        assert!(deliver(&mut aps, &frame[..=len]).is_none(), "not a member");
+        assert!(aps.group_member_endpoints(0x4321).is_empty());
+
+        aps.group_table_mut().add_group(0x4321, 3);
+        aps.group_table_mut().add_group(0x4321, 5);
+        frame[len - 1] = 2; // fresh APS counter
+        let mut buf = ApsFrameBuffer::new();
+        let indication = aps
+            .process_incoming_aps_frame(
+                &frame[..=len],
+                PEER_SHORT,
+                ShortAddress(0xFFFF),
+                200,
+                IncomingNwkSecurity::new(true, Some(PARENT_IEEE)),
+                &mut buf,
+            )
+            .expect("member group frame is delivered");
+        assert_eq!(indication.dst_address, ApsAddress::Group(0x4321));
+        assert_eq!(indication.dst_endpoint, 0xFF);
+        assert_eq!(aps.group_member_endpoints(0x4321), &[3, 5]);
     }
 }
