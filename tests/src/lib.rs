@@ -18,6 +18,8 @@ mod mac_tests;
 #[cfg(test)]
 mod nwk_tests;
 #[cfg(test)]
+mod ota_policy_tests;
+#[cfg(test)]
 mod ota_tests;
 #[cfg(test)]
 mod runtime_tests;
