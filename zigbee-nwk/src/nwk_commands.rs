@@ -972,6 +972,10 @@ impl<M: MacDriver> NwkLayer<M> {
             }
         }
 
+        // Retransmit broadcasts no router neighbour was heard relaying
+        #[cfg(feature = "router")]
+        zigbee_types::await_out_of_line!(self.service_passive_acks());
+
         // Send link status if due
         if self.link_status_due {
             self.link_status_due = false;

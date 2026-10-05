@@ -583,6 +583,19 @@ impl<M: MacDriver> NwkLayer<M> {
             })
             .await;
 
+        // R22 §3.6.5: a router keeps its own broadcast for passive
+        // acknowledgement by its router neighbours, like a relayed one.
+        #[cfg(feature = "router")]
+        if mac_result.is_ok() && next_hop == ShortAddress::BROADCAST && self.can_route() {
+            self.track_broadcast(
+                header.src_addr,
+                seq,
+                &nwk_buf[..total_len],
+                header.radius,
+                None,
+            );
+        }
+
         if let Err(ref e) = mac_result {
             log::warn!("[NWK TX] MAC send failed: {:?}", e);
             #[cfg(feature = "router")]
@@ -1099,14 +1112,18 @@ impl<M: MacDriver> NwkLayer<M> {
             self.security.activation_pending = false;
         }
         if let Some((source, sequence)) = self.pending_lifecycle_btr.take() {
-            self.btr.record(source, sequence);
+            let _ = self.btr.record(source, sequence);
         }
         #[cfg(feature = "router")]
         {
             if let Some(relay) = self.pending_lifecycle_relay.take() {
                 let result = if is_nwk_broadcast(relay.header.dst_addr) {
-                    self.relay_broadcast(&relay.header, relay.payload.as_slice())
-                        .await
+                    self.relay_broadcast(
+                        &relay.header,
+                        relay.payload.as_slice(),
+                        relay.previous_hop,
+                    )
+                    .await
                 } else if relay.header.frame_control.frame_type == NwkFrameType::Command as u8
                     && relay.payload.first() == Some(&(NwkCommandId::RouteRecord as u8))
                 {
@@ -1263,6 +1280,15 @@ impl<M: MacDriver> NwkLayer<M> {
                     }
                 }
                 self.record_command_outcome(outcome);
+            } else {
+                // A neighbour relaying our own broadcast is its passive
+                // acknowledgement (R22 §3.6.5).
+                #[cfg(feature = "router")]
+                if is_nwk_broadcast(dst)
+                    && let Some(hop) = prev_hop
+                {
+                    self.passive_acks.note_relay(src, header.seq_number, hop);
+                }
             }
             log::debug!(
                 "[NWK] Dropping self-originated frame seq={}",
@@ -1459,17 +1485,30 @@ impl<M: MacDriver> NwkLayer<M> {
         // journal write would make the legitimate retransmission look like a
         // duplicate in this boot.
         #[cfg(feature = "router")]
-        if is_broadcast
-            && can_route
-            && !is_route_request
-            && self.btr.is_duplicate(src, header.seq_number)
-        {
-            log::debug!(
-                "[NWK] BTR dup: src=0x{:04X} seq={}",
-                src.0,
-                header.seq_number
-            );
-            return None;
+        if is_broadcast && can_route && !is_route_request {
+            if self.btr.is_duplicate(src, header.seq_number) {
+                // A neighbour's copy of a broadcast we already handled is its
+                // passive acknowledgement of our relay (R22 §3.6.5).
+                self.passive_acks
+                    .note_relay(src, header.seq_number, prev_hop.unwrap_or(src));
+                log::debug!(
+                    "[NWK] BTR dup: src=0x{:04X} seq={}",
+                    src.0,
+                    header.seq_number
+                );
+                return None;
+            }
+            if self.btr.is_full() {
+                // R22 §3.6.5: without room to record the transaction the new
+                // broadcast is dropped; live entries are never evicted, or a
+                // still-circulating broadcast would be accepted again.
+                log::warn!(
+                    "[NWK] Broadcast transaction table full — dropping src=0x{:04X} seq={}",
+                    src.0,
+                    header.seq_number
+                );
+                return None;
+            }
         }
 
         // BTR admission has succeeded. Adoption must precede classification so
@@ -1534,7 +1573,7 @@ impl<M: MacDriver> NwkLayer<M> {
 
         #[cfg(feature = "router")]
         if is_broadcast && can_route && !is_route_request && lifecycle_kind.is_none() {
-            self.btr.record(src, header.seq_number);
+            let _ = self.btr.record(src, header.seq_number);
         }
 
         if let Some(outcome) = conflict_outcome {
@@ -1607,7 +1646,9 @@ impl<M: MacDriver> NwkLayer<M> {
             && relayable_broadcast
             && !(authenticated_replay.is_some() && lifecycle_kind.is_some())
         {
-            let rebroadcast = self.relay_broadcast(&header, payload.as_slice()).await;
+            let rebroadcast = self
+                .relay_broadcast(&header, payload.as_slice(), prev_hop.unwrap_or(src))
+                .await;
             if let Err(e) = rebroadcast {
                 log::warn!(
                     "[NWK] Rebroadcast of frame from 0x{:04X} failed: {:?}",
@@ -2416,11 +2457,17 @@ impl<M: MacDriver> NwkLayer<M> {
     /// `payload` is the authenticated plaintext; a secured broadcast is
     /// re-secured with this device's own key material, exactly like a unicast
     /// relay, because the decremented radius is authenticated header data.
+    ///
+    /// R22 §3.6.5: the relay waits a random jitter of up to
+    /// `nwkcMaxBroadcastJitter` first, so neighbours that heard the same copy
+    /// do not collide, and is then tracked for passive acknowledgement —
+    /// `previous_hop`, which transmitted it to us, already holds it.
     #[cfg(feature = "router")]
     async fn relay_broadcast(
         &mut self,
         header: &NwkHeader,
         payload: &[u8],
+        previous_hop: ShortAddress,
     ) -> Result<(), NwkStatus> {
         let new_radius = header.radius.saturating_sub(1);
         if new_radius == 0 {
@@ -2439,11 +2486,45 @@ impl<M: MacDriver> NwkLayer<M> {
             new_radius
         );
 
+        let jitter = crate::routing::routing_random_sample(
+            self.mac.monotonic_micros()
+                ^ (u32::from(self.nib.network_address.0) << 16)
+                ^ u32::from(header.src_addr.0)
+                ^ (u32::from(header.seq_number) << 8),
+        ) % crate::conflict::MAX_BROADCAST_JITTER_US;
+        self.mac.delay_micros(jitter).await;
+
+        self.send_tracked_broadcast(
+            header.src_addr,
+            header.seq_number,
+            &relay_buf[..total],
+            new_radius,
+            Some(previous_hop),
+        )
+        .await
+    }
+
+    /// MAC-broadcast a NWK broadcast frame and, when router neighbours are
+    /// expected to relay it further, keep it for passive acknowledgement
+    /// and up to `nwkMaxBroadcastRetries` retransmissions (R22 §3.6.5).
+    ///
+    /// A frame sent with radius 1 is not relayed by anyone, so no
+    /// acknowledgement can ever be heard for it and it is sent once.
+    #[cfg(feature = "router")]
+    #[inline(never)]
+    pub(crate) async fn send_tracked_broadcast(
+        &mut self,
+        src: ShortAddress,
+        seq: u8,
+        frame: &[u8],
+        radius: u8,
+        already_heard: Option<ShortAddress>,
+    ) -> Result<(), NwkStatus> {
         self.mac
             .mcps_data(McpsDataRequest {
                 src_addr_mode: AddressMode::Short,
                 dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
-                payload: &relay_buf[..total],
+                payload: frame,
                 msdu_handle: self.nib.next_seq(),
                 tx_options: TxOptions {
                     ack_tx: false, // No ACK for broadcast
@@ -2452,8 +2533,106 @@ impl<M: MacDriver> NwkLayer<M> {
             })
             .await
             .map_err(|_| NwkStatus::RouteError)?;
-
+        self.track_broadcast(src, seq, frame, radius, already_heard);
         Ok(())
+    }
+
+    /// Keep a broadcast just put on air for passive acknowledgement; see
+    /// [`Self::send_tracked_broadcast`].
+    #[cfg(feature = "router")]
+    #[inline(never)]
+    fn track_broadcast(
+        &mut self,
+        src: ShortAddress,
+        seq: u8,
+        frame: &[u8],
+        radius: u8,
+        already_heard: Option<ShortAddress>,
+    ) {
+        if radius > 1 && self.nib.max_broadcast_retries > 0 {
+            let mut heard = heapless::Vec::new();
+            if let Some(hop) = already_heard {
+                let _ = heard.push(hop);
+            }
+            if !self.all_router_neighbors_heard(&heard)
+                && let Ok(frame) = heapless::Vec::from_slice(frame)
+            {
+                let deadline_us = self
+                    .mac
+                    .monotonic_micros()
+                    .wrapping_add(u32::from(self.nib.passive_ack_timeout) * 1_000);
+                let _ = self.passive_acks.track(crate::routing::PendingBroadcast {
+                    src,
+                    seq,
+                    frame,
+                    retries_left: self.nib.max_broadcast_retries,
+                    deadline_us,
+                    heard,
+                });
+            }
+        }
+    }
+
+    /// Whether every rx-on-when-idle router neighbour is in `heard`.
+    #[cfg(feature = "router")]
+    fn all_router_neighbors_heard(&self, heard: &[ShortAddress]) -> bool {
+        heard.len() == crate::routing::MAX_PASSIVE_ACK_NEIGHBORS
+            || self.neighbors.iter().all(|n| {
+                !matches!(
+                    n.device_type,
+                    crate::neighbor::NeighborDeviceType::Router
+                        | crate::neighbor::NeighborDeviceType::Coordinator
+                ) || n.relationship == crate::neighbor::Relationship::PreviousChild
+                    || heard.contains(&n.network_address)
+            })
+    }
+
+    /// Retransmit broadcasts whose passive-acknowledgement window closed
+    /// before every router neighbour was heard relaying them (R22 §3.6.5).
+    ///
+    /// Called from [`NwkLayer::process_pending_routing`]; a retransmission
+    /// therefore happens at the first maintenance pass after
+    /// `nwkPassiveAckTimeout`, never before it.
+    #[cfg(feature = "router")]
+    #[inline(never)]
+    pub(crate) async fn service_passive_acks(&mut self) {
+        let mut index = 0;
+        while index < self.passive_acks.entries.len() {
+            let now = self.mac.monotonic_micros();
+            let entry = &self.passive_acks.entries[index];
+            if (now.wrapping_sub(entry.deadline_us) as i32) < 0 {
+                index += 1;
+                continue;
+            }
+            if entry.retries_left == 0 || self.all_router_neighbors_heard(&entry.heard) {
+                self.passive_acks.entries.swap_remove(index);
+                continue;
+            }
+            let frame = entry.frame.clone();
+            log::debug!(
+                "[NWK] Broadcast src=0x{:04X} seq={} not relayed by all router neighbours — retransmitting",
+                entry.src.0,
+                entry.seq,
+            );
+            let _ = self
+                .mac
+                .mcps_data(McpsDataRequest {
+                    src_addr_mode: AddressMode::Short,
+                    dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
+                    payload: &frame,
+                    msdu_handle: self.nib.next_seq(),
+                    tx_options: TxOptions {
+                        ack_tx: false,
+                        ..Default::default()
+                    },
+                })
+                .await;
+            let timeout = u32::from(self.nib.passive_ack_timeout) * 1_000;
+            let entry = &mut self.passive_acks.entries[index];
+            entry.retries_left -= 1;
+            entry.deadline_us = self.mac.monotonic_micros().wrapping_add(timeout);
+            index += 1;
+        }
     }
 
     /// Resolve the MAC next hop for a given NWK destination.
@@ -5588,6 +5767,187 @@ mod tests {
             nwk.pending_route_replies.is_empty(),
             "a reply addressed to us is not forwarded further"
         );
+    }
+
+    // ── Broadcast delivery (R22 §3.6.5) ──────────────────────
+
+    #[cfg(feature = "router")]
+    fn broadcast_from(src: ShortAddress, seq: u8, radius: u8) -> heapless::Vec<u8, 128> {
+        let mut header = frame(NwkFrameType::Data, src, ShortAddress::BROADCAST);
+        header.seq_number = seq;
+        header.radius = radius;
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &[0xB0], &mut buf);
+        heapless::Vec::from_slice(&buf[..len]).expect("the frame fits")
+    }
+
+    #[cfg(feature = "router")]
+    fn pass_time(nwk: &mut NwkLayer<MockMac>, micros: u32) {
+        block_on(nwk.mac.delay_micros(micros));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_full_broadcast_transaction_table_drops_the_new_broadcast() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        for seq in 0..crate::routing::MAX_BTR as u8 {
+            assert!(router.btr.record(ORIGIN, seq));
+        }
+        assert!(
+            !router.btr.record(PEER, 0),
+            "a full table refuses a new entry"
+        );
+
+        let bytes = broadcast_from(PEER, 0x80, 5);
+        assert!(
+            block_on(router.process_incoming_nwk_frame(&bytes, 200)).is_none(),
+            "a broadcast that cannot be recorded is dropped"
+        );
+        assert!(router.mac.tx_history().is_empty(), "and not relayed");
+        for seq in 0..crate::routing::MAX_BTR as u8 {
+            assert!(
+                router.btr.is_duplicate(ORIGIN, seq),
+                "live transactions are never evicted"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relayed_broadcast_is_jittered_within_nwkc_max_broadcast_jitter() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        let mut delays = heapless::Vec::<u32, 8>::new();
+        for seq in 0..8u8 {
+            let start = router.mac.monotonic_micros();
+            let bytes = broadcast_from(PEER, seq, 5);
+            assert!(block_on(router.process_incoming_nwk_frame(&bytes, 200)).is_some());
+            let delay = router.mac.monotonic_micros().wrapping_sub(start);
+            assert!(delay < crate::conflict::MAX_BROADCAST_JITTER_US);
+            delays.push(delay).unwrap();
+        }
+        assert!(
+            delays.iter().any(|d| *d != delays[0]),
+            "the relay delay is randomised: {delays:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relayed_broadcast_is_retransmitted_until_every_router_neighbour_relays_it() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        let bytes = broadcast_from(PEER, 0x21, 5);
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER))).is_some()
+        );
+        assert_eq!(router.mac.tx_history().len(), 1, "relayed once");
+
+        // Inside nwkPassiveAckTimeout nothing is repeated.
+        block_on(router.process_pending_routing());
+        assert_eq!(router.mac.tx_history().len(), 1);
+
+        // NEXT_HOP stays silent: once the window closes the frame is repeated
+        // verbatim.
+        pass_time(&mut router, 500_001);
+        block_on(router.process_pending_routing());
+        assert_eq!(router.mac.tx_history().len(), 2, "one retransmission");
+        assert_eq!(
+            recorded_frame(&router, 1),
+            recorded_frame(&router, 0),
+            "the retransmission is the same broadcast"
+        );
+
+        // NEXT_HOP's relay is the passive acknowledgement.
+        let mut relayed = frame(NwkFrameType::Data, PEER, ShortAddress::BROADCAST);
+        relayed.seq_number = 0x21;
+        relayed.radius = 4;
+        let mut buf = [0u8; 128];
+        let len = encode(&relayed, &[0xB0], &mut buf);
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&buf[..len], 200, Some(NEXT_HOP)))
+                .is_none(),
+            "the neighbour's copy is a duplicate"
+        );
+        pass_time(&mut router, 500_001);
+        block_on(router.process_pending_routing());
+        assert_eq!(
+            router.mac.tx_history().len(),
+            2,
+            "acknowledged — no more retries"
+        );
+        assert!(router.passive_acks.entries.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn broadcast_retransmissions_stop_at_nwk_max_broadcast_retries() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        let bytes = broadcast_from(PEER, 0x22, 5);
+        block_on(router.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER)));
+        for _ in 0..6 {
+            pass_time(&mut router, 500_001);
+            block_on(router.process_pending_routing());
+        }
+        assert_eq!(
+            router.mac.tx_history().len(),
+            1 + usize::from(router.nib.max_broadcast_retries),
+        );
+        assert!(router.passive_acks.entries.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_broadcast_nobody_will_relay_is_not_retransmitted() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        // Relayed with radius 1: no neighbour may carry it further.
+        let bytes = broadcast_from(PEER, 0x23, 2);
+        block_on(router.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER)));
+        // Only the router neighbour it came from exists.
+        let mut lone = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut lone, PEER, 1);
+        let bytes = broadcast_from(PEER, 0x24, 5);
+        block_on(lone.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER)));
+        for nwk in [&mut router, &mut lone] {
+            pass_time(nwk, 500_001);
+            block_on(nwk.process_pending_routing());
+            assert_eq!(nwk.mac.tx_history().len(), 1);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_routers_own_broadcast_is_acknowledged_by_its_neighbours_relay() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        block_on(router.nlde_data_request(ShortAddress::BROADCAST, 5, &[0x01], false, false))
+            .expect("broadcast sent");
+        assert_eq!(router.mac.tx_history().len(), 1);
+        let own = recorded_frame(&router, 0);
+        let (mut header, consumed) = NwkHeader::parse(&own).unwrap();
+        header.radius -= 1;
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &own[consumed..], &mut buf);
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&buf[..len], 200, Some(PEER)))
+                .is_none()
+        );
+        pass_time(&mut router, 500_001);
+        block_on(router.process_pending_routing());
+        assert_eq!(
+            router.mac.tx_history().len(),
+            1,
+            "PEER relayed it — no retry"
+        );
+
+        // Without that relay the router repeats its own broadcast.
+        block_on(router.nlde_data_request(ShortAddress::BROADCAST, 5, &[0x02], false, false))
+            .expect("broadcast sent");
+        pass_time(&mut router, 500_001);
+        block_on(router.process_pending_routing());
+        assert_eq!(router.mac.tx_history().len(), 3);
     }
 
     // ── Route Reply correlation (R22 §3.6.3.5) ───────────────

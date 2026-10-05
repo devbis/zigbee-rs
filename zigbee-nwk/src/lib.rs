@@ -328,6 +328,9 @@ pub struct NwkLayer<M: MacDriver> {
     /// Route requests already acted upon, keyed by originator and request ID.
     #[cfg(feature = "router")]
     rreq_records: routing::RreqRecordTable,
+    /// Broadcasts awaiting passive acknowledgement (R22 §3.6.5).
+    #[cfg(feature = "router")]
+    passive_acks: routing::PassiveAckTable,
     /// Pending Network Status (route error) notifications.
     #[cfg(feature = "router")]
     pending_route_errors: heapless::Vec<PendingNetworkStatus, 4>,
@@ -429,6 +432,8 @@ impl<M: MacDriver> NwkLayer<M> {
             #[cfg(feature = "router")]
             rreq_records: routing::RreqRecordTable::new(),
             #[cfg(feature = "router")]
+            passive_acks: routing::PassiveAckTable::new(),
+            #[cfg(feature = "router")]
             pending_route_errors: heapless::Vec::new(),
             #[cfg(not(feature = "router"))]
             pending_route_errors: heapless::Vec::new(),
@@ -486,6 +491,8 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).pending_rreq_forwards).write(heapless::Vec::new());
             #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).rreq_records).write(routing::RreqRecordTable::new());
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).passive_acks).write(routing::PassiveAckTable::new());
             #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).pending_route_errors).write(heapless::Vec::new());
             #[cfg(not(feature = "router"))]

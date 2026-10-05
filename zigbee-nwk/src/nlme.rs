@@ -1488,6 +1488,8 @@ impl<M: MacDriver> NwkLayer<M> {
         // deferred PAN identifier switch would retune the radio away from
         // whatever network it joins next (R22 §3.6.1.9.3, §3.6.1.13.3).
         self.pending_conflicts.clear();
+        #[cfg(feature = "router")]
+        self.passive_acks.clear();
         self.pending_pan_id_update = None;
         self.pending_pan_id_broadcast = None;
         self.abort_lifecycle_persistence();
@@ -1733,6 +1735,8 @@ impl<M: MacDriver> NwkLayer<M> {
             self.security = crate::security::NwkSecurity::new();
             self.joined = false;
             self.pending_conflicts.clear();
+            #[cfg(feature = "router")]
+            self.passive_acks.clear();
             self.pending_pan_id_update = None;
             self.pending_pan_id_broadcast = None;
             self.abort_lifecycle_persistence();
