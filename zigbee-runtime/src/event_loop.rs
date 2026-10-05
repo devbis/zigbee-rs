@@ -545,7 +545,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
                 .await;
         }
         aps.age_dup_table();
-        aps.fragment_rx_mut().age_entries();
+        // `age_ack_table` above also drives an in-flight fragmented
+        // transaction; collect its final confirm once it finished.
+        #[cfg(feature = "router")]
+        self.collect_fragmented_send_confirm();
     }
 
     /// Drive periodic NWK maintenance for this device's role.

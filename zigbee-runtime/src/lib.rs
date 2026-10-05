@@ -5120,6 +5120,157 @@ mod resume_tests {
         assert_eq!(zcl.payload.as_slice(), &[0x00, 0x00]);
     }
 
+    /// The APS header of an outbound unicast data frame.
+    #[cfg(feature = "router")]
+    fn outbound_aps_header(frame: &zigbee_mac::MacFrame) -> zigbee_aps::frames::ApsHeader {
+        let aps = decrypt_outbound_nwk_payload(frame);
+        zigbee_aps::frames::ApsHeader::parse(&aps)
+            .expect("outbound APS frame parses")
+            .0
+    }
+
+    /// A windowed APS acknowledgement from the coordinator (R22 §2.2.5.1.8).
+    #[cfg(feature = "router")]
+    fn fragment_ack_frame(
+        aps_counter: u8,
+        window_start: u8,
+        bitfield: u8,
+        nwk_counter: u32,
+    ) -> zigbee_mac::MacFrame {
+        use zigbee_aps::frames::{
+            ApsDeliveryMode, ApsExtendedHeader, ApsFrameControl, ApsFrameType, ApsHeader,
+        };
+        let header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Ack as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request: false,
+                extended_header: true,
+            },
+            dst_endpoint: Some(1),
+            group_address: None,
+            cluster_id: Some(0x0000),
+            profile_id: Some(0x0104),
+            src_endpoint: Some(1),
+            aps_counter,
+            extended_header: Some(ApsExtendedHeader {
+                fragmentation: zigbee_aps::frames::FRAG_FIRST,
+                block_number: window_start,
+                ack_bitfield: Some(bitfield),
+            }),
+        };
+        let mut aps = [0u8; 32];
+        let len = header.serialize(&mut aps);
+        nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &aps[..len],
+            nwk_counter,
+            true,
+        )
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn oversized_router_send_is_fragmented_and_reports_its_delivery() {
+        let mut device = resumed_router();
+        // One block per window, so each acknowledgement has to release the
+        // next block.
+        device.aps_mut().aib_mut().aps_max_window_size = 1;
+        let zcl: [u8; 150] = core::array::from_fn(|index| index as u8);
+
+        block_on(device.send_zcl_frame(COORDINATOR, 1, 1, 0x0000, &zcl))
+            .expect("an oversized unicast is accepted for fragmented delivery");
+        let history = device.mac().tx_history();
+        assert_eq!(history.len(), 1, "only the first window is sent");
+        let first = outbound_aps_header(&history[0].payload);
+        assert!(first.frame_control.ack_request);
+        let ext = first
+            .extended_header
+            .expect("fragments carry an extended header");
+        assert_eq!(ext.fragmentation, zigbee_aps::frames::FRAG_FIRST);
+        assert_eq!(
+            ext.block_number, 3,
+            "the first block carries the block count"
+        );
+        let counter = first.aps_counter;
+        assert!(device.take_fragmented_send_confirm().is_none());
+
+        let mut nwk_counter = 0x100;
+        for block in 0..3u8 {
+            device.mac_mut().clear_tx_history();
+            nwk_counter += 1;
+            let ack = fragment_ack_frame(counter, block, 0x01, nwk_counter);
+            assert!(block_on(device.process_incoming(&indication(ack), &mut [])).is_none());
+            let history = device.mac().tx_history();
+            if block < 2 {
+                // Processing the ACK sends the next block immediately rather
+                // than waiting for maintenance.
+                assert_eq!(history.len(), 1, "block {} follows the ACK", block + 1);
+                let next = outbound_aps_header(&history[0].payload);
+                assert_eq!(next.aps_counter, counter);
+                assert_eq!(next.extended_header.unwrap().block_number, block + 1);
+                assert!(device.take_fragmented_send_confirm().is_none());
+            } else {
+                assert!(history.is_empty());
+            }
+        }
+
+        let confirm = device
+            .take_fragmented_send_confirm()
+            .expect("the final ACK completes the transaction");
+        assert_eq!(confirm.status, zigbee_aps::ApsStatus::Success);
+        assert_eq!(confirm.aps_counter, counter);
+        assert!(device.take_fragmented_send_confirm().is_none());
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn unacknowledged_fragmented_send_reports_no_ack_from_maintenance() {
+        let mut device = resumed_router();
+        let zcl = [0x5A; 150];
+        block_on(device.send_zcl_frame(COORDINATOR, 1, 1, 0x0000, &zcl)).unwrap();
+        assert_eq!(device.mac().tx_history().len(), 3, "a whole window is sent");
+
+        let mut confirm = None;
+        for _ in 0..=zigbee_aps::fragment::APSC_MAX_FRAME_RETRIES + 1 {
+            block_on(zigbee_mac::PlatformServices::delay_micros(
+                device.mac_mut(),
+                zigbee_aps::APS_ACK_WAIT_DURATION_US,
+            ));
+            block_on(device.run_aps_maintenance());
+            confirm = device.take_fragmented_send_confirm();
+            if confirm.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            confirm
+                .expect("maintenance reports the failed transaction")
+                .status,
+            zigbee_aps::ApsStatus::NoAck
+        );
+        assert!(!device.aps().fragmented_tx_active());
+    }
+
+    /// Builds without the router feature carry no APS fragmentation: an
+    /// oversized send is refused instead of being truncated.
+    #[cfg(not(feature = "router"))]
+    #[test]
+    fn oversized_send_without_fragmentation_is_refused() {
+        let mut device = resumed_device(DeviceType::EndDevice);
+        let zcl = [0x5A; 150];
+        assert_eq!(
+            block_on(device.send_zcl_frame(COORDINATOR, 1, 1, 0x0000, &zcl)),
+            Err(crate::event_loop::SendError::Aps(
+                zigbee_aps::ApsStatus::AsduTooLong
+            ))
+        );
+        assert!(device.mac().tx_history().is_empty());
+    }
+
     // Relaying needs the router routing/BTR/source-route tables, which are
     // compiled to zero capacity without `zigbee-nwk/router`. Run with
     // `cargo test -p zigbee-runtime --features router`.
@@ -6771,6 +6922,11 @@ pub struct ZigbeeDevice<M: MacDriver, R: crate::role::DeviceRole = crate::role::
     /// duration of `process_incoming()`.
     #[cfg(feature = "router")]
     pending_security_indication: Option<zigbee_aps::apsme::ApsmeSecurityIndication>,
+    /// Final APSDE-DATA.confirm of the last fragmented send, collected from
+    /// APS until the application takes it
+    /// ([`ZigbeeDevice::take_fragmented_send_confirm`]).
+    #[cfg(feature = "router")]
+    fragmented_send_confirm: Option<zigbee_aps::apsde::ApsdeDataConfirm>,
     /// Store-backed receive paths delay APS ACKs until security state is durable.
     defer_aps_ack: bool,
     /// The current LeaveRequested event came from a self-targeted TC Remove-Device.
@@ -11215,6 +11371,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 if aps_ack_ready {
                     let _ = self.bdb.zdo_mut().aps_mut().send_pending_aps_ack().await;
                 }
+                // Our own fragmented data may go out only once this frame's
+                // security effects are durable, like the APS ACK above.
+                #[cfg(feature = "router")]
+                self.service_fragmented_send().await;
                 if trust_center_removal {
                     if self
                         .bdb
@@ -13025,8 +13185,56 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         clusters: &mut [ClusterRef<'_>],
     ) -> Option<event_loop::StackEvent> {
         let mut volatile_commit = |_| true;
-        self.process_incoming_with_replay_commit(indication, clusters, &mut volatile_commit, true)
-            .await
+        let event = self
+            .process_incoming_with_replay_commit(indication, clusters, &mut volatile_commit, true)
+            .await;
+        #[cfg(feature = "router")]
+        self.service_fragmented_send().await;
+        event
+    }
+
+    /// Send the next window of an in-flight fragmented transaction as soon as
+    /// a received APS ACK released it (R22 §2.2.8.4.5), instead of waiting for
+    /// the next maintenance tick, and collect its final confirm.
+    #[cfg(feature = "router")]
+    #[inline(never)]
+    async fn service_fragmented_send(&mut self) {
+        let aps = self.bdb.zdo_mut().aps_mut();
+        if aps.fragmented_tx_active() {
+            aps.service_fragment_tx().await;
+        }
+        self.collect_fragmented_send_confirm();
+    }
+
+    /// Move a finished fragmented transaction's APSDE-DATA.confirm out of
+    /// APS, logging its outcome.
+    #[cfg(feature = "router")]
+    pub(crate) fn collect_fragmented_send_confirm(&mut self) {
+        let Some(confirm) = self.bdb.zdo_mut().aps_mut().take_fragmented_tx_confirm() else {
+            return;
+        };
+        if confirm.status == zigbee_aps::ApsStatus::Success {
+            log::info!(
+                "[Runtime] Fragmented send counter={} delivered",
+                confirm.aps_counter
+            );
+        } else {
+            log::warn!(
+                "[Runtime] Fragmented send counter={} failed: {:?}",
+                confirm.aps_counter,
+                confirm.status
+            );
+        }
+        self.fragmented_send_confirm = Some(confirm);
+    }
+
+    /// Final delivery result of the last fragmented
+    /// [`send_zcl_frame`](Self::send_zcl_frame): `SUCCESS` once every block
+    /// was acknowledged, `NO_ACK` after the retries ran out. `None` while the
+    /// transaction is in flight or after the result was taken.
+    #[cfg(feature = "router")]
+    pub fn take_fragmented_send_confirm(&mut self) -> Option<zigbee_aps::apsde::ApsdeDataConfirm> {
+        self.fragmented_send_confirm.take()
     }
 
     async fn process_incoming_with_replay_commit<F>(
@@ -13558,6 +13766,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 
     /// Send a raw ZCL frame via APS→NWK→MAC.
+    ///
+    /// A frame larger than one APS payload is sent with APS fragmentation on
+    /// router builds: `Ok` then means the first window was handed to NWK, and
+    /// the delivery result is reported by
+    /// [`take_fragmented_send_confirm`](Self::take_fragmented_send_confirm).
+    /// Other builds refuse it with `SendError::Aps(AsduTooLong)`.
     pub async fn send_zcl_frame(
         &mut self,
         dst_addr: ShortAddress,
@@ -13570,6 +13784,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             return Err(event_loop::SendError::NotJoined);
         }
 
+        // R22 §2.2.8.4.5: a frame larger than one APS payload is sent
+        // fragmented, which requires APS acknowledgement. Only router builds
+        // carry APS fragmentation; elsewhere APS refuses it with
+        // ASDU_TOO_LONG.
+        let fragmented =
+            cfg!(feature = "router") && zcl_data.len() > zigbee_aps::apsde::APS_MAX_PAYLOAD;
         let req = zigbee_aps::apsde::ApsdeDataRequest {
             dst_addr_mode: zigbee_aps::ApsAddressMode::Short,
             dst_address: ApsAddress::Short(dst_addr),
@@ -13580,6 +13800,8 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             payload: zcl_data,
             tx_options: zigbee_aps::ApsTxOptions {
                 use_nwk_key: true,
+                ack_request: fragmented,
+                fragmentation_permitted: fragmented,
                 ..zigbee_aps::ApsTxOptions::default()
             },
             radius: 0,

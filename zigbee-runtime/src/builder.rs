@@ -52,6 +52,8 @@ macro_rules! zigbee_device_fields {
             pending_action: None,
             #[cfg(feature = "router")]
             pending_security_indication: None,
+            #[cfg(feature = "router")]
+            fragmented_send_confirm: None,
             defer_aps_ack: false,
             trust_center_removal_pending: false,
             deferred_mgmt_leave: None,
