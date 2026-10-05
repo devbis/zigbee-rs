@@ -1160,20 +1160,35 @@ impl<M: MacDriver> NwkLayer<M> {
     /// least-recently-heard source is evicted, never our parent or a child
     /// while any other entry can go (see `commit_frame_counter_for_key_protecting`).
     fn commit_replay_floor(&mut self, replay: crate::security::NwkReplayCounter) {
-        let neighbors = &self.neighbors;
-        self.security.commit_frame_counter_for_key_protecting(
+        // A router keeps the floors of its parent and children when the replay
+        // table overflows; strangers are evicted least-recently-heard first.
+        #[cfg(feature = "router")]
+        {
+            let neighbors = &self.neighbors;
+            self.security.commit_frame_counter_for_key_protecting(
+                &replay.source,
+                replay.key_sequence,
+                replay.counter,
+                &|ieee: &IeeeAddress| {
+                    neighbors.find_by_ieee(ieee).is_some_and(|entry| {
+                        matches!(
+                            entry.relationship,
+                            crate::neighbor::Relationship::Parent
+                                | crate::neighbor::Relationship::Child
+                        )
+                    })
+                },
+            );
+        }
+        // NWK security is hop-by-hop, so an end device only verifies frames
+        // whose auxiliary source is its parent (or an overheard neighbour);
+        // the parent is always the most recently heard source and plain LRU
+        // keeps it, which keeps the sleepy build lean.
+        #[cfg(not(feature = "router"))]
+        self.security.commit_frame_counter_for_key(
             &replay.source,
             replay.key_sequence,
             replay.counter,
-            |ieee| {
-                neighbors.find_by_ieee(ieee).is_some_and(|entry| {
-                    matches!(
-                        entry.relationship,
-                        crate::neighbor::Relationship::Parent
-                            | crate::neighbor::Relationship::Child
-                    )
-                })
-            },
         );
     }
 

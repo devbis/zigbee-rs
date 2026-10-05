@@ -434,7 +434,7 @@ impl NwkSecurity {
         key_sequence: u8,
         counter: u32,
     ) {
-        self.commit_frame_counter_for_key_protecting(source, key_sequence, counter, |_| false);
+        self.commit_frame_counter_for_key_protecting(source, key_sequence, counter, &|_| false);
     }
 
     /// Commit a verified counter, evicting a stale entry when the table is
@@ -459,32 +459,37 @@ impl NwkSecurity {
         source: &IeeeAddress,
         key_sequence: u8,
         counter: u32,
-        protect: impl Fn(&IeeeAddress) -> bool,
+        protect: &dyn Fn(&IeeeAddress) -> bool,
     ) {
         let table = &mut self.frame_counter_table;
-        let mut entry = match table
+        let mut entry = FrameCounterEntry {
+            source: *source,
+            key_sequence,
+            counter,
+        };
+        let from = match table
             .iter()
             .position(|e| e.source == *source && e.key_sequence == key_sequence)
         {
-            Some(index) => table.remove(index),
+            Some(index) => {
+                entry.counter = entry.counter.max(table[index].counter);
+                index
+            }
+            None if table.is_full() => {
+                log::warn!("[NWK] Replay table full — evicting least recently heard source");
+                table.iter().position(|e| !protect(&e.source)).unwrap_or(0)
+            }
             None => {
-                if table.is_full() {
-                    let victim = table.iter().position(|e| !protect(&e.source)).unwrap_or(0);
-                    log::warn!("[NWK] Replay table full — evicting least recently heard source");
-                    table.remove(victim);
-                }
-                FrameCounterEntry {
-                    source: *source,
-                    key_sequence,
-                    counter,
-                }
+                let _ = table.push(entry);
+                return;
             }
         };
-        if counter > entry.counter {
-            entry.counter = counter;
+        // Move the refreshed (or replacing) entry to the most-recent end.
+        let last = table.len() - 1;
+        for index in from..last {
+            table[index] = table[index + 1].clone();
         }
-        // Cannot fail: an entry was removed above or the table had room.
-        let _ = table.push(entry);
+        table[last] = entry;
     }
 
     /// Restore a durable replay floor only when the installed key still
@@ -869,7 +874,7 @@ mod tests {
         // A new neighbour is admitted rather than locked out forever.
         let newcomer = [0xF0; 8];
         assert!(security.check_frame_counter_for_key(&newcomer, 1, 5));
-        security.commit_frame_counter_for_key_protecting(&newcomer, 1, 5, |s| *s == parent);
+        security.commit_frame_counter_for_key_protecting(&newcomer, 1, 5, &|s| *s == parent);
 
         assert!(!security.check_frame_counter_for_key(&newcomer, 1, 5));
         // The parent kept its floor although it is now the oldest entry.
