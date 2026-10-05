@@ -879,6 +879,150 @@ pub fn frame_is_for_us(
     }
 }
 
+/// Decide whether `dst` is a unicast destination naming this node exactly.
+///
+/// Unlike [`frame_is_for_us`] this rejects the broadcast short address. It is
+/// the filter a software-acknowledging MAC must pass before transmitting an
+/// ACK (IEEE 802.15.4-2015 §6.7.4.1: broadcast frames are never acknowledged,
+/// and frames for somebody else must not be acknowledged on their behalf).
+/// While unassociated (`our_pan == 0xFFFF`) the PAN check is relaxed for the
+/// extended destination so the Association Response can still be ACKed.
+pub fn is_exact_destination(
+    dst: &MacAddress,
+    our_pan: PanId,
+    our_short: ShortAddress,
+    our_extended: &IeeeAddress,
+) -> bool {
+    match dst {
+        MacAddress::Short(pan, addr) => {
+            our_short.0 < 0xFFFE && addr.0 == our_short.0 && pan.0 == our_pan.0
+        }
+        MacAddress::Extended(pan, addr) => {
+            addr == our_extended && (pan.0 == our_pan.0 || our_pan.0 == 0xFFFF)
+        }
+    }
+}
+
+/// Return the sequence number to acknowledge if `data` is a received MAC
+/// frame that this node must ACK in software.
+///
+/// Only data and MAC command frames with the Acknowledgment Request bit set
+/// and an exact unicast destination for this node qualify; beacons, ACKs,
+/// broadcasts and frames addressed to other nodes return `None`.
+pub fn software_ack_sequence(
+    data: &[u8],
+    our_pan: PanId,
+    our_short: ShortAddress,
+    our_extended: &IeeeAddress,
+) -> Option<u8> {
+    if data.len() < 3 {
+        return None;
+    }
+    let fc = u16::from_le_bytes([data[0], data[1]]);
+    let frame_type = fc & 0x07;
+    if !(frame_type == 0x01 || frame_type == 0x03) || fc & (1 << 5) == 0 {
+        return None;
+    }
+    let dst = parse_dest_address(data, fc)?;
+    is_exact_destination(&dst, our_pan, our_short, our_extended).then_some(data[2])
+}
+
+/// Decide whether `data` is the parent's indirect data frame answering our
+/// Data Request.
+///
+/// After a frame-pending ACK only a data frame whose destination names this
+/// node exactly and whose source is the coordinator (`macCoordShortAddress`
+/// in our PAN, or a configured `macCoordExtendedAddress`) completes the poll.
+/// Broadcasts and frames overheard from other nodes must be handled through
+/// the normal receive path; callers that wrap a poll result as "from the
+/// parent" would otherwise misattribute them.
+pub fn is_parent_poll_response(
+    data: &[u8],
+    our_pan: PanId,
+    our_short: ShortAddress,
+    our_extended: &IeeeAddress,
+    coord_short: ShortAddress,
+    coord_extended: &IeeeAddress,
+) -> bool {
+    if data.len() < 3 || data[0] & 0x07 != 0x01 {
+        return false;
+    }
+    let fc = u16::from_le_bytes([data[0], data[1]]);
+    if data.len() < 3 + addressing_size(fc) {
+        return false;
+    }
+    let (Some(dst), Some(src)) = (parse_dest_address(data, fc), parse_source_address(data, fc))
+    else {
+        return false;
+    };
+    if !is_exact_destination(&dst, our_pan, our_short, our_extended) {
+        return false;
+    }
+    match src {
+        MacAddress::Short(pan, addr) => pan == our_pan && addr.0 < 0xFFF8 && addr == coord_short,
+        MacAddress::Extended(_, addr) => *coord_extended != [0; 8] && addr == *coord_extended,
+    }
+}
+
+/// Build an Imm-Ack frame (FCS excluded) for `sequence`.
+pub const fn build_ack(sequence: u8, frame_pending: bool) -> [u8; 3] {
+    [if frame_pending { 0x12 } else { 0x02 }, 0x00, sequence]
+}
+
+/// aUnitBackoffPeriod for the 2.4 GHz O-QPSK PHY: 20 symbols × 16 µs.
+pub const UNIT_BACKOFF_PERIOD_US: u64 = 320;
+
+/// Choose an unslotted CSMA-CA backoff in `0..2^be` unit periods.
+///
+/// `random` must come from an entropy source (hardware RNG or [`BackoffRng`]);
+/// a deterministic function of the sequence number makes colliding neighbours
+/// pick the same slot again. `be` is clamped to 8 (IEEE maximum macMaxBE).
+pub fn csma_backoff_slots(random: u32, be: u8) -> u16 {
+    let be = core::cmp::min(be, 8);
+    (random as u16) & ((1u16 << be) - 1)
+}
+
+/// Per-device xorshift32 used for CSMA backoff on radios without a usable
+/// hardware RNG.
+///
+/// The seed mixes the EUI-64 (unique per device, so two nodes never share a
+/// sequence) with whatever runtime jitter the platform can offer (timer ticks,
+/// RSSI noise). Callers should keep stirring jitter in via [`Self::mix`]. This
+/// is *not* a cryptographic RNG and must never feed key or nonce material.
+#[derive(Debug, Clone, Copy)]
+pub struct BackoffRng {
+    state: u32,
+}
+
+impl BackoffRng {
+    /// Seed from the device EUI-64 and an initial jitter word.
+    pub fn new(eui64: &IeeeAddress, jitter: u32) -> Self {
+        let lo = u32::from_le_bytes([eui64[0], eui64[1], eui64[2], eui64[3]]);
+        let hi = u32::from_le_bytes([eui64[4], eui64[5], eui64[6], eui64[7]]);
+        let mut rng = Self {
+            state: (lo ^ hi.rotate_left(16) ^ 0x9E37_79B9).max(1),
+        };
+        rng.mix(jitter);
+        rng
+    }
+
+    /// Stir additional runtime jitter into the state.
+    pub fn mix(&mut self, jitter: u32) {
+        self.state = (self.state ^ jitter.wrapping_mul(0x85EB_CA6B)).max(1);
+        self.next_u32();
+    }
+
+    /// Next pseudo-random word.
+    pub fn next_u32(&mut self) -> u32 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.state = x.max(1);
+        x
+    }
+}
+
 /// Convert an EUI-64 into the big-endian word expected by radio drivers that
 /// take the extended address as a `u64`.
 ///
@@ -1413,5 +1557,169 @@ mod tests {
             parse_coordinator_realignment_orphan_response(&extended_realignment),
             None
         );
+    }
+
+    #[test]
+    fn software_ack_only_for_exact_unicast_ack_request() {
+        let ext = [1, 2, 3, 4, 5, 6, 7, 8];
+        let pan = PanId(0x1234);
+        let short = ShortAddress(0x5678);
+        // Data, AR, PAN compression, short dst/src.
+        let unicast = [0x61, 0x88, 0x42, 0x34, 0x12, 0x78, 0x56, 0x00, 0x00, 0xAA];
+        assert_eq!(
+            software_ack_sequence(&unicast, pan, short, &ext),
+            Some(0x42)
+        );
+
+        // Same frame to another node: never ACK on its behalf.
+        let mut other = unicast;
+        other[5] = 0x79;
+        assert_eq!(software_ack_sequence(&other, pan, short, &ext), None);
+
+        // Wrong PAN.
+        let mut wrong_pan = unicast;
+        wrong_pan[3] = 0x35;
+        assert_eq!(software_ack_sequence(&wrong_pan, pan, short, &ext), None);
+
+        // Broadcast (even with AR erroneously set) is never acknowledged.
+        let mut broadcast = unicast;
+        broadcast[5] = 0xFF;
+        broadcast[6] = 0xFF;
+        assert_eq!(software_ack_sequence(&broadcast, pan, short, &ext), None);
+
+        // No AR bit.
+        let mut no_ar = unicast;
+        no_ar[0] = 0x41;
+        assert_eq!(software_ack_sequence(&no_ar, pan, short, &ext), None);
+
+        // Unassigned short address never matches.
+        assert_eq!(
+            software_ack_sequence(&unicast, pan, ShortAddress(0xFFFF), &ext),
+            None
+        );
+
+        // ACK frames themselves are never acknowledged.
+        assert_eq!(
+            software_ack_sequence(&[0x02, 0x00, 0x42], pan, short, &ext),
+            None
+        );
+    }
+
+    #[test]
+    fn software_ack_accepts_extended_association_response_while_unassociated() {
+        let ext = [1, 2, 3, 4, 5, 6, 7, 8];
+        let response = build_association_response(
+            0x22,
+            PanId(0x1234),
+            &[8, 7, 6, 5, 4, 3, 2, 1],
+            &MlmeAssociateResponse {
+                device_address: ext,
+                short_address: ShortAddress(0x3344),
+                status: AssociationStatus::Success,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            software_ack_sequence(&response, PanId(0xFFFF), ShortAddress(0xFFFF), &ext),
+            Some(0x22)
+        );
+        assert_eq!(
+            software_ack_sequence(&response, PanId(0xFFFF), ShortAddress(0xFFFF), &[9; 8]),
+            None
+        );
+    }
+
+    #[test]
+    fn ack_builder_round_trips_through_ack_info() {
+        assert_eq!(ack_info(&build_ack(7, false)), Some((7, false)));
+        assert_eq!(ack_info(&build_ack(9, true)), Some((9, true)));
+    }
+
+    #[test]
+    fn backoff_slots_stay_inside_contention_window() {
+        for be in 0..=10u8 {
+            let limit = 1u32 << core::cmp::min(be, 8);
+            for random in [0u32, 1, 0x7F, 0xFFFF, 0xFFFF_FFFF, 0x1234_5678] {
+                assert!(u32::from(csma_backoff_slots(random, be)) < limit);
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_rng_differs_per_device_and_jitter() {
+        let mut a = BackoffRng::new(&[1, 0, 0, 0, 0, 0, 0, 0], 0);
+        let mut b = BackoffRng::new(&[2, 0, 0, 0, 0, 0, 0, 0], 0);
+        let mut c = BackoffRng::new(&[1, 0, 0, 0, 0, 0, 0, 0], 17);
+        let sa: [u32; 4] = core::array::from_fn(|_| a.next_u32());
+        let sb: [u32; 4] = core::array::from_fn(|_| b.next_u32());
+        let sc: [u32; 4] = core::array::from_fn(|_| c.next_u32());
+        assert_ne!(sa, sb);
+        assert_ne!(sa, sc);
+        assert!(sa.iter().all(|v| *v != 0));
+        // All-zero EUI and jitter still yields a live generator.
+        let mut z = BackoffRng::new(&[0; 8], 0);
+        assert_ne!(z.next_u32(), 0);
+    }
+
+    #[test]
+    fn parent_poll_response_requires_parent_source_and_exact_destination() {
+        let ext = [1, 2, 3, 4, 5, 6, 7, 8];
+        let pan = PanId(0x1234);
+        let short = ShortAddress(0x5678);
+        let parent = ShortAddress(0x0000);
+        // Data, AR, PAN compression, short dst 0x5678, short src 0x0000.
+        let from_parent = [0x61, 0x88, 0x42, 0x34, 0x12, 0x78, 0x56, 0x00, 0x00, 0xAA];
+        assert!(is_parent_poll_response(
+            &from_parent,
+            pan,
+            short,
+            &ext,
+            parent,
+            &[0; 8]
+        ));
+
+        // A neighbour router answering into our poll window is not the parent.
+        let mut neighbour = from_parent;
+        neighbour[7] = 0x01;
+        assert!(!is_parent_poll_response(
+            &neighbour, pan, short, &ext, parent, &[0; 8]
+        ));
+
+        // The parent's broadcast is not a poll response.
+        let mut broadcast = from_parent;
+        broadcast[5] = 0xFF;
+        broadcast[6] = 0xFF;
+        assert!(!is_parent_poll_response(
+            &broadcast, pan, short, &ext, parent, &[0; 8]
+        ));
+
+        // A MAC command (e.g. a stray association response) is not data.
+        let mut command = from_parent;
+        command[0] = 0x63;
+        assert!(!is_parent_poll_response(
+            &command, pan, short, &ext, parent, &[0; 8]
+        ));
+
+        // Truncated addressing never matches.
+        assert!(!is_parent_poll_response(
+            &from_parent[..6],
+            pan,
+            short,
+            &ext,
+            parent,
+            &[0; 8]
+        ));
+
+        // Extended destination (rejoin response queued by IEEE) from the
+        // parent's short address is accepted.
+        let mut by_ieee = heapless::Vec::<u8, 32>::new();
+        by_ieee
+            .extend_from_slice(&[0x61, 0x8C, 0x07, 0x34, 0x12])
+            .unwrap();
+        by_ieee.extend_from_slice(&ext).unwrap();
+        by_ieee.extend_from_slice(&[0x00, 0x00, 0x09]).unwrap();
+        assert!(is_parent_poll_response(
+            &by_ieee, pan, short, &ext, parent, &[0; 8]
+        ));
     }
 }

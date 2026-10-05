@@ -34,6 +34,18 @@
 //! delivered like any other frame through the normal `RxDone` path — verified
 //! on an ESP32-C6 devkit, see [`Ieee802154Driver::ack_observed`] — so
 //! [`Ieee802154Driver::transmit_with_ack`] can confirm deliveries itself.
+//!
+//! # Delivery status policy
+//!
+//! A frame that requested an acknowledgement is only reported as delivered
+//! when its matching ACK (same sequence number) has been seen. Every other
+//! outcome — no ACK in the window ([`TxAckResult::NotObserved`]) or an ACK
+//! that could not be looked for ([`TxAckResult::NotChecked`]) — is retried
+//! per `macMaxFrameRetries` and finally surfaces as `MacError::NoAck`.
+//! Reporting an unverified unicast as delivered would hide parent loss and
+//! suppress NWK route repair, which is far worse than a rare spurious NoAck
+//! that NWK/APS recover from. Receivers discard MAC retransmissions by DSN,
+//! so a retry of a frame that was in fact received is harmless.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -86,20 +98,25 @@ pub enum TxAckResult {
     /// The frame went out but no ACK frame was observed.
     NotObserved,
     /// The frame went out but the ACK could not be looked for, because doing so
-    /// would have meant dropping already received frames. Treated as sent: a
-    /// retransmission would duplicate a frame the peer most likely has.
+    /// would have meant dropping already received frames. Delivery is
+    /// *unverified*; the MAC must not report it as acknowledged.
     NotChecked,
     /// The frame could not be handed to the radio at all.
     TxFailed,
 }
 
+/// Minimum esp-radio receive queue depth enforced by [`apply_radio_policy`].
+const RADIO_RX_QUEUE_DEPTH: usize = 20;
+
 /// How many frames may be held while looking for an ACK.
 ///
-/// Deliberately small. Parked frames are invisible to the stack until the MAC
-/// polls again, so a deep queue just delivers stale frames; when it is full the
-/// driver stops inspecting the radio queue instead of dropping anything (see
-/// [`TxAckResult::NotChecked`]).
-const PENDING_RX_DEPTH: usize = 4;
+/// Parking only moves a frame from the esp-radio queue into this one; it does
+/// not make it any staler. The depth covers a completely full radio queue plus
+/// the few frames that can physically arrive inside one ACK window, so the
+/// ACK can always be found behind a backlog. Only if the stack has fallen
+/// further behind than that does the driver stop inspecting the radio queue
+/// (instead of dropping anything) and report [`TxAckResult::NotChecked`].
+const PENDING_RX_DEPTH: usize = RADIO_RX_QUEUE_DEPTH + 4;
 
 /// Wrapper around the ESP32 ieee802154 radio peripheral.
 pub struct Ieee802154Driver<'a> {
@@ -260,10 +277,8 @@ impl<'a> Ieee802154Driver<'a> {
     ///
     /// If there is no room left to park, the ACK is *not* looked for. Frames
     /// then stay in the esp-radio queue where they are safe, and the caller is
-    /// told the transmission could not be verified rather than being pushed
-    /// into a retransmission it does not need. This matters on a busy network:
-    /// every broadcast this node sends comes back from a dozen routers within a
-    /// few milliseconds.
+    /// told the transmission could not be verified ([`TxAckResult::NotChecked`]),
+    /// which the MAC treats like a missing ACK.
     pub fn transmit_with_ack(&mut self, frame: &[u8], seq: u8) -> TxAckResult {
         if self.transmit(frame).is_err() {
             return TxAckResult::TxFailed;
@@ -430,7 +445,7 @@ fn apply_radio_policy(cfg: &mut Config) {
     // A Zigbee network floods link-status/route broadcasts; esp-radio's default
     // of 10 queued frames overflows ("Receive queue full") while the MAC is
     // busy with a TX burst or a flash write.
-    cfg.rx_queue_size = cfg.rx_queue_size.max(20);
+    cfg.rx_queue_size = cfg.rx_queue_size.max(RADIO_RX_QUEUE_DEPTH);
 }
 
 /// Return the sequence number if `rx` is an IEEE 802.15.4 ACK frame.

@@ -26,6 +26,7 @@ use driver::{Ieee802154Driver, TxAckResult};
 use zigbee_types::*;
 
 use embassy_time::{Duration, Instant, Timer};
+use esp_hal::rng::Rng;
 use esp_radio::ieee802154::{Config, Ieee802154};
 
 pub use crate::esp_aes::AesEngineError;
@@ -343,10 +344,12 @@ impl<'a> EspMac<'a> {
         let deadline = Instant::now() + Duration::from_micros(duration_us);
         self.driver.start_receive();
         let mut rx_count = 0u32;
-        let mut saw_data_on_channel = false;
-        let mut data_pan: u16 = 0;
-        let mut data_src: u16 = 0;
 
+        // Only genuine beacon frames produce PAN descriptors. Overheard data
+        // traffic proves nothing about permit-join, capacity, stack profile or
+        // the extended PAN ID, and its addressing fields depend on the frame
+        // control field — synthesising a descriptor from it would steer the
+        // join into a PAN that never offered one.
         loop {
             if Instant::now() >= deadline {
                 break;
@@ -359,7 +362,6 @@ impl<'a> EspMac<'a> {
                 } else {
                     0
                 };
-                let ftype = fc & 0x07;
                 // Log first few frames on each channel for debugging
                 if rx_count <= 3 {
                     log::info!(
@@ -367,7 +369,7 @@ impl<'a> EspMac<'a> {
                         channel,
                         rx_count,
                         fc,
-                        ftype,
+                        fc & 0x07,
                         rx.len
                     );
                 }
@@ -380,15 +382,6 @@ impl<'a> EspMac<'a> {
                     if descriptors.push(pd).is_err() {
                         break;
                     }
-                } else if ftype == 1 && data.len() >= 7 && !saw_data_on_channel {
-                    // Data frame — extract PAN and source address for synthetic beacon
-                    let pan = u16::from_le_bytes([data[3], data[4]]);
-                    let src = u16::from_le_bytes([data[5], data[6]]);
-                    if pan != 0xFFFF {
-                        saw_data_on_channel = true;
-                        data_pan = pan;
-                        data_src = src;
-                    }
                 }
                 self.driver.start_receive();
             } else {
@@ -396,37 +389,15 @@ impl<'a> EspMac<'a> {
             }
         }
 
-        // Fallback: if we received data frames but no beacons, synthesize a
-        // PanDescriptor. EZSP coordinators may not send standard beacons but
-        // the presence of data traffic proves the network exists.
-        if descriptors.is_empty() && saw_data_on_channel {
+        if rx_count == 0 {
+            log::info!("[SCAN] ch{}: no frames in {}us", channel, duration_us);
+        } else if descriptors.is_empty() {
             log::info!(
-                "[SCAN] ch{}: no beacons but {} data frames, synth PAN=0x{:04X} src=0x{:04X}",
+                "[SCAN] ch{}: {} frame(s) but no beacon in {}us",
                 channel,
                 rx_count,
-                data_pan,
-                data_src
+                duration_us
             );
-            let _ = descriptors.push(PanDescriptor {
-                coord_address: MacAddress::Short(PanId(data_pan), ShortAddress(data_src)),
-                channel,
-                superframe_spec: SuperframeSpec::from_raw(0x8FFF), // permit joining
-                lqi: 128,
-                security_use: false,
-                zigbee_beacon: ZigbeeBeaconPayload {
-                    protocol_id: 0,
-                    stack_profile: 2,
-                    protocol_version: 2,
-                    router_capacity: true,
-                    device_depth: 0,
-                    end_device_capacity: true,
-                    extended_pan_id: [0u8; 8],
-                    tx_offset: [0xFF, 0xFF, 0xFF],
-                    update_id: 0,
-                },
-            });
-        } else if rx_count == 0 {
-            log::info!("[SCAN] ch{}: no frames in {}us", channel, duration_us);
         }
     }
 
@@ -948,44 +919,34 @@ impl MacDriver for EspMac<'_> {
             timestamp: None,
         };
 
+        let mut unverified = 0u8;
         for attempt in 0..=max_retries {
-            // CSMA-CA backoff
+            // Unslotted CSMA-CA (IEEE 802.15.4-2015 §6.2.5.1) with PIB
+            // macMinBe/macMaxBe/macMaxCsmaBackoffs. esp-radio's raw transmit
+            // has no CCA, so `TxFailed` (radio refused/timed out) stands in
+            // for a busy channel.
             let mut be = self.min_be;
             let mut nb: u8 = 0;
 
             let transmitted = loop {
-                let max_val = (1u32 << be) - 1;
-                let random = (seq as u32)
-                    .wrapping_add(nb as u32)
-                    .wrapping_add(attempt as u32)
-                    .wrapping_mul(1103515245)
-                    .wrapping_add(12345);
-                let backoff = (random % (max_val + 1)) as u64;
-                if backoff > 0 {
-                    Timer::after_micros(backoff * 20 * 16).await;
+                // The hardware RNG is fed by RF noise while the radio is on, so
+                // neighbours that collided once do not pick the same slot again.
+                let slots = crate::frames::csma_backoff_slots(Rng::new().random(), be);
+                if slots > 0 {
+                    Timer::after_micros(u64::from(slots) * crate::frames::UNIT_BACKOFF_PERIOD_US)
+                        .await;
                 }
 
                 if ack_requested {
-                    // TX + ACK wait using driver's precise timing
+                    // TX + ACK wait using driver's precise timing. Only a
+                    // matching ACK counts as delivery (see the driver's
+                    // "Delivery status policy").
                     match self.driver.transmit_with_ack(&frame_buf[..len], seq) {
                         TxAckResult::Acked => return Ok(confirm),
-                        // The radio was holding frames the stack has not seen
-                        // yet, so the ACK could not be looked for without
-                        // dropping them. Retransmitting would duplicate a frame
-                        // the peer probably already has; APS/NWK own end-to-end
-                        // reliability here.
-                        TxAckResult::NotChecked => return Ok(confirm),
-                        TxAckResult::NotObserved => {
-                            // esp-radio only surfaces ACK frames while the
-                            // hardware filter passes them. If this radio has
-                            // never delivered a single ACK, "no ACK" carries no
-                            // information and retransmitting would just double
-                            // the traffic — report success and let APS/NWK
-                            // handle end-to-end reliability.
-                            if !self.driver.ack_observed() {
-                                return Ok(confirm);
-                            }
-                            break true; // TX sent but no ACK — will retry
+                        TxAckResult::NotObserved => break true,
+                        TxAckResult::NotChecked => {
+                            unverified = unverified.saturating_add(1);
+                            break true;
                         }
                         TxAckResult::TxFailed => {
                             nb += 1;
@@ -1015,9 +976,12 @@ impl MacDriver for EspMac<'_> {
         }
 
         log::warn!(
-            "[ESP TX] no ACK for seq {} after {} tries",
+            "[ESP TX] no ACK for seq {} after {} retries ({} unverifiable: RX backlog full; \
+             any ACK ever seen: {})",
             seq,
-            max_retries
+            max_retries,
+            unverified,
+            self.driver.ack_observed()
         );
         Err(MacError::NoAck)
     }
