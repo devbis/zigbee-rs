@@ -40,6 +40,8 @@ pub mod apsde;
 pub mod apsme;
 pub mod binding;
 pub mod fragment;
+#[cfg(feature = "fragmentation")]
+mod fragment_tx;
 pub mod frames;
 pub mod group;
 pub mod security;
@@ -547,6 +549,11 @@ pub struct ApsLayer<M: MacDriver> {
     dup_table: [ApsDuplicateEntry; APS_DUP_TABLE_SIZE],
     /// Reception state to undo if the current frame's durable commit aborts.
     pending_rx_rollback: Option<ApsRxRollback>,
+    /// Outgoing fragmented transaction (R22 §2.2.8.4.5.1).
+    #[cfg(feature = "fragmentation")]
+    fragment_tx: Option<fragment_tx::FragmentTxSession>,
+    /// Final APSDE-DATA.confirm of the last fragmented transaction.
+    fragment_tx_confirm: Option<apsde::ApsdeDataConfirm>,
     /// Outbound APS ACK tracking (frames awaiting ACK confirmation)
     ack_table: heapless::Vec<PendingApsAckEntry, APS_ACK_TABLE_SIZE>,
     /// Recently confirmed handles retained for durable upper-layer delivery.
@@ -591,6 +598,9 @@ impl<M: MacDriver> ApsLayer<M> {
             pending_data_replay: None,
             dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
             pending_rx_rollback: None,
+            #[cfg(feature = "fragmentation")]
+            fragment_tx: None,
+            fragment_tx_confirm: None,
             ack_table: heapless::Vec::new(),
             ack_completions: heapless::Vec::new(),
             next_ack_generation: 1,
@@ -636,6 +646,9 @@ impl<M: MacDriver> ApsLayer<M> {
             core::ptr::addr_of_mut!((*slot).dup_table)
                 .write([ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE]);
             core::ptr::addr_of_mut!((*slot).pending_rx_rollback).write(None);
+            #[cfg(feature = "fragmentation")]
+            core::ptr::addr_of_mut!((*slot).fragment_tx).write(None);
+            core::ptr::addr_of_mut!((*slot).fragment_tx_confirm).write(None);
             core::ptr::addr_of_mut!((*slot).ack_table).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).ack_completions).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).next_ack_generation).write(1);
@@ -1030,19 +1043,59 @@ impl<M: MacDriver> ApsLayer<M> {
 
     /// Whether an outbound unicast still needs its peer's acknowledgement.
     pub fn has_pending_ack(&self) -> bool {
+        #[cfg(feature = "fragmentation")]
+        if self.fragment_tx.is_some() {
+            return true;
+        }
         self.ack_table
             .iter()
             .any(|entry| entry.active && !entry.confirmed)
     }
 
+    /// Final APSDE-DATA.confirm of a fragmented transaction (R22
+    /// §2.2.8.4.5.1): `SUCCESS` once every block was acknowledged, `NO_ACK`
+    /// after `apscMaxFrameRetries` unanswered retries, `SECURITY_FAIL` if a
+    /// block could not be secured. `None` while the transaction is in flight
+    /// or when none was started. Taking the result clears it.
+    pub fn take_fragmented_tx_confirm(&mut self) -> Option<apsde::ApsdeDataConfirm> {
+        self.fragment_tx_confirm.take()
+    }
+
     /// Deliver an incoming APS ACK. Returns true if matched a pending request.
+    ///
+    /// This entry point carries no security information, so it only
+    /// completes transmissions that were not APS-secured; the receive path
+    /// uses [`Self::confirm_ack_with_security`].
     pub fn confirm_ack(&mut self, src_addr: u16, aps_counter: u8) -> bool {
+        self.confirm_ack_with_security(src_addr, aps_counter, false)
+    }
+
+    /// Deliver an incoming APS ACK whose APS security state is known.
+    ///
+    /// An APS-secured transmission is only completed by an APS-secured ACK:
+    /// a device holding just the network key could otherwise forge the
+    /// acknowledgement and suppress the retries of a link-key-protected
+    /// frame.
+    pub(crate) fn confirm_ack_with_security(
+        &mut self,
+        src_addr: u16,
+        aps_counter: u8,
+        aps_secured_ack: bool,
+    ) -> bool {
         for entry in self.ack_table.iter_mut() {
             if entry.active
                 && entry.aps_counter == aps_counter
                 && entry.dst_addr == src_addr
                 && !entry.confirmed
             {
+                if entry.security.is_some() && !aps_secured_ack {
+                    log::warn!(
+                        "[APS] ignoring unsecured ACK for APS-secured counter={} from 0x{:04X}",
+                        aps_counter,
+                        src_addr,
+                    );
+                    return false;
+                }
                 entry.confirmed = true;
                 let handle = ApsAckHandle::new(src_addr, aps_counter, entry.generation);
                 if !self.ack_completions.contains(&handle) {
@@ -1235,6 +1288,22 @@ impl<M: MacDriver> ApsLayer<M> {
                     entry.active = false;
                     entry.original_frame.clear();
                 }
+            }
+        }
+
+        // Fragmented transaction: run its acknowledgement timer and hand out
+        // due blocks in the remaining capacity, so a maintenance loop that
+        // only sends what this returns also drives fragmentation.
+        #[cfg(feature = "fragmentation")]
+        {
+            self.poll_fragment_tx_timeout();
+            while !retransmit.is_full() {
+                let Some((dst_addr, _, _, frame)) = self.next_due_fragment() else {
+                    break;
+                };
+                retransmit
+                    .push(ApsRetransmission { dst_addr, frame })
+                    .expect("capacity checked above");
             }
         }
         retransmit
