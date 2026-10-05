@@ -1018,30 +1018,28 @@ where
         if !St::PRESENT {
             return;
         }
-        self.resources
-            .status
-            .set(SensorStatus::Joining { on: true });
-        self.resources
-            .wake
-            .delay_ms(self.policy.status.blink_on_ms)
-            .await;
-        self.resources
-            .status
-            .set(SensorStatus::Joining { on: false });
-        self.resources
-            .wake
-            .delay_ms(self.policy.status.blink_gap_ms)
-            .await;
-        self.resources
-            .status
-            .set(SensorStatus::Joining { on: true });
-        self.resources
-            .wake
-            .delay_ms(self.policy.status.blink_on_ms)
-            .await;
-        self.resources
-            .status
-            .set(SensorStatus::Joining { on: false });
+        // on, gap, on: one await site per wait keeps the future small.
+        let mut second_flash = false;
+        loop {
+            self.resources
+                .status
+                .set(SensorStatus::Joining { on: true });
+            self.resources
+                .wake
+                .delay_ms(self.policy.status.blink_on_ms)
+                .await;
+            self.resources
+                .status
+                .set(SensorStatus::Joining { on: false });
+            if second_flash {
+                break;
+            }
+            second_flash = true;
+            self.resources
+                .wake
+                .delay_ms(self.policy.status.blink_gap_ms)
+                .await;
+        }
     }
 
     /// Unjoined lifecycle: sleep through the exponential backoff (or until
