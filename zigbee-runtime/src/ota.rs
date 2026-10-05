@@ -656,7 +656,7 @@ impl<F: FirmwareWriter> OtaManager<F> {
         while !rest.is_empty() {
             let pos = self.download_ctx.file_offset;
             let consumed = match self.download_ctx.phase {
-                OtaParsePhase::Header => self.consume_header(rest, &offer)?,
+                OtaParsePhase::Header => self.consume_header(rest)?,
                 OtaParsePhase::SubElement => self.consume_sub_element(rest, &offer)?,
                 OtaParsePhase::Payload => {
                     let ctx = &self.download_ctx;
@@ -693,7 +693,6 @@ impl<F: FirmwareWriter> OtaManager<F> {
     fn consume_header(
         &mut self,
         data: &[u8],
-        offer: &OtaImageOffer,
     ) -> Result<usize, crate::firmware_writer::FirmwareError> {
         use crate::firmware_writer::FirmwareError;
         use zigbee_zcl::clusters::ota_image::OTA_HEADER_MIN_SIZE;
@@ -725,45 +724,19 @@ impl<F: FirmwareWriter> OtaManager<F> {
                 return Err(FirmwareError::VerifyFailed);
             }
         };
-        if header.manufacturer_code != offer.manufacturer_code
-            || header.manufacturer_code != self.config.manufacturer_code
-            || header.image_type != offer.image_type
-            || header.image_type != self.config.image_type
-        {
-            log::warn!(
-                "[OTA] Header identity mismatch: mfg=0x{:04X} type=0x{:04X}",
-                header.manufacturer_code,
-                header.image_type
-            );
-            return Err(FirmwareError::VerifyFailed);
-        }
-        if header.file_version != offer.file_version
-            || header.file_version <= self.config.current_version
-        {
-            log::warn!(
-                "[OTA] Header version 0x{:08X} differs from offer 0x{:08X}",
-                header.file_version,
-                offer.file_version
-            );
-            return Err(FirmwareError::VerifyFailed);
-        }
-        if header.total_image_size != offer.image_size
+        // Identity, version and size against the Query Next Image Response
+        // that started this download (which already required a newer
+        // version), and the hardware-version range.
+        if !self.cluster.validate_image_header(&header)
             || u32::from(header.header_length) > header.total_image_size
         {
             log::warn!(
-                "[OTA] Header size {} differs from offer {}",
-                header.total_image_size,
-                offer.image_size
+                "[OTA] Header rejected: mfg=0x{:04X} type=0x{:04X} version=0x{:08X} size={}",
+                header.manufacturer_code,
+                header.image_type,
+                header.file_version,
+                header.total_image_size
             );
-            return Err(FirmwareError::VerifyFailed);
-        }
-        if let (Some(hw), Some(min), Some(max)) = (
-            self.config.hardware_version,
-            header.min_hardware_version,
-            header.max_hardware_version,
-        ) && !(min..=max).contains(&hw)
-        {
-            log::warn!("[OTA] Hardware version {} outside [{}, {}]", hw, min, max);
             return Err(FirmwareError::VerifyFailed);
         }
 
