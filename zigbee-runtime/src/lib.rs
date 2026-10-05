@@ -111,6 +111,7 @@ pub mod trust_center_runtime;
 #[cfg(feature = "trust-center")]
 pub mod trust_center_store;
 pub(crate) mod zcl_dispatch;
+pub(crate) mod zcl_wire;
 
 use zigbee_aps::ApsAddress;
 use zigbee_bdb::BdbLayer;
@@ -738,6 +739,7 @@ mod builder_cluster_tests {
             0x55,
             ZclStatus::UnsupGeneralCommand,
             ClusterDirection::ServerToClient,
+            None,
         );
 
         let response = ZclFrame::parse(device.pending_responses[0].zcl_data.as_slice()).unwrap();
@@ -3784,6 +3786,115 @@ mod resume_tests {
         ));
         assert!(!device.is_joined());
         assert!(!device.secure_rejoin_pending());
+    }
+
+    /// Group-addressed APS data frame (`delivery mode = group`) carrying a
+    /// ZCL Identify command with default responses enabled.
+    fn group_identify_frame(
+        group: u16,
+        aps_counter: u8,
+        frame_counter: u32,
+    ) -> zigbee_mac::MacFrame {
+        let [glo, ghi] = group.to_le_bytes();
+        let payload = [
+            0x0C, // APS FC: data frame, group delivery
+            glo,
+            ghi,
+            0x03,
+            0x00, // Identify cluster
+            0x04,
+            0x01, // HA profile
+            0x01, // source endpoint
+            aps_counter,
+            0x01, // ZCL FC: cluster-specific, client→server, DR enabled
+            0x42, // ZCL sequence
+            0x00, // Identify
+            0x05,
+            0x00, // IdentifyTime = 5 s
+        ];
+        nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(0xFFFF),
+            &payload,
+            frame_counter,
+            true,
+        )
+    }
+
+    fn identify_time(
+        device: &ZigbeeDevice<MockMac>,
+        endpoint: u8,
+    ) -> Option<zigbee_zcl::data_types::ZclValue> {
+        let clusters: [crate::ClusterRef<'_>; 0] = [];
+        device
+            .with_cluster(endpoint, crate::ClusterId::IDENTIFY, &clusters, |cluster| {
+                cluster
+                    .attributes()
+                    .get(zigbee_zcl::AttributeId(0x0000))
+                    .cloned()
+            })
+            .flatten()
+    }
+
+    /// A group-addressed frame is delivered to every local endpoint that is a
+    /// member of the group — and only those — and, being groupcast, elicits
+    /// no Default Response.
+    #[test]
+    fn group_frames_fan_out_to_member_endpoints_without_responses() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .endpoint(1, 0x0104, crate::DeviceId::TEMPERATURE_SENSOR, |endpoint| {
+                endpoint.cluster_server(crate::ClusterId::IDENTIFY)
+            })
+            .endpoint(2, 0x0104, crate::DeviceId::THERMOSTAT, |endpoint| {
+                endpoint.cluster_server(crate::ClusterId::IDENTIFY)
+            })
+            .build();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        {
+            let aps = device.bdb_mut().zdo_mut().aps_mut();
+            for (group, endpoint) in [(0x0007, 1), (0x0007, 2), (0x0008, 2)] {
+                let confirm = aps.apsme_add_group(&zigbee_aps::apsme::ApsmeAddGroupRequest {
+                    group_address: group,
+                    endpoint,
+                });
+                assert_eq!(confirm.status, zigbee_aps::ApsStatus::Success);
+            }
+        }
+        let zero = Some(zigbee_zcl::data_types::ZclValue::U16(0));
+        let five = Some(zigbee_zcl::data_types::ZclValue::U16(5));
+
+        // Group 0x0008: endpoint 2 only.
+        let event = block_on(
+            device.process_incoming(&indication(group_identify_frame(0x0008, 1, 1)), &mut []),
+        );
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::CommandReceived { endpoint: 2, .. })
+        ));
+        assert_eq!(identify_time(&device, 1), zero);
+        assert_eq!(identify_time(&device, 2), five);
+        assert!(device.pending_responses.is_empty());
+
+        // Group 0x0007: both member endpoints.
+        device.reset_identify_clusters();
+        let _ = block_on(
+            device.process_incoming(&indication(group_identify_frame(0x0007, 2, 2)), &mut []),
+        );
+        assert_eq!(identify_time(&device, 1), five);
+        assert_eq!(identify_time(&device, 2), five);
+        assert!(device.pending_responses.is_empty());
+
+        // Group 0x0009: no member endpoint, nothing is delivered.
+        device.reset_identify_clusters();
+        let event = block_on(
+            device.process_incoming(&indication(group_identify_frame(0x0009, 3, 3)), &mut []),
+        );
+        assert!(event.is_none());
+        assert_eq!(identify_time(&device, 1), zero);
+        assert_eq!(identify_time(&device, 2), zero);
+        assert!(device.pending_responses.is_empty());
     }
 
     #[test]
@@ -12530,55 +12641,103 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         // The only `M`-generic side effects — APS group-table updates and the
         // Finding & Binding Identify collection — are returned as actions and
         // applied here, after the borrow of runtime-local state is released.
-        let zcl_scratch = unsafe { &mut *self.scratch.zcl.get() };
-        let outcome = zcl_dispatch::LocalZclCtx::new(
-            &self.endpoints,
-            &mut self.basic_cluster,
-            &mut self.identify_clusters,
-            &mut self.reporting,
-            &mut self.remote_reporting,
-            &mut self.pending_responses,
-            clusters,
-            zcl_scratch,
-        )
-        .dispatch(
-            dst_ep,
-            aps_indication.src_endpoint,
-            cluster_id,
-            src_addr,
-            aps_indication.payload,
-        );
+        self.dispatch_application_zcl(clusters, &aps_indication, dst_ep, cluster_id, src_addr, dst)
+    }
 
-        #[cfg(any(feature = "groups", test))]
-        if let Some(action) = outcome.group_action {
-            let aps = self.bdb.zdo_mut().aps_mut();
-            match action {
-                zcl_dispatch::GroupTableAction::Add { group, endpoint } => {
-                    let _ = aps.apsme_add_group(&zigbee_aps::apsme::ApsmeAddGroupRequest {
-                        group_address: group,
-                        endpoint,
-                    });
-                }
-                zcl_dispatch::GroupTableAction::Remove { group, endpoint } => {
-                    let _ = aps.apsme_remove_group(&zigbee_aps::apsme::ApsmeRemoveGroupRequest {
-                        group_address: group,
-                        endpoint,
-                    });
-                }
-                zcl_dispatch::GroupTableAction::RemoveAll { endpoint } => {
-                    let _ = aps.apsme_remove_all_groups(
-                        &zigbee_aps::apsme::ApsmeRemoveAllGroupsRequest { endpoint },
-                    );
+    /// Deliver one application APS indication to the local ZCL dispatcher.
+    ///
+    /// Synchronous and `#[inline(never)]` so the fan-out loop and its locals
+    /// never become part of the async receive future's layout.
+    ///
+    /// Delivery follows R22 §2.2.4.1.1: a group-addressed frame goes to every
+    /// local endpoint that is a member of the group in the APS group table;
+    /// the broadcast endpoint 0xFF goes to every application endpoint; other
+    /// frames go to the addressed endpoint. Group and NWK-broadcast frames are
+    /// dispatched as non-unicast, so they never elicit a Default Response or a
+    /// Groups cluster response. When several endpoints produce an event, the
+    /// first is returned (the receive API carries a single event); every
+    /// endpoint's cluster state and group-table side effects are applied.
+    #[inline(never)]
+    fn dispatch_application_zcl(
+        &mut self,
+        clusters: &mut [ClusterRef<'_>],
+        aps_indication: &zigbee_aps::apsde::ApsdeDataIndication<'_>,
+        dst_ep: u8,
+        cluster_id: u16,
+        src_addr: u16,
+        nwk_dst: ShortAddress,
+    ) -> Option<event_loop::StackEvent> {
+        let group = match (aps_indication.dst_addr_mode, aps_indication.dst_address) {
+            (zigbee_aps::ApsAddressMode::Group, ApsAddress::Group(group)) => Some(group),
+            _ => None,
+        };
+        let unicast = group.is_none() && nwk_dst.0 < 0xFFF8;
+        let targets = zcl_dispatch::delivery_endpoints(
+            &self.endpoints,
+            dst_ep,
+            group,
+            self.bdb.zdo().aps().group_table(),
+        );
+        if targets.is_empty() {
+            rt_trace!("[RT] zcl_rx no member endpoint for dst_ep={}", dst_ep);
+        }
+        let mut event = None;
+        for target in targets {
+            let zcl_scratch = unsafe { &mut *self.scratch.zcl.get() };
+            let outcome = zcl_dispatch::LocalZclCtx::new(
+                &self.endpoints,
+                &mut self.basic_cluster,
+                &mut self.identify_clusters,
+                &mut self.reporting,
+                &mut self.remote_reporting,
+                &mut self.pending_responses,
+                clusters,
+                zcl_scratch,
+            )
+            .with_unicast(unicast)
+            .dispatch(
+                target,
+                aps_indication.src_endpoint,
+                cluster_id,
+                src_addr,
+                aps_indication.payload,
+            );
+
+            #[cfg(any(feature = "groups", test))]
+            if let Some(action) = outcome.group_action {
+                let aps = self.bdb.zdo_mut().aps_mut();
+                match action {
+                    zcl_dispatch::GroupTableAction::Add { group, endpoint } => {
+                        let _ = aps.apsme_add_group(&zigbee_aps::apsme::ApsmeAddGroupRequest {
+                            group_address: group,
+                            endpoint,
+                        });
+                    }
+                    zcl_dispatch::GroupTableAction::Remove { group, endpoint } => {
+                        let _ =
+                            aps.apsme_remove_group(&zigbee_aps::apsme::ApsmeRemoveGroupRequest {
+                                group_address: group,
+                                endpoint,
+                            });
+                    }
+                    zcl_dispatch::GroupTableAction::RemoveAll { endpoint } => {
+                        let _ = aps.apsme_remove_all_groups(
+                            &zigbee_aps::apsme::ApsmeRemoveAllGroupsRequest { endpoint },
+                        );
+                    }
                 }
             }
-        }
 
-        #[cfg(feature = "finding-binding")]
-        if let Some((addr, ep)) = outcome.fb_identify_target {
-            let _ = self.bdb.fb_identify_responses.push((addr, ep));
-        }
+            #[cfg(feature = "finding-binding")]
+            if let Some((addr, ep)) = outcome.fb_identify_target {
+                let _ = self.bdb.fb_identify_responses.push((addr, ep));
+            }
 
-        outcome.event
+            if event.is_none() {
+                event = outcome.event;
+            }
+        }
+        event
     }
 
     /// Send a raw ZCL frame via APS→NWK→MAC.
