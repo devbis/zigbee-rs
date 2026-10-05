@@ -279,13 +279,24 @@ impl RouteEntry {
     }
 }
 
-/// Pending route discovery
+/// Route discovery table entry (R22 Table 3-68).
+///
+/// One route discovery is identified network-wide by the pair
+/// (`originator`, `request_id`): route request IDs are allocated per
+/// originator, so the ID alone is ambiguous on any router that relays
+/// discoveries for several devices.
 #[derive(Debug, Clone)]
 pub struct RouteDiscovery {
     pub request_id: u8,
+    /// Network address of the device that initiated the route request.
+    pub originator: ShortAddress,
     pub destination: ShortAddress,
+    /// Neighbour that sent the lowest-cost copy of the route request: the
+    /// next hop a Route Reply is forwarded to on its way to the originator.
     pub sender: ShortAddress,
+    /// Lowest accumulated cost from the originator to this device.
     pub forward_cost: u8,
+    /// Lowest cost reported back from the destination to this device.
     pub residual_cost: u8,
     pub timestamp: u32,
     pub active: bool,
@@ -295,6 +306,7 @@ impl RouteDiscovery {
     fn empty() -> Self {
         Self {
             request_id: 0,
+            originator: ShortAddress(0xFFFF),
             destination: ShortAddress(0xFFFF),
             sender: ShortAddress(0xFFFF),
             forward_cost: 0xFF,
@@ -425,7 +437,46 @@ impl RoutingTable {
         }
     }
 
-    /// Find a pending route discovery by request ID.
+    /// Active route discovery table entries.
+    pub fn discoveries(&self) -> impl Iterator<Item = &RouteDiscovery> {
+        self.discoveries.iter().filter(|d| d.active)
+    }
+
+    /// The route discovery identified by (`originator`, `request_id`).
+    pub fn find_discovery_for(
+        &self,
+        originator: ShortAddress,
+        request_id: u8,
+    ) -> Option<&RouteDiscovery> {
+        self.discoveries
+            .iter()
+            .find(|d| d.active && d.originator == originator && d.request_id == request_id)
+    }
+
+    /// Mutable access to the route discovery identified by (`originator`,
+    /// `request_id`).
+    pub fn find_discovery_for_mut(
+        &mut self,
+        originator: ShortAddress,
+        request_id: u8,
+    ) -> Option<&mut RouteDiscovery> {
+        self.discoveries
+            .iter_mut()
+            .find(|d| d.active && d.originator == originator && d.request_id == request_id)
+    }
+
+    /// Complete the route discovery identified by (`originator`,
+    /// `request_id`).
+    pub fn complete_discovery_for(&mut self, originator: ShortAddress, request_id: u8) {
+        if let Some(d) = self.find_discovery_for_mut(originator, request_id) {
+            d.active = false;
+        }
+    }
+
+    /// Find a pending route discovery by request ID alone.
+    ///
+    /// Ambiguous on a router that relays discoveries for several
+    /// originators; prefer [`Self::find_discovery_for`].
     pub fn find_discovery(&self, request_id: u8) -> Option<&RouteDiscovery> {
         self.discoveries
             .iter()
@@ -459,10 +510,26 @@ impl RoutingTable {
         else {
             return;
         };
+        Self::fail_discovery_entry(disc, &mut self.routes);
+    }
+
+    /// Abandon the route discovery identified by (`originator`,
+    /// `request_id`); see [`Self::fail_discovery`].
+    pub fn fail_discovery_for(&mut self, originator: ShortAddress, request_id: u8) {
+        let Some(disc) = self
+            .discoveries
+            .iter_mut()
+            .find(|d| d.active && d.originator == originator && d.request_id == request_id)
+        else {
+            return;
+        };
+        Self::fail_discovery_entry(disc, &mut self.routes);
+    }
+
+    fn fail_discovery_entry(disc: &mut RouteDiscovery, routes: &mut [RouteEntry]) {
         disc.active = false;
         let destination = disc.destination;
-        if let Some(route) = self
-            .routes
+        if let Some(route) = routes
             .iter_mut()
             .find(|r| r.destination == destination && r.status == RouteStatus::DiscoveryUnderway)
         {
@@ -470,7 +537,10 @@ impl RoutingTable {
         }
     }
 
-    /// Complete a route discovery (remove from pending).
+    /// Complete a route discovery by request ID alone.
+    ///
+    /// Ambiguous on a router that relays discoveries for several
+    /// originators; prefer [`Self::complete_discovery_for`].
     pub fn complete_discovery(&mut self, request_id: u8) {
         if let Some(d) = self
             .discoveries
