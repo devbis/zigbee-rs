@@ -406,15 +406,12 @@ impl<M: MacDriver> ZdoLayer<M> {
     pub fn next_seq(&mut self) -> u8 {
         if !self.seq_seeded {
             self.seq_seeded = true;
-            let micros = self.aps.nwk().mac().monotonic_micros().to_le_bytes();
-            self.seq = self
-                .aps
-                .nwk()
-                .nib()
-                .ieee_address
-                .iter()
-                .chain(micros.iter())
-                .fold(self.seq, |acc, byte| acc.rotate_left(3) ^ byte);
+            let micros = self.aps.nwk().mac().monotonic_micros();
+            let ieee = &self.aps.nwk().nib().ieee_address;
+            // Little-endian EUI-64: the low bytes are the device-specific
+            // serial, the high bytes the (shared) OUI.
+            self.seq ^=
+                (micros ^ (micros >> 8) ^ (micros >> 16)) as u8 ^ ieee[0] ^ ieee[1].rotate_left(4);
         }
         let s = self.seq;
         self.seq = self.seq.wrapping_add(1);
