@@ -188,15 +188,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         cluster_id: u16,
         status: ZclStatus,
     ) {
-        if !self.unicast {
-            return;
-        }
-        if header.frame_type() == zigbee_zcl::frame::ZclFrameType::Global
-            && header.command_id.0 == 0x0B
-        {
-            return;
-        }
-        if status == ZclStatus::Success && header.disable_default_response() {
+        if !self.unicast || !header.default_response_required(status) {
             return;
         }
         queue_default_response(
@@ -527,13 +519,7 @@ impl<'a, 'c, const N: usize> LocalZclCtx<'a, 'c, N> {
         // dedicated UNSUP_MANUF_* status — always, since it is an error — and
         // change no state. No event is raised: the frame carries no standard
         // meaning an application could act on.
-        if zcl_frame.header.is_manufacturer_specific() {
-            let status = match zcl_frame.header.frame_type() {
-                zigbee_zcl::frame::ZclFrameType::Global => {
-                    ZclStatus::UnsupManufacturerGeneralCommand
-                }
-                _ => ZclStatus::UnsupManufacturerClusterCommand,
-            };
+        if let Some(status) = zcl_frame.header.manufacturer_specific_unsupported_status() {
             rt_trace!(
                 "[RT] zcl_manuf_unsupported ep={} cluster=0x{:04X} cmd=0x{:02X}",
                 dst_ep,
@@ -3146,6 +3132,18 @@ mod tests {
             resp.payload.as_slice(),
             &[0x00, ZclStatus::UnsupManufacturerClusterCommand as u8]
         );
+    }
+
+    /// A reserved ZCL frame type (0b10/0b11) is not a frame this device can
+    /// interpret: it is dropped without a response and without an event.
+    #[test]
+    fn reserved_frame_type_is_dropped_without_a_response() {
+        let mut fx = Fixture::new(&[ClusterId::IDENTIFY]);
+        for frame_type in [0x02, 0x03] {
+            let outcome = fx.dispatch(&mut [], ClusterId::IDENTIFY.0, &[frame_type, 0x01, 0x00]);
+            assert!(outcome.event.is_none());
+        }
+        assert!(fx.pending.is_empty());
     }
 
     /// The Disable Default Response bit only suppresses a *successful*
