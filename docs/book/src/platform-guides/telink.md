@@ -98,6 +98,13 @@ ParentRouterApp::new(
 `ParentRouterApp` owns steering/resume, bounded receive/tick processing,
 security checkpoints, and child-table restore/save/clear.
 
+The TB-04 board has no fitted user button, so nothing calls
+`request_commissioning()`. After a Leave without rejoin the router stays
+factory-new with the red LED solid and makes no network search; a power cycle
+starts Network Steering again, retrying with the 5..60 s policy backoff. A
+product built on a module with a button should map its short press to
+`request_commissioning()`.
+
 ## Flash ownership
 
 The 512 KiB TB-04 product preserves:

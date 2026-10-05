@@ -9,8 +9,8 @@ builds `DeviceType::EndDevice` with `PowerMode::AlwaysOn`, which advertises
 `macRxOnWhenIdle = true` without claiming router or child-parent behavior.
 
 The frontend exposes finite `initialize()` and `step()` calls. This root uses
-them directly so it can service the three-second reset button between bounded
-always-on End Device steps.
+them directly so it can service Button 1 between bounded always-on End Device
+steps.
 
 ## Product behavior
 
@@ -25,7 +25,15 @@ always-on End Device steps.
 - DK external high-frequency crystal (`ExternalXtal`) and both applicable
   DC-DC regulators enabled.
 - Button 1 held for three seconds performs a journal-aware factory reset and
-  only then resets the MCU. A short press has no protocol action.
+  only then resets the MCU.
+- Button 1 short press (50 ms up to three seconds, acted on at release)
+  requests commissioning. After a Leave without rejoin (coordinator
+  Mgmt_Leave, NWK Leave, Trust Center Remove-Device, or a local Leave) the
+  device stays factory-new with LED1 dark and does not search for a network
+  until this press or a power cycle; a press also skips a running join
+  backoff. While joined or while a reset is pending the press is ignored.
+  Gesture classification is host-tested in
+  `products/nrf52840-router/src/button.rs`.
 
 ## Indicators
 
@@ -58,5 +66,6 @@ remain mandatory. This snapshot is build/layout-tested, not hardware-tested.
 
 Before release, verify on an nRF52840-DK that commissioning/resume survives
 power loss, LED2 follows RX activity, the three-second reset clears membership
-without counter rollback, and the always-on End Device remains reachable
+without counter rollback, a short press after a coordinator Leave starts
+commissioning again, and the always-on End Device remains reachable
 without advertising or admitting children.

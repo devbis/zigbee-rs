@@ -76,6 +76,26 @@ loop {
 `run()` is the infinite convenience wrapper. `StepEvents` returns at most one
 incoming event and one tick event from the bounded cycle.
 
+### Leave and the commissioning button
+
+After a Leave without rejoin (coordinator Mgmt_Leave or NWK Leave, Trust
+Center Remove-Device, a remove-children cascade, or a local Leave) a joining
+frontend commits factory-new state and makes no automatic network search.
+`awaiting_commissioning_request()` reports this state until the composition
+root calls `request_commissioning()`, normally from a button. The request also
+skips a running join backoff and returns `false` (doing nothing) while joined
+or while a factory reset is pending, so a product can route its ordinary
+short-press action to it without breaking the joined behavior. A forming
+coordinator re-forms immediately, `urgent_factory_reset_and_recommission()`
+still steers immediately, and a power cycle of a factory-new node starts
+steering with the policy backoff.
+
+| product | gesture | after Leave without a press |
+|---|---|---|
+| `examples/nrf52840-router` | Button 1 short press requests commissioning; 3 s hold factory-resets | LED1 dark, waits |
+| `examples/telink-tlsr8258-router` | no button fitted on TB-04 | red LED solid, waits until power cycle |
+| `examples/mock-light` | simulated press in the host demo | waits |
+
 ## Relay versus parent
 
 ### nRF52840

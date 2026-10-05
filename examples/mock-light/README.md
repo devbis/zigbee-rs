@@ -7,6 +7,13 @@ The example seeds persisted router security state, initializes the shared
 frontend, applies On/Off and Level Control behavior through the profile, and
 runs two finite `step()` calls.
 
+It then simulates the product button. `request_commissioning()` returns
+`false` while joined, so a joined light or plug keeps its normal button action
+(for example toggling the load). After a local Leave the router stays
+factory-new and makes no network search on its own; the simulated press is
+accepted and the next `step()` makes exactly one Network Steering attempt.
+The demo asserts this sequence and also runs as the crate's unit test.
+
 ```rust,ignore
 let mut app = RelayRouterApp::new(
     node,

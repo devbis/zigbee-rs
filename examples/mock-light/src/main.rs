@@ -1,17 +1,18 @@
 //! Finite host composition of a forwarding dimmable-light router.
 
 use router_app::{
-    NoChildren, NoDiagnostics, NoStatus, NoSupervisor, RelayRouterApp, RouterParts, RouterPolicy,
+    DiagnosticEvent, Diagnostics, NoChildren, NoStatus, NoSupervisor, RelayRouterApp, RouterParts,
+    RouterPolicy,
 };
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::mock::MockMac;
-use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::power::PowerMode;
 use zigbee_runtime::profile::{ApplicationProfile, DeviceProfile, DimmableLight};
 use zigbee_runtime::security_store::{
     PersistentSecurityState, RamSecurityStateStore, SecurityStateStore,
 };
+use zigbee_runtime::{UserAction, ZigbeeDevice};
 use zigbee_types::ShortAddress;
 use zigbee_zcl::DeviceId;
 use zigbee_zcl::clusters::Cluster;
@@ -52,6 +53,20 @@ fn commissioned_router_state() -> PersistentSecurityState {
     state.tclk_counter_limit = 0x400;
     state.validate().expect("valid router security state");
     state
+}
+
+/// Counts commissioning attempts so the demo can show what a button press did.
+#[derive(Default)]
+struct AttemptCounter {
+    attempts: u32,
+}
+
+impl Diagnostics for AttemptCounter {
+    fn record(&mut self, event: DiagnosticEvent) {
+        if matches!(event, DiagnosticEvent::CommissioningAttempt { .. }) {
+            self.attempts += 1;
+        }
+    }
 }
 
 fn print_light_state(label: &str, light: &DimmableLight) {
@@ -95,7 +110,7 @@ fn main() {
             node,
             NoChildren,
             &POLICY,
-            RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+            RouterParts::new(NoStatus, NoSupervisor, AttemptCounter::default()),
         )
         .expect("valid forwarding-light composition");
 
@@ -146,6 +161,56 @@ fn main() {
             );
         }
 
+        // A light or plug has a physical button; here it is simulated. The
+        // gesture maps to `request_commissioning()`, which the app ignores
+        // while joined, so a joined product keeps its normal button action.
+        assert!(
+            !app.request_commissioning(),
+            "a joined light ignores a commissioning request"
+        );
+        println!("  simulated button while joined: ignored by the router app");
+
+        // After a Leave without rejoin (coordinator Mgmt_Leave, Trust Center
+        // Remove-Device, or this local Leave) the router stays factory-new
+        // and does not search for a network on its own.
+        app.node_mut().device_mut().user_action(UserAction::Leave);
+        app.step().await.expect("leave step");
+        assert!(!app.node().device().is_joined());
+        assert!(app.awaiting_commissioning_request());
+        let attempts_before = app.parts().diagnostics.attempts;
+        for _ in 0..3 {
+            app.step().await.expect("idle factory-new step");
+        }
+        assert!(app.awaiting_commissioning_request());
+        assert_eq!(app.parts().diagnostics.attempts, attempts_before);
+        println!("  left network: factory-new, waiting for the button");
+
+        assert!(
+            app.request_commissioning(),
+            "a factory-new light accepts the button request"
+        );
+        assert!(!app.awaiting_commissioning_request());
+        app.step()
+            .await
+            .expect("button-requested commissioning step");
+        assert_eq!(app.parts().diagnostics.attempts, attempts_before + 1);
+        // No coordinator is scripted, so the attempt finds no network and the
+        // app falls back to its bounded retry backoff.
+        println!(
+            "  simulated button: one Network Steering attempt (joined={})",
+            app.node().device().is_joined()
+        );
+
         println!("RelayRouterApp dimmable-light demo complete");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// Run the finite demo, including its post-Leave button assertions, under
+    /// `cargo test --workspace`.
+    #[test]
+    fn finite_demo_waits_for_button_after_leave() {
+        super::main();
+    }
 }

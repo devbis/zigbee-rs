@@ -156,6 +156,12 @@ production default.
 All six frontends provide finite `initialize()` and `step()` operations plus
 the infinite `run()` convenience wrapper.
 
+After a Leave without rejoin, joining frontends stay factory-new and wait for
+`request_commissioning()` (normally a button press; ignored while joined)
+instead of searching again. The nRF52840 image maps it to a Button 1 short
+press. The TB-04 router has no fitted button and recovers by power cycle. See
+[the router guide](docs/book/src/advanced/coordinator-router.md#leave-and-the-commissioning-button).
+
 ## Feature boundaries
 
 - `sleepy-end-device` is the truthful End Device polling/power feature name.
