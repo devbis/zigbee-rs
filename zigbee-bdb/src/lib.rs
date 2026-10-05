@@ -395,10 +395,60 @@ impl<M: MacDriver> BdbLayer<M> {
             self.fb_current_ieee = None;
         }
         #[cfg(feature = "centralized-tclk")]
-        {
-            self.tclk_exchange = None;
-        }
+        self.discard_tclk_exchange();
         self.state = BdbState::Idle;
+    }
+
+    /// Provision this node's install code (joiner side).
+    ///
+    /// `code` is the full installation code including its trailing
+    /// little-endian CRC-16 (8, 10, 14 or 18 bytes). The derived AES-MMO key
+    /// becomes the preconfigured Trust Center link key used to decrypt the
+    /// initial Transport-Key; after a successful join
+    /// `bdbNodeJoinLinkKeyType` reports
+    /// `InstallCodeDerivedPreconfiguredLinkKey` and the node still performs
+    /// the unique-TCLK Request-Key/Verify-Key exchange (BDB v3.0.1 §10.2.5).
+    ///
+    /// The Trust Center must hold the same install code for this node.
+    /// Requires the `install-code` feature (AES-MMO derivation); images that
+    /// provision the derived key directly can use
+    /// [`Self::set_preconfigured_tc_link_key`] instead.
+    #[cfg(feature = "install-code")]
+    pub fn set_install_code(&mut self, code: &[u8]) -> Result<(), zigbee_crypto::InstallCodeError> {
+        let key = zigbee_crypto::derive_install_code_key(code)?;
+        self.set_preconfigured_tc_link_key(key);
+        Ok(())
+    }
+
+    /// Set the preconfigured Trust Center link key used for the next join
+    /// (an install-code-derived key or a product-specific key).
+    #[cfg(feature = "centralized-tclk")]
+    pub fn set_preconfigured_tc_link_key(&mut self, key: zigbee_aps::security::AesKey) {
+        self.zdo
+            .aps_mut()
+            .security_mut()
+            .set_default_tc_link_key(key);
+    }
+
+    /// Restore the well-known ZigBeeAlliance09 preconfigured link key.
+    #[cfg(feature = "centralized-tclk")]
+    pub fn clear_install_code(&mut self) {
+        self.set_preconfigured_tc_link_key(zigbee_aps::security::DEFAULT_TC_LINK_KEY);
+    }
+
+    /// Drop any armed unique-TCLK exchange, releasing the ZDO request-response
+    /// slot it may still own (Node_Desc_req) so the bounded pending table
+    /// cannot leak across steering attempts or resets.
+    #[cfg(feature = "centralized-tclk")]
+    pub(crate) fn discard_tclk_exchange(&mut self) {
+        if let Some(slot) = self
+            .tclk_exchange
+            .as_mut()
+            .and_then(|exchange| exchange.node_desc_slot.take())
+        {
+            self.zdo.cancel_pending(slot);
+        }
+        self.tclk_exchange = None;
     }
 
     /// Whether an event-driven unique Trust Center link-key exchange is still
@@ -432,7 +482,10 @@ impl<M: MacDriver> BdbLayer<M> {
     ) {
         let now = self.zdo.aps().nwk().mac().monotonic_micros();
         self.attributes.node_is_on_a_network = true;
-        let mut exchange = TclkExchange::new(tc_addr, tc_ieee, now);
+        let join_key = *self.zdo.aps().security().default_tc_link_key();
+        let mut exchange = TclkExchange::new(tc_addr, tc_ieee, now)
+            .with_join_link_key(join_key)
+            .with_attempts_max(self.attributes.tc_link_key_exchange_attempts_max);
         exchange.baseline_handshake_counters(&self.zdo.aps().security_handshake_stats());
         self.tclk_exchange = Some(exchange);
     }

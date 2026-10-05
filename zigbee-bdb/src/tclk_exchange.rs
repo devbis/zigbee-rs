@@ -204,6 +204,13 @@ pub struct TclkExchange {
     pub(crate) confirm_success_baseline: u32,
     pub(crate) confirm_reject_baseline: u32,
     pub(crate) verify_key_was_sent: bool,
+    /// Per-message transmission budget (`bdbTCLinkKeyExchangeAttemptsMax`,
+    /// clamped to `1..=TCLK_MESSAGE_ATTEMPTS`).
+    pub(crate) attempts_max: u8,
+    /// Initial link key the node joined with (global or install-code
+    /// derived). Only a Trust Center link key *different* from this one is a
+    /// replacement obtained by the exchange (BDB v3.0.1 §10.2.5).
+    pub(crate) join_link_key: zigbee_aps::security::AesKey,
 }
 
 impl TclkExchange {
@@ -224,7 +231,36 @@ impl TclkExchange {
             confirm_success_baseline: 0,
             confirm_reject_baseline: 0,
             verify_key_was_sent: false,
+            attempts_max: TCLK_MESSAGE_ATTEMPTS,
+            join_link_key: zigbee_aps::security::DEFAULT_TC_LINK_KEY,
         }
+    }
+
+    /// Record the initial link key the node joined with.
+    pub(crate) fn with_join_link_key(mut self, key: zigbee_aps::security::AesKey) -> Self {
+        self.join_link_key = key;
+        self
+    }
+
+    /// Apply `bdbTCLinkKeyExchangeAttemptsMax` to every message budget.
+    ///
+    /// The value is clamped to `1..=TCLK_MESSAGE_ATTEMPTS` so the strict
+    /// overall deadline, which is sized for the maximum budget, always leaves
+    /// every permitted attempt its full BDB response window.
+    pub(crate) fn with_attempts_max(mut self, attempts_max: u8) -> Self {
+        let attempts_max = attempts_max.clamp(1, TCLK_MESSAGE_ATTEMPTS);
+        self.attempts_max = attempts_max;
+        self.node_desc_budget = attempts_max;
+        self.request_key_budget = attempts_max;
+        self.verify_key_budget = attempts_max;
+        self
+    }
+
+    /// Key-establishment attempts made so far (`bdbTCLinkKeyExchangeAttempts`,
+    /// BDB v3.0.1 §10.2.5): the APS Request-Key transmissions for a new
+    /// Trust Center link key.
+    pub(crate) fn current_attempts(&self) -> u8 {
+        self.attempts_max.saturating_sub(self.request_key_budget)
     }
 
     /// Capture the APS security-handshake counters this exchange is measured
@@ -309,7 +345,7 @@ impl TclkExchange {
     /// message type begins, so a fresh Request-Key gets a fresh Verify-Key
     /// budget for the replacement key.
     pub(crate) fn reset_verify_key_budget(&mut self) {
-        self.verify_key_budget = TCLK_MESSAGE_ATTEMPTS;
+        self.verify_key_budget = self.attempts_max;
         self.verify_key_was_sent = false;
     }
 
@@ -421,6 +457,43 @@ mod tests {
         ex.reset_verify_key_budget();
         assert_eq!(ex.verify_key_budget, TCLK_MESSAGE_ATTEMPTS);
         assert_eq!(ex.request_key_budget, TCLK_MESSAGE_ATTEMPTS - 1);
+    }
+
+    #[test]
+    fn configured_attempts_max_bounds_every_message_budget() {
+        let ex = armed(0).with_attempts_max(1);
+        assert_eq!(
+            (
+                ex.node_desc_budget,
+                ex.request_key_budget,
+                ex.verify_key_budget
+            ),
+            (1, 1, 1)
+        );
+        // Zero would make the exchange impossible; larger values would not fit
+        // the strict overall deadline.
+        assert_eq!(armed(0).with_attempts_max(0).attempts_max, 1);
+        assert_eq!(
+            armed(0).with_attempts_max(u8::MAX).attempts_max,
+            TCLK_MESSAGE_ATTEMPTS
+        );
+
+        let mut ex = armed(0).with_attempts_max(2);
+        assert_eq!(ex.current_attempts(), 0);
+        // Node_Desc probing is not a key-establishment attempt.
+        assert!(ex.take_node_desc_attempt());
+        assert_eq!(ex.current_attempts(), 0);
+        assert!(ex.take_request_key_attempt());
+        assert_eq!(ex.current_attempts(), 1);
+        assert!(ex.take_request_key_attempt());
+        assert!(!ex.take_request_key_attempt());
+        assert_eq!(ex.current_attempts(), 2);
+        ex.enter(TclkStage::SendVerifyKey, 0);
+        assert!(ex.take_verify_key_attempt());
+        assert!(ex.take_verify_key_attempt());
+        assert!(!ex.take_verify_key_attempt());
+        ex.reset_verify_key_budget();
+        assert_eq!(ex.verify_key_budget, 2);
     }
 
     #[test]

@@ -169,12 +169,24 @@ pub struct BdbAttributes {
     pub commissioning_status: BdbCommissioningStatus,
 
     /// EUI-64 of the most recent device that joined through this node.
+    ///
+    /// Trust Center bookkeeping: maintained by the Trust Center runtime that
+    /// owns the APS key table, not by joiner steering.
     pub joining_node_eui64: IeeeAddress,
 
     /// New Trust Center link key for the most recent joining device.
+    ///
+    /// Trust Center bookkeeping, like [`Self::joining_node_eui64`].
     pub joining_node_new_tc_link_key: [u8; 16],
 
-    /// Whether the Trust Center admits only nodes provisioned with install codes.
+    /// `bdbJoinUsesInstallCodeKey` — Trust Center policy (BDB v3.0.1
+    /// Table 5): whether the Trust Center admits only nodes provisioned with
+    /// install codes. When `true`, [`crate::TrustCenterPolicy::from_attributes`]
+    /// forces [`TrustCenterInstallCodePolicy::Required`].
+    ///
+    /// This is *not* a joiner setting: a joiner reports the key it actually
+    /// used in [`Self::node_join_link_key_type`]. To join with an install
+    /// code, provision it with `BdbLayer::set_install_code`.
     pub join_uses_install_code_key: bool,
 
     /// Whether the Trust Center accepts previously unknown devices.
@@ -223,13 +235,25 @@ pub struct BdbAttributes {
     /// Secondary channel set — scanned if primary yields no results.
     pub secondary_channel_set: ChannelMask,
 
-    /// Attempts made in the current Trust Center link-key exchange stage.
+    /// Key-establishment attempts made in the current Trust Center link-key
+    /// exchange (APS Request-Key transmissions, BDB v3.0.1 §10.2.5).
+    ///
+    /// Updated by the unique-TCLK exchange on every step; reset when an
+    /// exchange is armed.
     pub tc_link_key_exchange_attempts: u8,
 
     /// Maximum attempts for each Trust Center link-key exchange stage.
+    ///
+    /// Applied when an exchange is armed and clamped to `1..=3` so the strict
+    /// overall exchange deadline always fits every permitted attempt.
     pub tc_link_key_exchange_attempts_max: u8,
 
     /// Trust Center link-key exchange mechanism selected by the application.
+    ///
+    /// Only [`TcLinkKeyExchangeMethod::ApsRequestKey`] is implemented;
+    /// steering refuses to start (status `TcLinkKeyExchangeFailure`) when
+    /// Certificate-Based Key Establishment is selected rather than silently
+    /// using the APS Request-Key method.
     pub tc_link_key_exchange_method: TcLinkKeyExchangeMethod,
 
     /// Timeout (seconds) for a joining node to complete TC link key exchange.

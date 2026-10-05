@@ -29,7 +29,6 @@ use zigbee_zdo::discovery::NodeDescRsp;
 
 #[cfg(feature = "centralized-tclk")]
 use crate::TrustCenterLinkKeyState;
-#[cfg(any(feature = "distributed-security", feature = "router", test))]
 use crate::attributes::BDB_MIN_COMMISSIONING_TIME;
 #[cfg(feature = "centralized-tclk")]
 use crate::tclk_exchange::{TclkExchange, TclkProgress, TclkStage};
@@ -321,7 +320,7 @@ mod tests {
     };
 
     /// A unique Trust Center link key — deliberately different from the global
-    /// ZigBeeAlliance09 default so `has_unique_tc_link_key` recognises it.
+    /// ZigBeeAlliance09 default so `has_replacement_tc_link_key` recognises it.
     const TEST_UNIQUE_TCLK: [u8; 16] = [0x5C; 16];
 
     fn step(bdb: &mut BdbLayer<MockMac>) -> TclkProgress {
@@ -1835,6 +1834,221 @@ mod tests {
         assert_eq!(stored.outgoing_frame_counter, 0x400);
         assert_eq!(stored.outgoing_frame_counter_limit, 0x800);
     }
+
+    /// 18-byte install code (16 data bytes + CRC-16/X-25) and its key.
+    #[cfg(feature = "install-code")]
+    const INSTALL_CODE: [u8; 18] = [
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0xD4, 0x90,
+    ];
+    const INSTALL_CODE_KEY: [u8; 16] = [
+        0xFA, 0x80, 0x81, 0xCA, 0xAA, 0x41, 0xD5, 0xAD, 0xE9, 0xB5, 0x65, 0x87, 0x99, 0x26, 0x8B,
+        0x88,
+    ];
+
+    fn steer(bdb: &mut BdbLayer<MockMac>) -> Result<(), BdbStatus> {
+        let mut announce = ScriptedAnnce::failing(0);
+        let mut persistence = TestPersistence::default();
+        block_on(bdb.network_steering_with_announce_for_test(&mut persistence, &mut announce))
+    }
+
+    fn install_tc_key_pair(bdb: &mut BdbLayer<MockMac>, key: [u8; 16]) {
+        assert!(
+            bdb.zdo_mut()
+                .aps_mut()
+                .security_mut()
+                .add_key(ApsLinkKeyEntry {
+                    partner_address: TEST_TC_IEEE,
+                    key,
+                    key_type: ApsKeyType::TrustCenterLinkKey,
+                    outgoing_frame_counter: 0,
+                    outgoing_frame_counter_limit: 0x100,
+                    incoming_frame_counter: 0,
+                    incoming_frame_counter_valid: false,
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn global_key_join_reports_the_key_actually_used_not_tc_policy() {
+        let mut bdb = steerable_bdb();
+        // bdbJoinUsesInstallCodeKey is Trust Center policy; it must not make
+        // a joiner claim an install-code key it did not use.
+        bdb.attributes_mut().join_uses_install_code_key = true;
+
+        assert_eq!(steer(&mut bdb), Ok(()));
+        assert_eq!(
+            bdb.attributes().node_join_link_key_type,
+            crate::attributes::NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey
+        );
+    }
+
+    #[test]
+    fn install_code_join_requests_and_verifies_a_unique_key() {
+        let mut bdb = steerable_bdb();
+        #[cfg(feature = "install-code")]
+        {
+            assert_eq!(
+                bdb.set_install_code(&INSTALL_CODE[..17]),
+                Err(zigbee_crypto::InstallCodeError::InvalidLength)
+            );
+            assert_eq!(bdb.set_install_code(&INSTALL_CODE), Ok(()));
+        }
+        #[cfg(not(feature = "install-code"))]
+        bdb.set_preconfigured_tc_link_key(INSTALL_CODE_KEY);
+        assert_eq!(
+            *bdb.zdo().aps().security().default_tc_link_key(),
+            INSTALL_CODE_KEY
+        );
+
+        assert_eq!(steer(&mut bdb), Ok(()));
+        assert_eq!(
+            bdb.attributes().node_join_link_key_type,
+            crate::attributes::NodeJoinLinkKeyType::InstallCodeDerivedPreconfiguredLinkKey
+        );
+        assert_eq!(
+            bdb.tclk_exchange.as_ref().unwrap().join_link_key,
+            INSTALL_CODE_KEY
+        );
+
+        // Even with the install-code key recorded as the TC key-pair entry,
+        // the initial key is not a replacement: BDB v3.0.1 §10.2.5 requires
+        // Node_Desc → Request-Key → Verify-Key, because a Trust Center does
+        // not accept Verify-Key for the initial key.
+        install_tc_key_pair(&mut bdb, INSTALL_CODE_KEY);
+        bdb.zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .clear_tx_history();
+        arrive_at_send_node_desc(&mut bdb);
+        assert_eq!(step(&mut bdb), TclkProgress::InProgress);
+        assert_eq!(stage(&bdb), TclkStage::AwaitNodeDesc);
+        assert_eq!(bdb.steering_diagnostics().node_desc_requests, 1);
+
+        // A Trust Center-issued replacement is then verified.
+        install_tc_key_pair(&mut bdb, TEST_UNIQUE_TCLK);
+        set_stage(&mut bdb, TclkStage::AwaitTclk);
+        assert_eq!(step(&mut bdb), TclkProgress::InProgress);
+        assert_eq!(stage(&bdb), TclkStage::SendVerifyKey);
+
+        bdb.clear_install_code();
+        assert_eq!(
+            *bdb.zdo().aps().security().default_tc_link_key(),
+            zigbee_aps::security::DEFAULT_TC_LINK_KEY
+        );
+    }
+
+    #[test]
+    fn preprovisioned_tc_key_pair_is_install_code_derived_and_restored_on_retry() {
+        let mut bdb = steerable_bdb();
+        install_tc_key_pair(&mut bdb, INSTALL_CODE_KEY);
+
+        assert_eq!(steer(&mut bdb), Ok(()));
+        assert_eq!(
+            bdb.attributes().node_join_link_key_type,
+            crate::attributes::NodeJoinLinkKeyType::InstallCodeDerivedPreconfiguredLinkKey
+        );
+        // The pre-provisioned key is the *initial* key, not a replacement:
+        // the exchange must probe and request instead of verifying it.
+        arrive_at_send_node_desc(&mut bdb);
+        assert_eq!(step(&mut bdb), TclkProgress::InProgress);
+        assert_eq!(stage(&bdb), TclkStage::AwaitNodeDesc);
+
+        let exchange = bdb.tclk_exchange.take().unwrap();
+        assert_eq!(exchange.join_link_key, INSTALL_CODE_KEY);
+
+        // An unconfirmed replacement is rolled back to the join key, not
+        // deleted, so the Trust Center's next Transport-Key stays readable.
+        install_tc_key_pair(&mut bdb, TEST_UNIQUE_TCLK);
+        bdb.clear_unconfirmed_tc_link_key(&exchange);
+        assert_eq!(
+            bdb.zdo()
+                .aps()
+                .security()
+                .find_key(&TEST_TC_IEEE, ApsKeyType::TrustCenterLinkKey)
+                .map(|entry| entry.key),
+            Some(INSTALL_CODE_KEY)
+        );
+    }
+
+    #[test]
+    fn unusable_join_security_resets_the_association() {
+        let mut bdb = steerable_bdb();
+        // No Trust Center identity was recorded by the key exchange.
+        bdb.zdo_mut().aps_mut().aib_mut().aps_trust_center_address = [0; 8];
+
+        assert_eq!(steer(&mut bdb), Err(BdbStatus::SteeringFailure));
+        assert!(!bdb.zdo().nwk().is_joined());
+        assert!(!bdb.is_on_network());
+        assert!(!bdb.tclk_exchange_active());
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::NoNetwork
+        );
+    }
+
+    #[test]
+    fn cbke_exchange_method_is_rejected_before_joining() {
+        let mut bdb = steerable_bdb();
+        bdb.attributes_mut().tc_link_key_exchange_method =
+            crate::attributes::TcLinkKeyExchangeMethod::CertificateBasedKeyExchange;
+
+        assert_eq!(
+            steer(&mut bdb),
+            Err(BdbStatus::TrustCenterLinkKeyExchangeFailure)
+        );
+        assert!(!bdb.zdo().nwk().is_joined());
+        assert_eq!(bdb.steering_diagnostics().join_attempts, 0);
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::TcLinkKeyExchangeFailure
+        );
+    }
+
+    #[test]
+    fn configured_attempts_max_bounds_the_exchange_and_is_reported() {
+        let mut bdb = steerable_bdb();
+        bdb.attributes_mut().tc_link_key_exchange_attempts_max = 1;
+        assert_eq!(steer(&mut bdb), Ok(()));
+        assert_eq!(budgets(&bdb), (1, 1, 1));
+
+        arrive_at_send_node_desc(&mut bdb);
+        assert_eq!(step(&mut bdb), TclkProgress::InProgress);
+        assert_eq!(stage(&bdb), TclkStage::AwaitNodeDesc);
+        assert_eq!(bdb.attributes().tc_link_key_exchange_attempts, 0);
+
+        set_stage(&mut bdb, TclkStage::SendRequestKey);
+        assert_eq!(step(&mut bdb), TclkProgress::InProgress);
+        assert_eq!(stage(&bdb), TclkStage::AwaitTclk);
+        assert_eq!(bdb.attributes().tc_link_key_exchange_attempts, 1);
+    }
+
+    #[test]
+    fn discarding_an_armed_exchange_releases_its_zdo_slot() {
+        let mut bdb = steered_bdb();
+        arrive_at_send_node_desc(&mut bdb);
+        assert_eq!(step(&mut bdb), TclkProgress::InProgress);
+        assert_eq!(stage(&bdb), TclkStage::AwaitNodeDesc);
+        assert_eq!(bdb.zdo().pending_count(), 1);
+
+        bdb.reset_attributes();
+        assert!(!bdb.tclk_exchange_active());
+        assert_eq!(bdb.zdo().pending_count(), 0);
+    }
+
+    #[test]
+    fn restarting_steering_releases_the_previous_exchange_slot() {
+        let mut bdb = steered_bdb();
+        arrive_at_send_node_desc(&mut bdb);
+        assert_eq!(step(&mut bdb), TclkProgress::InProgress);
+        assert_eq!(bdb.zdo().pending_count(), 1);
+
+        // On-network steering replaces the exchange; its slot must not leak.
+        let _ = block_on(bdb.network_steering());
+        assert_eq!(bdb.zdo().pending_count(), 0);
+    }
 }
 
 impl<M: MacDriver> BdbLayer<M> {
@@ -1882,9 +2096,7 @@ impl<M: MacDriver> BdbLayer<M> {
     ) -> Result<(), BdbStatus> {
         self.steering_diagnostics = SteeringDiagnostics::default();
         #[cfg(feature = "centralized-tclk")]
-        {
-            self.tclk_exchange = None;
-        }
+        self.discard_tclk_exchange();
         if !self.attributes.node_is_on_a_network {
             self.attributes.node_join_link_key_type =
                 crate::attributes::NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey;
@@ -1936,6 +2148,8 @@ impl<M: MacDriver> BdbLayer<M> {
             return TclkProgress::Complete;
         };
         let progress = self.step_tclk_exchange(&mut exchange, persistence).await;
+        // bdbTCLinkKeyExchangeAttempts: transmissions of the current message.
+        self.attributes.tc_link_key_exchange_attempts = exchange.current_attempts();
         match progress {
             TclkProgress::InProgress => {
                 self.tclk_exchange = Some(exchange);
@@ -1954,6 +2168,11 @@ impl<M: MacDriver> BdbLayer<M> {
                         );
                     }
                 }
+                // An end device has no local association flag; its only
+                // steering duty is the network-wide broadcast, which is best
+                // effort so a lost frame cannot undo a completed join.
+                #[cfg(not(any(feature = "router", test)))]
+                let _ = self.activate_permit_joining_after_steering().await;
             }
             TclkProgress::Failed(_) => {}
         }
@@ -1966,6 +2185,17 @@ impl<M: MacDriver> BdbLayer<M> {
         mut persistence: Option<&mut (dyn SecurityPersistence + '_)>,
         announce: &mut T,
     ) -> Result<(), BdbStatus> {
+        // Only the APS Request-Key exchange is implemented. Refuse to join
+        // rather than claim CBKE and silently run a different procedure.
+        #[cfg(feature = "centralized-tclk")]
+        if self.attributes.tc_link_key_exchange_method
+            == crate::attributes::TcLinkKeyExchangeMethod::CertificateBasedKeyExchange
+        {
+            log::warn!("[BDB:Steering] CBKE TC link-key exchange is not supported");
+            self.attributes.commissioning_status =
+                crate::attributes::BdbCommissioningStatus::TcLinkKeyExchangeFailure;
+            return Err(BdbStatus::TrustCenterLinkKeyExchangeFailure);
+        }
         self.steering_diagnostics.attempt_started_us =
             self.zdo.aps().nwk().mac().monotonic_micros();
         self.steering_diagnostics.stage = SteeringStage::Scanning;
@@ -2152,12 +2382,6 @@ impl<M: MacDriver> BdbLayer<M> {
 
                     let ieee = self.zdo.nwk().nib().ieee_address;
 
-                    // Step 5: Start router if we are a router
-                    #[cfg(any(feature = "router", test))]
-                    if self.zdo.nwk().device_type() == DeviceType::Router {
-                        let _ = self.zdo.nlme_start_router().await;
-                    }
-
                     // Step 5b: TC link key exchange
                     // After joining, the coordinator sends Transport-Key (with NWK key)
                     // encrypted with the well-known TC link key (ZigBeeAlliance09).
@@ -2191,7 +2415,11 @@ impl<M: MacDriver> BdbLayer<M> {
                     self.steering_diagnostics.transport_key_received = true;
                     self.steering_diagnostics.transport_key_received_us =
                         self.zdo.aps().nwk().mac().monotonic_micros();
-                    self.capture_join_link_key_type()?;
+                    #[cfg_attr(not(feature = "centralized-tclk"), allow(unused_variables))]
+                    let join_link_key = match self.capture_join_link_key_type() {
+                        Ok(key) => key,
+                        Err(status) => return Err(self.abort_unauthorised_join(status)),
+                    };
 
                     if let Some(persistence) = persistence.as_deref_mut() {
                         if let Err(error) = self.reserve_network_security(persistence) {
@@ -2205,6 +2433,15 @@ impl<M: MacDriver> BdbLayer<M> {
                         }
                         self.steering_diagnostics.security_reserved_us =
                             self.zdo.aps().nwk().mac().monotonic_micros();
+                    }
+
+                    // Step 5b': a router starts routing (beacons, relaying,
+                    // admitting children) only once it is authorised, i.e.
+                    // after the network key was delivered and reserved —
+                    // never while it is still an unauthenticated joiner.
+                    #[cfg(any(feature = "router", test))]
+                    if self.zdo.nwk().device_type() == DeviceType::Router {
+                        let _ = self.zdo.nlme_start_router().await;
                     }
 
                     // Step 5c: Send Device_annce now that we have the NWK key
@@ -2309,7 +2546,12 @@ impl<M: MacDriver> BdbLayer<M> {
                     #[cfg(feature = "centralized-tclk")]
                     {
                         let mut exchange =
-                            TclkExchange::new(ShortAddress::COORDINATOR, tc_ieee, now);
+                            TclkExchange::new(ShortAddress::COORDINATOR, tc_ieee, now)
+                                .with_join_link_key(join_link_key)
+                                .with_attempts_max(
+                                    self.attributes.tc_link_key_exchange_attempts_max,
+                                );
+                        self.attributes.tc_link_key_exchange_attempts = 0;
                         exchange.baseline_handshake_counters(
                             &self.zdo.aps().security_handshake_stats(),
                         );
@@ -2544,52 +2786,84 @@ impl<M: MacDriver> BdbLayer<M> {
         Ok(())
     }
 
-    fn capture_join_link_key_type(&mut self) -> Result<(), BdbStatus> {
+    /// Record `bdbNodeJoinLinkKeyType` from the key that *actually* protected
+    /// the initial Transport-Key (BDB v3.0.1 Table 6) and return that key.
+    ///
+    /// `bdbJoinUsesInstallCodeKey` is Trust Center admission policy (BDB
+    /// Table 5) and is deliberately not consulted here: a joiner claims an
+    /// install-code-derived key only when the key that authenticated its
+    /// Transport-Key is not the well-known ZigBeeAlliance09 key — i.e. a
+    /// preconfigured key installed via [`BdbLayer::set_install_code`] /
+    /// [`BdbLayer::set_preconfigured_tc_link_key`] or a pre-provisioned
+    /// Trust Center key-pair entry.
+    ///
+    /// The returned key is the initial (join) link key. The unique-TCLK
+    /// exchange uses it to tell a Trust Center-issued replacement apart from
+    /// the key the node joined with.
+    fn capture_join_link_key_type(&mut self) -> Result<zigbee_aps::security::AesKey, BdbStatus> {
         use crate::attributes::NodeJoinLinkKeyType;
         use zigbee_aps::NetworkKeyJoinMethod;
+        use zigbee_aps::security::DEFAULT_TC_LINK_KEY;
 
         let method = self.zdo.aps_mut().take_network_key_join_method();
-        self.attributes.node_join_link_key_type = match method {
-            Some(NetworkKeyJoinMethod::DistributedSecurityGlobal) => {
-                #[cfg(any(feature = "distributed-security", test))]
-                {
-                    NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey
-                }
-                #[cfg(not(any(feature = "distributed-security", test)))]
-                {
-                    return Err(BdbStatus::NotPermitted);
-                }
-            }
-            Some(NetworkKeyJoinMethod::CentralizedKeyPair) => {
-                NodeJoinLinkKeyType::InstallCodeDerivedPreconfiguredLinkKey
-            }
-            Some(NetworkKeyJoinMethod::CentralizedPreconfiguredGlobal) => {
-                if self.attributes.join_uses_install_code_key {
-                    NodeJoinLinkKeyType::InstallCodeDerivedPreconfiguredLinkKey
-                } else {
-                    NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey
-                }
-            }
-            None if self.zdo.aps().aib().aps_trust_center_address == [0xFF; 8] => {
-                #[cfg(any(feature = "distributed-security", test))]
-                {
-                    NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey
-                }
-                #[cfg(not(any(feature = "distributed-security", test)))]
-                {
-                    return Err(BdbStatus::NotPermitted);
-                }
-            }
-            None if self.zdo.aps().aib().aps_trust_center_address != [0; 8] => {
-                if self.attributes.join_uses_install_code_key {
-                    NodeJoinLinkKeyType::InstallCodeDerivedPreconfiguredLinkKey
-                } else {
-                    NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey
-                }
-            }
-            None => return Err(BdbStatus::SteeringFailure),
+        let tc_ieee = self.zdo.aps().aib().aps_trust_center_address;
+        let preconfigured = *self.zdo.aps().security().default_tc_link_key();
+        let distributed = match method {
+            Some(NetworkKeyJoinMethod::DistributedSecurityGlobal) => true,
+            None if tc_ieee == [0xFF; 8] => true,
+            None if tc_ieee == [0; 8] => return Err(BdbStatus::SteeringFailure),
+            _ => false,
         };
-        Ok(())
+        let (key_type, join_key) = if distributed {
+            #[cfg(not(any(feature = "distributed-security", test)))]
+            return Err(BdbStatus::NotPermitted);
+            #[cfg(any(feature = "distributed-security", test))]
+            (
+                NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey,
+                preconfigured,
+            )
+        } else {
+            // A key-pair join (or an unreported method with a known Trust
+            // Center) used the TC entry when one exists; a preconfigured
+            // global join used the preconfigured key.
+            let key = if method == Some(NetworkKeyJoinMethod::CentralizedPreconfiguredGlobal) {
+                preconfigured
+            } else {
+                self.zdo
+                    .aps()
+                    .security()
+                    .find_key(&tc_ieee, ApsKeyType::TrustCenterLinkKey)
+                    .map_or(preconfigured, |entry| entry.key)
+            };
+            let key_type = if key == DEFAULT_TC_LINK_KEY {
+                NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey
+            } else {
+                NodeJoinLinkKeyType::InstallCodeDerivedPreconfiguredLinkKey
+            };
+            (key_type, key)
+        };
+        self.attributes.node_join_link_key_type = key_type;
+        Ok(join_key)
+    }
+
+    /// Undo an association whose initial network key cannot be accepted
+    /// (unsupported security model or no Trust Center identity).
+    ///
+    /// The NWK layer already holds the parent relationship and the delivered
+    /// key, so it must be reset — returning early would leave the stack
+    /// joined while BDB reports failure.
+    fn abort_unauthorised_join(&mut self, status: BdbStatus) -> BdbStatus {
+        self.steering_diagnostics.stage = SteeringStage::JoinFailed;
+        let _ = self.zdo.nlme_reset(false);
+        self.attributes.node_is_on_a_network = false;
+        self.attributes.node_join_link_key_type =
+            crate::attributes::NodeJoinLinkKeyType::DefaultGlobalTrustCenterLinkKey;
+        self.attributes.commissioning_status = if status == BdbStatus::NotPermitted {
+            crate::attributes::BdbCommissioningStatus::NotPermitted
+        } else {
+            crate::attributes::BdbCommissioningStatus::NoNetwork
+        };
+        status
     }
 
     #[cfg(feature = "centralized-tclk")]
@@ -2652,18 +2926,28 @@ impl<M: MacDriver> BdbLayer<M> {
 
     // ── Event-driven unique TCLK exchange ───────────────────
 
-    /// Whether a *unique* (non-default) Trust Center link key is installed.
+    /// Whether the Trust Center has installed a *replacement* link key.
     ///
-    /// The global ZigBeeAlliance09 key is never a valid unique TCLK, so an
-    /// entry holding it does not count as an established unique key.
+    /// Neither the global ZigBeeAlliance09 key, the configured preconfigured
+    /// (e.g. install-code-derived) key, nor the key the node joined with is a
+    /// unique TCLK obtained by the exchange: BDB v3.0.1 §10.2.5 requires the
+    /// joiner to request and verify a new key on every centralized join, so a
+    /// node that joined with an install-code key must still go through
+    /// Node_Desc → Request-Key → Verify-Key instead of "verifying" the initial
+    /// key (which a Trust Center rejects).
     #[cfg(feature = "centralized-tclk")]
-    fn has_unique_tc_link_key(&self, tc_ieee: &zigbee_types::IeeeAddress) -> bool {
-        let default_key = *self.zdo.aps().security().default_tc_link_key();
+    fn has_replacement_tc_link_key(&self, ex: &TclkExchange) -> bool {
+        use zigbee_aps::security::DEFAULT_TC_LINK_KEY;
+        let preconfigured = *self.zdo.aps().security().default_tc_link_key();
         self.zdo
             .aps()
             .security()
-            .find_key(tc_ieee, ApsKeyType::TrustCenterLinkKey)
-            .is_some_and(|entry| entry.key != default_key)
+            .find_key(&ex.tc_ieee, ApsKeyType::TrustCenterLinkKey)
+            .is_some_and(|entry| {
+                entry.key != DEFAULT_TC_LINK_KEY
+                    && entry.key != preconfigured
+                    && entry.key != ex.join_link_key
+            })
     }
 
     /// Drop a unique TCLK that was installed but never confirmed.
@@ -2673,14 +2957,25 @@ impl<M: MacDriver> BdbLayer<M> {
     /// space, and the Trust Center will transport a fresh one. A confirmed key
     /// is never removed here, so the reserved outgoing-counter window and the
     /// persisted commissioned state stay intact for every other path.
+    ///
+    /// When the node joined with a pre-provisioned key-pair entry (rather
+    /// than the preconfigured key), the entry is restored to that join key so
+    /// the Trust Center's next Transport-Key, which it still protects with
+    /// the initial key, remains decryptable.
     #[cfg(feature = "centralized-tclk")]
-    fn clear_unconfirmed_tc_link_key(&mut self, tc_ieee: &zigbee_types::IeeeAddress) {
-        if self.has_unique_tc_link_key(tc_ieee) {
-            log::warn!("[BDB:Steering] Dropping unconfirmed unique TC link key before retry");
-            self.zdo
-                .aps_mut()
-                .security_mut()
-                .remove_key(tc_ieee, ApsKeyType::TrustCenterLinkKey);
+    fn clear_unconfirmed_tc_link_key(&mut self, ex: &TclkExchange) {
+        if !self.has_replacement_tc_link_key(ex) {
+            return;
+        }
+        log::warn!("[BDB:Steering] Dropping unconfirmed unique TC link key before retry");
+        let preconfigured = *self.zdo.aps().security().default_tc_link_key();
+        let security = self.zdo.aps_mut().security_mut();
+        if ex.join_link_key != preconfigured
+            && let Some(entry) = security.find_key_mut(&ex.tc_ieee, ApsKeyType::TrustCenterLinkKey)
+        {
+            entry.key = ex.join_link_key;
+        } else {
+            security.remove_key(&ex.tc_ieee, ApsKeyType::TrustCenterLinkKey);
         }
     }
 
@@ -2724,7 +3019,7 @@ impl<M: MacDriver> BdbLayer<M> {
                 // already pushed a unique key (some coordinators transport it
                 // unsolicited right after the join), reserve it and prove
                 // possession instead of throwing it away and re-probing.
-                if self.has_unique_tc_link_key(&ex.tc_ieee) {
+                if self.has_replacement_tc_link_key(ex) {
                     log::info!(
                         "[BDB:Steering] Unique TC link key already installed — verifying it"
                     );
@@ -2859,7 +3154,7 @@ impl<M: MacDriver> BdbLayer<M> {
 
             TclkStage::AwaitTclk => {
                 self.steering_diagnostics.stage = SteeringStage::WaitingForTrustCenterLinkKey;
-                if self.has_unique_tc_link_key(&ex.tc_ieee) {
+                if self.has_replacement_tc_link_key(ex) {
                     self.steering_diagnostics.tclk_installations = self
                         .steering_diagnostics
                         .tclk_installations
@@ -2928,7 +3223,7 @@ impl<M: MacDriver> BdbLayer<M> {
                             "[BDB:Steering] Verify-Key budget exhausted — requesting a \
                              replacement unique key"
                         );
-                        self.clear_unconfirmed_tc_link_key(&ex.tc_ieee);
+                        self.clear_unconfirmed_tc_link_key(ex);
                         ex.reset_verify_key_budget();
                         ex.enter(TclkStage::SendRequestKey, now);
                         return TclkProgress::InProgress;
@@ -3264,17 +3559,9 @@ impl<M: MacDriver> BdbLayer<M> {
 
     /// Steering when the device IS already on a network.
     ///
-    /// Opens the network for joining and broadcasts Mgmt_Permit_Joining_req
-    /// so that routers in the network also open their permit joining.
-    #[cfg(not(any(feature = "router", test)))]
-    async fn steer_on_network(&mut self) -> Result<(), BdbStatus> {
-        log::warn!("[BDB:Steering] End Device cannot open permit joining");
-        self.attributes.commissioning_status =
-            crate::attributes::BdbCommissioningStatus::NotPermitted;
-        Err(BdbStatus::NotPermitted)
-    }
-
-    #[cfg(any(feature = "router", test))]
+    /// BDB v3.0.1 §8.2: every node type — end devices included — broadcasts
+    /// Mgmt_Permit_Joining_req to all routers and the coordinator; only a
+    /// router or coordinator additionally opens its own association flag.
     async fn steer_on_network(&mut self) -> Result<(), BdbStatus> {
         log::info!("[BDB:Steering] Already on network — opening permit joining");
 
@@ -3296,7 +3583,6 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Complete BDB steering by extending the network-wide permit-joining
     /// window, then opening the local association flag when this node can
     /// admit children (BDB v3.0.1 §§8.1 step 3–4 and 8.2 steps 14–15).
-    #[cfg(any(feature = "distributed-security", feature = "router", test))]
     async fn activate_permit_joining_after_steering(&mut self) -> Result<(), BdbStatus> {
         let duration = core::cmp::min(BDB_MIN_COMMISSIONING_TIME, 254) as u8;
 
