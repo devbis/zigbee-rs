@@ -170,6 +170,16 @@ pub struct RejoinDiagnostics {
     pub other_tx_failures: u8,
 }
 
+/// NLME-NWK-STATUS.indication (R22 §3.2.2.30): a network-layer status
+/// reported to the next higher layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NlmeNwkStatusIndication {
+    /// Status code from R22 Table 3-51 (the Network Status command codes).
+    pub status: u8,
+    /// The network address the status refers to.
+    pub network_addr: ShortAddress,
+}
+
 /// The NWK layer — owns all NWK state and the MAC driver.
 ///
 /// Generic over:
@@ -371,6 +381,9 @@ pub struct NwkLayer<M: MacDriver> {
     /// A Network Update the network manager owes the network after accepting a
     /// PAN identifier conflict report, broadcast on the next async pass.
     pending_pan_id_broadcast: Option<frames::PanIdUpdate>,
+    /// NLME-NWK-STATUS.indication waiting for the next higher layer.
+    #[cfg(feature = "router")]
+    pending_nwk_status: Option<NlmeNwkStatusIndication>,
     /// Enable side-effect-first replay ordering for durable lifecycle frames.
     lifecycle_persistence_enabled: bool,
     /// Verified replay floor held until the owning journal is durable.
@@ -450,6 +463,8 @@ impl<M: MacDriver> NwkLayer<M> {
             pending_conflicts: heapless::Vec::new(),
             pending_pan_id_update: None,
             pending_pan_id_broadcast: None,
+            #[cfg(feature = "router")]
+            pending_nwk_status: None,
             lifecycle_persistence_enabled: false,
             pending_lifecycle_replay: None,
             pending_lifecycle_btr: None,
@@ -512,6 +527,8 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).pending_conflicts).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).pending_pan_id_update).write(None);
             core::ptr::addr_of_mut!((*slot).pending_pan_id_broadcast).write(None);
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).pending_nwk_status).write(None);
             core::ptr::addr_of_mut!((*slot).lifecycle_persistence_enabled).write(false);
             core::ptr::addr_of_mut!((*slot).pending_lifecycle_replay).write(None);
             core::ptr::addr_of_mut!((*slot).pending_lifecycle_btr).write(None);
@@ -580,6 +597,18 @@ impl<M: MacDriver> NwkLayer<M> {
     /// [`process_incoming_nwk_frame`]: Self::process_incoming_nwk_frame
     pub fn take_command_outcome(&mut self) -> Option<nlde::NwkCommandOutcome> {
         self.pending_command_outcome.take()
+    }
+
+    /// Collect the pending NLME-NWK-STATUS.indication, if any.
+    ///
+    /// Currently raised with status
+    /// [`frames::NetworkStatusCommand::NETWORK_ADDRESS_UPDATE`] when
+    /// [`Self::assign_new_local_address`] resolved a conflict on this
+    /// router's own address (R22 §3.6.1.9.3); the next higher layer answers
+    /// it by announcing the new address with a `Device_annce`.
+    #[cfg(feature = "router")]
+    pub fn take_nwk_status_indication(&mut self) -> Option<NlmeNwkStatusIndication> {
+        self.pending_nwk_status.take()
     }
 
     /// Get the device type.
