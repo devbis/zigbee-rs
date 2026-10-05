@@ -24,7 +24,7 @@ pub mod platform;
 
 pub use battery::{BatteryPolicy, NrfBattery};
 pub use diagnostics::{NrfDiagnostics, persistence_failure};
-pub use environment::OnChipTemperature;
+pub use environment::{HUMIDITY_UNKNOWN, OnChipTemperature};
 pub use platform::{
     NrfPolarityStatus, NrfStatus, NrfSupervisor, NrfTimerWakeController, NrfWakeController,
     SensorMac,
