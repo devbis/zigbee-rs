@@ -76,6 +76,16 @@ fn resolve_writable_slot(
     Ok(idx)
 }
 
+/// Capacity-independent push: `register` delegates here so it is compiled
+/// once instead of once per `AttributeStore<N>`.
+#[inline(never)]
+fn push_attr(
+    attrs: &mut heapless::vec::VecView<AttributeValue>,
+    entry: AttributeValue,
+) -> Result<(), ZclStatus> {
+    attrs.push(entry).map_err(|_| ZclStatus::InsufficientSpace)
+}
+
 /// Fixed-capacity store of attribute values using `heapless::Vec`.
 ///
 /// The const generic `N` determines the maximum number of attributes.
@@ -104,12 +114,13 @@ impl<const N: usize> AttributeStore<N> {
         def: AttributeDefinition,
         initial: ZclValue,
     ) -> Result<(), ZclStatus> {
-        self.attrs
-            .push(AttributeValue {
+        push_attr(
+            self.attrs.as_mut_view(),
+            AttributeValue {
                 definition: def,
                 value: initial,
-            })
-            .map_err(|_| ZclStatus::InsufficientSpace)
+            },
+        )
     }
 
     /// Look up the current value by attribute ID.

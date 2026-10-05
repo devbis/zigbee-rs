@@ -1,7 +1,7 @@
 //! Write Attributes command (0x02) and Write Attributes Response (0x03).
 
 use crate::attribute::AttributeStore;
-use crate::data_types::{ZclDataType, ZclValue, data_type_size, is_data_type_enabled};
+use crate::data_types::{ZclDataType, ZclValue, data_type_size};
 use crate::{AttributeId, ZclStatus};
 
 /// Maximum number of attributes in a single write request / response.
@@ -55,8 +55,10 @@ pub struct WriteAttributeParseFailure {
 #[derive(Debug, Clone)]
 pub struct WriteAttributesParseOutcome {
     pub request: WriteAttributesRequest,
-    /// Disabled-data-type failures, each carrying its original request ordinal
-    /// so the response can be reassembled in wire order.
+    /// Per-record failures found while parsing (disabled/unsupported data
+    /// type → INVALID_DATA_TYPE, string over capacity → INVALID_VALUE), each
+    /// carrying its original request ordinal so the response can be
+    /// reassembled in wire order.
     pub invalid_data_types: heapless::Vec<WriteAttributeParseFailure, MAX_WRITE_ATTRS>,
 }
 
@@ -78,18 +80,20 @@ impl WriteAttributesParseOutcome {
         applied: &WriteAttributesResponse,
     ) -> WriteAttributesResponse {
         let mut records = heapless::Vec::new();
-        let total = self.request.records.len() + self.invalid_data_types.len();
-        let mut fi = 0;
-        let mut ai = 0;
-        for ordinal in 0..total {
-            if fi < self.invalid_data_types.len()
-                && self.invalid_data_types[fi].ordinal as usize == ordinal
-            {
-                let _ = records.push(self.invalid_data_types[fi].record);
-                fi += 1;
-            } else if ai < applied.records.len() {
-                let _ = records.push(applied.records[ai]);
-                ai += 1;
+        let mut fails = self.invalid_data_types.iter().peekable();
+        let mut applied = applied.records.iter().copied();
+        loop {
+            // Records are emitted in request order, so the next ordinal is
+            // the number of records emitted so far.
+            let next = match fails.peek() {
+                Some(f) if f.ordinal as usize == records.len() => None,
+                _ => applied.next(),
+            };
+            let Some(rec) = next.or_else(|| fails.next().map(|f| f.record)) else {
+                break;
+            };
+            if records.push(rec).is_err() {
+                break;
             }
         }
         WriteAttributesResponse { records }
@@ -141,31 +145,44 @@ impl WriteAttributesRequest {
             i += 2;
             let dt = ZclDataType::from_u8(data[i]).ok_or(WriteAttributesParseError::Malformed)?;
             i += 1;
-            if !is_data_type_enabled(dt) {
-                let value_size = data_type_size(dt).ok_or(WriteAttributesParseError::Malformed)?;
-                if i + value_size > data.len() {
-                    return Err(WriteAttributesParseError::Malformed);
-                }
-                i += value_size;
-                invalid_data_types
-                    .push(WriteAttributeParseFailure {
-                        ordinal: (record_count - 1) as u8,
-                        record: WriteAttributeStatusRecord {
-                            status: ZclStatus::InvalidDataType,
-                            id,
-                        },
+            if let Some((value, consumed)) = ZclValue::deserialize(dt, &data[i..]) {
+                i += consumed;
+                records
+                    .push(WriteAttributeRecord {
+                        id,
+                        data_type: dt,
+                        value,
                     })
                     .map_err(|_| WriteAttributesParseError::Malformed)?;
                 continue;
             }
-            let (value, consumed) = ZclValue::deserialize(dt, &data[i..])
-                .ok_or(WriteAttributesParseError::Malformed)?;
-            i += consumed;
-            records
-                .push(WriteAttributeRecord {
-                    id,
-                    data_type: dt,
-                    value,
+            // The value cannot be stored (disabled type, or a string longer
+            // than the inline capacity): if it is still well-delimited, skip
+            // it and fail only this record.
+            let (skip, status) = if matches!(dt, ZclDataType::OctetString | ZclDataType::CharString)
+            {
+                // 0xFF denotes an invalid string with no payload.
+                let n = *data.get(i).ok_or(WriteAttributesParseError::Malformed)?;
+                (
+                    1 + if n == 0xFF { 0 } else { n as usize },
+                    ZclStatus::InvalidValue,
+                )
+            } else {
+                // Fixed-size value of a disabled type. Long (16-bit) strings
+                // have no fixed size and remain malformed.
+                (
+                    data_type_size(dt).ok_or(WriteAttributesParseError::Malformed)?,
+                    ZclStatus::InvalidDataType,
+                )
+            };
+            if i + skip > data.len() {
+                return Err(WriteAttributesParseError::Malformed);
+            }
+            i += skip;
+            invalid_data_types
+                .push(WriteAttributeParseFailure {
+                    ordinal: (record_count - 1) as u8,
+                    record: WriteAttributeStatusRecord { status, id },
                 })
                 .map_err(|_| WriteAttributesParseError::Malformed)?;
         }
@@ -176,24 +193,19 @@ impl WriteAttributesRequest {
     }
 
     /// Serialize to ZCL payload bytes. Returns bytes written.
+    ///
+    /// Only complete records are written. Never panics.
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         let mut pos = 0;
         for rec in &self.records {
-            // Need at least 2 (id) + 1 (type) = 3 bytes
-            if pos + 3 > buf.len() {
+            let rest = &mut buf[pos..];
+            let Some(hdr) = rest.get_mut(..3) else { break };
+            hdr[..2].copy_from_slice(&rec.id.0.to_le_bytes());
+            hdr[2] = rec.data_type as u8;
+            let Some(n) = rec.value.try_serialize(&mut rest[3..]) else {
                 break;
-            }
-            let b = rec.id.0.to_le_bytes();
-            buf[pos] = b[0];
-            buf[pos + 1] = b[1];
-            pos += 2;
-            buf[pos] = rec.data_type as u8;
-            pos += 1;
-            let remaining = &mut buf[pos..];
-            if remaining.is_empty() {
-                break;
-            }
-            pos += rec.value.serialize(remaining);
+            };
+            pos += 3 + n;
         }
         pos
     }
@@ -806,6 +818,7 @@ mod tests {
 #[cfg(test)]
 mod bounds_tests {
     use super::{MAX_WRITE_ATTRS, WriteAttributesRequest};
+    use crate::AttributeId;
     use crate::data_types::ZclDataType;
 
     #[test]
@@ -839,5 +852,64 @@ mod bounds_tests {
         payload.push(ZclDataType::U8 as u8).unwrap();
         payload.push(0).unwrap();
         assert!(WriteAttributesRequest::parse_checked(&payload).is_err());
+    }
+
+    #[test]
+    fn oversized_or_unstorable_values_fail_only_their_own_record() {
+        use crate::ZclStatus;
+        let mut p: heapless::Vec<u8, 128> = heapless::Vec::new();
+        // #0: CharString of 40 bytes (> inline capacity) → INVALID_VALUE
+        p.extend_from_slice(&[0x05, 0x00, ZclDataType::CharString as u8, 40])
+            .unwrap();
+        p.extend_from_slice(&[b'a'; 40]).unwrap();
+        // #1: valid U8
+        p.extend_from_slice(&[0x06, 0x00, ZclDataType::U8 as u8, 7])
+            .unwrap();
+        // #2: another valid U8
+        p.extend_from_slice(&[0x07, 0x00, ZclDataType::U8 as u8, 9])
+            .unwrap();
+        // #3: invalid (0xFF length) CharString → INVALID_VALUE
+        p.extend_from_slice(&[0x08, 0x00, ZclDataType::CharString as u8, 0xFF])
+            .unwrap();
+        let out = WriteAttributesRequest::parse_checked(&p).unwrap();
+        assert_eq!(out.request.records.len(), 2);
+        assert_eq!(out.request.records[0].id, AttributeId(6));
+        assert_eq!(out.request.records[1].id, AttributeId(7));
+        let fails: heapless::Vec<(u8, u16, ZclStatus), 4> = out
+            .invalid_data_types
+            .iter()
+            .map(|f| (f.ordinal, f.record.id.0, f.record.status))
+            .collect();
+        assert_eq!(
+            &fails[..],
+            &[
+                (0, 5, ZclStatus::InvalidValue),
+                (3, 8, ZclStatus::InvalidValue),
+            ]
+        );
+        // A string length running past the payload is still malformed.
+        assert!(WriteAttributesRequest::parse_checked(&[0x05, 0x00, 0x42, 40, b'a']).is_err());
+    }
+
+    #[test]
+    fn request_serializer_writes_complete_records_only() {
+        use super::WriteAttributeRecord;
+        use crate::data_types::ZclValue;
+        let s = ZclValue::CharString(heapless::Vec::from_slice(&[b'w'; 32]).unwrap());
+        let mut records = heapless::Vec::new();
+        for id in 0..2u16 {
+            records
+                .push(WriteAttributeRecord {
+                    id: AttributeId(id),
+                    data_type: ZclDataType::CharString,
+                    value: s.clone(),
+                })
+                .unwrap();
+        }
+        let req = WriteAttributesRequest { records };
+        for cap in 0..80 {
+            let mut buf = [0u8; 80];
+            assert_eq!(req.serialize(&mut buf[..cap]), (cap / 36).min(2) * 36);
+        }
     }
 }
