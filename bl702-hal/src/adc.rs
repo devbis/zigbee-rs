@@ -1,8 +1,21 @@
 //! BL702 GPADC single-ended external input and VBAT/2 measurement.
 //!
 //! The nominal millivolt conversion follows the SDK's 12-bit, 3.2 V reference
-//! formula. Per-die gain trim is not applied, so hardware calibration is still
-//! required before treating the converted value as precision metrology.
+//! formula.
+//!
+//! Calibration matches the BL702 SDK (`bl702_adc.c`, bl_mcu_sdk v1.4.5):
+//!
+//! * The per-die gain coefficient from eFuse (`ADC_Gain_Trim()`) is applied to
+//!   every sample when its enable and parity bits are valid;
+//!   [`Gpadc::gain_trim_valid`] reports whether it was. Without it the result
+//!   uses the nominal gain.
+//! * The hardware offset calibration (`GPADC_CAL_OS_EN` /
+//!   `GPADC_OS_CAL_DATA`) is disabled and zeroed, which is the SDK default.
+//!   The BL702 eFuse holds no GPADC offset trim (only gain and TSEN trims),
+//!   so there is no factory value to re-apply; offset error remains.
+//!
+//! Board-level calibration against a reference is still required before
+//! treating the converted value as precision metrology.
 
 use core::hint::spin_loop;
 
@@ -126,6 +139,7 @@ impl Gpadc {
             NEGATIVE_GROUND | MIC2_DIFFERENTIAL,
             NEGATIVE_GROUND | MIC2_DIFFERENTIAL,
         );
+        // SDK default: no offset calibration. There is no eFuse offset trim.
         rmw(OFFSET_CALIBRATION, 0xffff, 0);
 
         // FIFO threshold one, DMA disabled, clear stale samples.
