@@ -33,9 +33,19 @@ pub enum SleepError {
 /// Approximate RC32K frequency (varies ±10% per chip/temperature).
 pub const RC32K_HZ: u32 = 32_768;
 
-/// Convert milliseconds to RC32K ticks.
+/// Largest delay the 24-bit AON RTC compare channel can represent.
+pub const RTC_MAX_TICKS: u32 = 0x00FF_FFFF;
+
+/// Convert milliseconds to RC32K ticks, saturating at [`RTC_MAX_TICKS`]
+/// (about 512 s). The multiplication is done in 64 bits so delays above
+/// 131 071 ms cannot wrap into a short wake-up.
 pub const fn ms_to_rtc_ticks(ms: u32) -> u32 {
-    (ms * RC32K_HZ) / 1000
+    let ticks = (ms as u64 * RC32K_HZ as u64) / 1000;
+    if ticks > RTC_MAX_TICKS as u64 {
+        RTC_MAX_TICKS
+    } else {
+        ticks as u32
+    }
 }
 
 /// Read the current AON RTC counter value (24-bit, wraps at 0xFFFFFF).
@@ -45,8 +55,14 @@ pub fn rtc_count() -> u32 {
 
 /// Configure the RTC compare channel 0 to fire after `ticks` RC32K cycles.
 ///
-/// This sets up the wake source for system sleep.
+/// This sets up the wake source for system sleep. `ticks` is clamped to
+/// [`RTC_MAX_TICKS`] because the counter and comparator are 24 bits wide.
 pub fn config_rtc_wakeup(ticks: u32) {
+    let ticks = if ticks > RTC_MAX_TICKS {
+        RTC_MAX_TICKS
+    } else {
+        ticks
+    };
     // Read current counter (must sample twice for stability)
     let mut cnt = reg_read(AON_RTCCNT);
     while cnt == reg_read(AON_RTCCNT) {} // wait for counter edge

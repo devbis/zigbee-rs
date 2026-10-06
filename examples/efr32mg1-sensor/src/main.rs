@@ -121,7 +121,11 @@ async fn main(_spawner: Spawner) {
     device.bdb_mut().attributes_mut().primary_channel_set = BDB_POPULAR_CHANNEL_SET;
     device.bdb_mut().attributes_mut().secondary_channel_set = BDB_POPULAR_CHANNEL_FALLBACK_SET;
 
-    let security = SECURITY.init(efr32mg1_tradfri_product::storage::security_store());
+    let (security_partition, _application_nv) =
+        efr32mg1_tradfri_product::storage::split_flash(chip.flash);
+    let security = SECURITY.init(efr32mg1_tradfri_product::storage::security_store(
+        security_partition,
+    ));
     match device.reset_security_state_if_identity_changed(security, ieee) {
         Ok(true) => {
             rtt_target::rprintln!("[EFR32][sensor] CLEARED_STALE_IDENTITY");

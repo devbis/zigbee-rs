@@ -105,7 +105,7 @@ emit_bin() {
 #   5. the diagnostic record's fixed address and reserved size
 #   6. `.ram_code` fitting under the absolute `.text` base (0x8000)
 #   7. image-size warnings against a legacy 256 KiB lab comparison threshold
-#      and hard failures at the 0x74000 security journal
+#      and hard failures at the 0x70000 APS-table journal (production NV start)
 verify_layout() {
     require_file "$ELF_PATH" "ELF image"
     require_file "$LLVM_NM" "llvm-nm"
@@ -243,13 +243,14 @@ verify_layout() {
         exit 1
     fi
 
-    # 7: image-size warnings. Fail hard at the security journal; retain the
+    # 7: image-size warnings. Fail hard at the production NV journals (APS at
+    # 0x70000, child table at 0x72000, security at 0x74000); retain the
     # legacy 256 KiB lab threshold only as a comparison warning.
     if [[ -f "$BIN_PATH" ]]; then
         local bin_size
         bin_size=$(wc -c < "$BIN_PATH" | tr -d ' ')
-        if (( bin_size > 0x74000 )); then
-            fail_check ".bin size=${bin_size} (0x$(printf %X "$bin_size")) reaches security journal at 0x74000"
+        if (( bin_size > 0x70000 )); then
+            fail_check ".bin size=${bin_size} (0x$(printf %X "$bin_size")) reaches APS-table journal at 0x70000"
             echo "layout-check: one or more invariants FAILED (see above)" >&2
             exit 1
         fi

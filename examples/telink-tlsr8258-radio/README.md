@@ -39,7 +39,7 @@ while larger images missed every ACK.
 All waits are bounded (fixed tick timeouts, never an infinite spin on radio
 status); interrupts stay globally disabled the entire time (the firmware is
 fully polled; nothing is logged from an ISR, because there is no ISR body
-beyond a `bx lr` stub — see [Design notes](#design-notes)).
+beyond a `bx lr` stub — see [Design notes](#design-notes--limitations)).
 
 ## Module map
 
@@ -213,11 +213,13 @@ not redundant):
    `!= 512`, fails if `< 64`).
 6. `.ram_code` fits under the absolute `.text` base (`<= 0x8000`).
 7. Image size: this diagnostic's local script still emits a legacy warning
-   above `0x40000`, then **fails** at its linked security journal
-   (`0x74000`). The warning is not the current production gate: the R22
+   above `0x40000`, then **fails** at the production TB-04 application
+   boundary (`0x70000`), where the APS (`0x70000`), child-table (`0x72000`)
+   and security (`0x74000`) journals begin. `memory.x` links against the same
+   boundary, so flashing this harness cannot overwrite a commissioned
+   device's journals. The warning is not a production gate: the R22
    sensor/router products report image bytes without enforcing artificial
-   regression budgets and retain the physical application boundary at
-   `0x70000`.
+   regression budgets.
 
 ## Design notes / limitations
 

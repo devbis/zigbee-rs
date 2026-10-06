@@ -46,11 +46,29 @@ impl NorFlashError for FlashError {
     }
 }
 
-pub struct Efr32mg1Flash;
+/// Whole-chip MSC flash handle.
+///
+/// This handle can erase and program every page of the 256 KiB array,
+/// including the Gecko Bootloader (`0x0..0x4000`), the running application
+/// and any preserved NVM3/token region. Safe code obtains the single instance
+/// from [`crate::peripherals::Peripherals::take`]; products should then hand
+/// persistence code only bounded partition views.
+pub struct Efr32mg1Flash {
+    _private: (),
+}
 
 impl Efr32mg1Flash {
-    pub const fn new() -> Self {
-        Self
+    /// Create an additional whole-chip flash handle.
+    ///
+    /// # Safety
+    ///
+    /// The caller must already own the internal flash (normally by consuming
+    /// the [`crate::peripherals::Peripherals`] `flash` field), must only use
+    /// this handle on ranges that no other live handle uses, and must never
+    /// erase or program the bootloader, the executing image or preserved
+    /// NVM3/token/factory data through it.
+    pub const unsafe fn new() -> Self {
+        Self { _private: () }
     }
 
     fn validate_range(offset: u32, length: usize) -> Result<(), FlashError> {
@@ -59,12 +77,6 @@ impl Efr32mg1Flash {
             .filter(|end| *end <= FLASH_CAPACITY)
             .map(|_| ())
             .ok_or(FlashError::OutOfBounds)
-    }
-}
-
-impl Default for Efr32mg1Flash {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -123,9 +135,59 @@ impl NorFlash for Efr32mg1Flash {
     }
 }
 
+/// Mask interrupts (PRIMASK) for one MSC operation and return the previous
+/// PRIMASK. Forced inline so the SRAM-resident callers never branch to flash.
+#[inline(always)]
+fn msc_critical_enter() -> u32 {
+    #[cfg(target_arch = "arm")]
+    {
+        let primask: u32;
+        unsafe {
+            core::arch::asm!(
+                "mrs {primask}, PRIMASK",
+                "cpsid i",
+                primask = out(reg) primask,
+                options(nostack, preserves_flags),
+            )
+        };
+        primask
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        0
+    }
+}
+
+#[inline(always)]
+fn msc_critical_exit(primask: u32) {
+    #[cfg(target_arch = "arm")]
+    unsafe {
+        core::arch::asm!(
+            "msr PRIMASK, {primask}",
+            primask = in(reg) primask,
+            options(nostack, preserves_flags),
+        )
+    };
+    #[cfg(not(target_arch = "arm"))]
+    let _ = primask;
+}
+
+// Each MSC unlock/WREN/command/relock sequence runs with interrupts masked
+// so an interrupt handler cannot observe or disturb a half-configured MSC
+// (unlocked, WREN set, ADDRB loaded). Interrupt handlers execute from flash,
+// which the MSC stalls during an erase/write anyway, so masking does not
+// lengthen worst-case interrupt latency beyond the existing flash stall.
 #[inline(never)]
 #[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_code"))]
 fn erase_page_ram(offset: u32) -> Result<(), FlashError> {
+    let primask = msc_critical_enter();
+    let result = erase_page_ram_masked(offset);
+    msc_critical_exit(primask);
+    result
+}
+
+#[inline(always)]
+fn erase_page_ram_masked(offset: u32) -> Result<(), FlashError> {
     unsafe {
         let was_locked = core::ptr::read_volatile(MSC_LOCK as *const u32) != 0;
         core::ptr::write_volatile(MSC_LOCK as *mut u32, MSC_LOCK_LOCKKEY_UNLOCK);
@@ -159,6 +221,14 @@ fn erase_page_ram(offset: u32) -> Result<(), FlashError> {
 #[inline(never)]
 #[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_code"))]
 fn program_word_ram(offset: u32, word: u32) -> Result<(), FlashError> {
+    let primask = msc_critical_enter();
+    let result = program_word_ram_masked(offset, word);
+    msc_critical_exit(primask);
+    result
+}
+
+#[inline(always)]
+fn program_word_ram_masked(offset: u32, word: u32) -> Result<(), FlashError> {
     unsafe {
         let was_locked = core::ptr::read_volatile(MSC_LOCK as *const u32) != 0;
         core::ptr::write_volatile(MSC_LOCK as *mut u32, MSC_LOCK_LOCKKEY_UNLOCK);

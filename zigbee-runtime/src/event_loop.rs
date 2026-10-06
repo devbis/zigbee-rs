@@ -39,8 +39,6 @@ use zigbee_mac::MacDriver;
 use zigbee_types::ShortAddress;
 #[cfg(any(feature = "finding-binding", feature = "finding-binding-target"))]
 use zigbee_zcl::clusters::Cluster;
-use zigbee_zcl::frame::ZclFrame;
-use zigbee_zcl::{ClusterDirection, CommandId};
 
 use crate::UserAction;
 
@@ -310,6 +308,23 @@ impl<R: crate::role::ParentRole> ActionStartup<R> for DistributedActionStartup {
     }
 }
 
+/// Largest Report Attributes ZCL frame: one unfragmented APS payload.
+const REPORT_FRAME_CAP: usize = zigbee_aps::apsde::APS_MAX_PAYLOAD;
+/// Global frame, server→client, disable default response (ZCL r8 §2.4.1.1).
+const REPORT_FRAME_CONTROL: u8 = 0x18;
+/// Report Attributes (ZCL r8 §2.5.11).
+const REPORT_ATTRIBUTES_COMMAND: u8 = 0x0A;
+
+/// Result of sending a set of collected attribute reports.
+pub(crate) struct ReportSendOutcome {
+    /// Report Attributes frames accepted by APS.
+    pub(crate) frames_sent: usize,
+    /// A record too large for any single frame was dropped.
+    pub(crate) skipped_oversize: bool,
+    /// First record not handed to APS and the error that stopped sending.
+    pub(crate) failure: Option<(usize, SendError)>,
+}
+
 /// Errors returned while sending application ZCL traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendError {
@@ -530,7 +545,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
                 .await;
         }
         aps.age_dup_table();
-        aps.fragment_rx_mut().age_entries();
+        // `age_ack_table` above also drives an in-flight fragmented
+        // transaction; collect its final confirm once it finished.
+        #[cfg(feature = "router")]
+        self.collect_fragmented_send_confirm();
     }
 
     /// Drive periodic NWK maintenance for this device's role.
@@ -818,75 +836,102 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
 
     /// Send a ZCL Report Attributes command for the given endpoint and cluster.
     ///
-    /// Serializes the report into a ZCL frame and sends via APS→NWK→MAC.
+    /// Records are packed whole into as many Report Attributes frames as
+    /// needed, each no larger than one unfragmented APS payload, and sent via
+    /// APS→NWK→MAC. Returns [`SendError::PayloadTooLong`] when a single record
+    /// can never fit a frame (it is skipped; the others are still sent), or the
+    /// first send error (later records are then not sent).
     pub async fn send_report(
         &mut self,
         endpoint: u8,
         cluster_id: u16,
         report: &zigbee_zcl::foundation::reporting::ReportAttributes,
     ) -> Result<(), SendError> {
+        let outcome = self
+            .send_report_records(endpoint, cluster_id, &report.reports)
+            .await;
+        match outcome.failure {
+            Some((_, error)) => Err(error),
+            None if outcome.skipped_oversize => Err(SendError::PayloadTooLong),
+            None => Ok(()),
+        }
+    }
+
+    /// Send `records` as one or more whole-record Report Attributes frames.
+    ///
+    /// Sending stops at the first failure; [`ReportSendOutcome::failure`]
+    /// then identifies the first record that was not handed to APS so the
+    /// caller can keep it pending.
+    pub(crate) async fn send_report_records(
+        &mut self,
+        endpoint: u8,
+        cluster_id: u16,
+        records: &[zigbee_zcl::foundation::reporting::AttributeReport],
+    ) -> ReportSendOutcome {
+        let mut outcome = ReportSendOutcome {
+            frames_sent: 0,
+            skipped_oversize: false,
+            failure: None,
+        };
         if !self.is_joined() {
-            return Err(SendError::NotJoined);
+            outcome.failure = Some((0, SendError::NotJoined));
+            return outcome;
         }
 
-        // Build ZCL Report Attributes frame (command 0x0A, server→client)
-        let seq = self.next_zcl_seq();
-        let mut zcl_frame = ZclFrame::new_global(
-            seq,
-            CommandId(0x0A), // Report Attributes
-            ClusterDirection::ServerToClient,
-            true, // disable default response
-        );
-
-        // Serialize report payload into ZCL frame
-        let mut payload_buf = [0u8; 128];
-        let payload_len = report.serialize(&mut payload_buf);
-        for &b in &payload_buf[..payload_len] {
-            zcl_frame
-                .payload
-                .push(b)
-                .map_err(|_| SendError::PayloadTooLong)?;
-        }
-
-        // Serialize ZCL frame
-        let mut zcl_buf = [0u8; 128];
-        let zcl_len = match zcl_frame.serialize(&mut zcl_buf) {
-            Ok(len) => len,
-            Err(_) => return Err(SendError::Serialization),
-        };
-
-        // Send via APS to the coordinator (0x0000)
-        let req = ApsdeDataRequest {
-            dst_addr_mode: ApsAddressMode::Short,
-            dst_address: ApsAddress::Short(ShortAddress::COORDINATOR),
-            dst_endpoint: endpoint,
-            profile_id: 0x0104, // Home Automation
-            cluster_id,
-            src_endpoint: endpoint,
-            payload: &zcl_buf[..zcl_len],
-            tx_options: ApsTxOptions {
-                use_nwk_key: true,
-                ..ApsTxOptions::default()
-            },
-            radius: 0,
-            alias_src_addr: None,
-            alias_seq: None,
-        };
-
-        match self.bdb.zdo_mut().aps_mut().apsde_data_request(&req).await {
-            Ok(_) => {
-                log::debug!(
-                    "[Runtime] Report sent: ep={} cluster=0x{:04X}",
+        // One buffer holds the whole ZCL frame: 3-byte global header followed
+        // by whole records. Its size is the largest unfragmented APS payload.
+        let mut zcl_buf = [0u8; REPORT_FRAME_CAP];
+        let mut next = 0usize;
+        while next < records.len() {
+            let chunk_start = next;
+            let (payload_len, after) =
+                crate::zcl_wire::pack_report_records(records, next, &mut zcl_buf[3..]);
+            next = after;
+            if payload_len == 0 {
+                log::warn!(
+                    "[Runtime] Report record too large for one frame: ep={} cluster=0x{:04X}",
                     endpoint,
                     cluster_id
                 );
-                Ok(())
+                outcome.skipped_oversize = true;
+                continue;
             }
-            Err(e) => {
+
+            // Frame control: global, server→client, disable default response.
+            zcl_buf[0] = REPORT_FRAME_CONTROL;
+            zcl_buf[1] = self.next_zcl_seq();
+            zcl_buf[2] = REPORT_ATTRIBUTES_COMMAND;
+
+            let req = ApsdeDataRequest {
+                dst_addr_mode: ApsAddressMode::Short,
+                dst_address: ApsAddress::Short(ShortAddress::COORDINATOR),
+                dst_endpoint: endpoint,
+                profile_id: 0x0104, // Home Automation
+                cluster_id,
+                src_endpoint: endpoint,
+                payload: &zcl_buf[..3 + payload_len],
+                tx_options: ApsTxOptions {
+                    use_nwk_key: true,
+                    ..ApsTxOptions::default()
+                },
+                radius: 0,
+                alias_src_addr: None,
+                alias_seq: None,
+            };
+
+            if let Err(e) = self.bdb.zdo_mut().aps_mut().apsde_data_request(&req).await {
                 log::warn!("[Runtime] Report send failed: {:?}", e);
-                Err(SendError::Aps(e))
+                outcome.failure = Some((chunk_start, SendError::Aps(e)));
+                return outcome;
             }
+            outcome.frames_sent += 1;
+            log::debug!(
+                "[Runtime] Report sent: ep={} cluster=0x{:04X}",
+                endpoint,
+                cluster_id
+            );
         }
+        outcome
     }
 }
 

@@ -58,6 +58,20 @@ pub mod window_covering;
 use crate::attribute::AttributeStore;
 use crate::{ClusterId, CommandId, ZclStatus};
 
+/// A cluster's part in behaviour that spans more than one cluster or needs
+/// context only the endpoint dispatcher has, reachable through a
+/// `dyn Cluster`.
+pub enum ClusterRole<'a> {
+    /// Nothing beyond its own commands and attributes.
+    None,
+    /// The endpoint's scene table (ZCL r8 §3.7). Reached only through the
+    /// Scenes server's own vtable, so images without a Scenes server do not
+    /// link the scene-table command handling.
+    SceneTable(&'a mut dyn scenes::SceneTable),
+    /// A cluster whose state is stored in and recalled from scenes.
+    SceneState(&'a mut dyn scenes::SceneCapable),
+}
+
 /// Trait that all cluster implementations must satisfy.
 pub trait Cluster {
     /// The cluster identifier for this cluster.
@@ -72,6 +86,22 @@ pub trait Cluster {
         payload: &[u8],
     ) -> Result<heapless::Vec<u8, 64>, ZclStatus>;
 
+    /// Handle a cluster-specific command received from the node whose IEEE
+    /// address is `src_ieee` (`None` when the dispatcher could not resolve
+    /// it). Clusters whose commands are only valid from a particular peer
+    /// override this; e.g. an IAS Zone server accepts a Zone Enroll Response
+    /// only from its CIE (ZCL r8 §8.2.2.3.1). Dispatchers call this rather
+    /// than [`Self::handle_command`].
+    fn handle_command_from(
+        &mut self,
+        src_ieee: Option<u64>,
+        cmd_id: CommandId,
+        payload: &[u8],
+    ) -> Result<heapless::Vec<u8, 64>, ZclStatus> {
+        let _ = src_ieee;
+        self.handle_command(cmd_id, payload)
+    }
+
     /// Immutable access to the cluster's attribute store.
     fn attributes(&self) -> &dyn AttributeStoreAccess;
 
@@ -81,6 +111,13 @@ pub trait Cluster {
     /// Command IDs this cluster can receive (client→server).
     fn received_commands(&self) -> heapless::Vec<u8, 32> {
         heapless::Vec::new()
+    }
+
+    /// This cluster's [`ClusterRole`]. A cluster implementing
+    /// [`scenes::SceneCapable`] returns [`ClusterRole::SceneState`] so its
+    /// state is captured by Store Scene and restored by Recall Scene.
+    fn cluster_role(&mut self) -> ClusterRole<'_> {
+        ClusterRole::None
     }
 
     /// Command IDs this cluster can generate (server→client).

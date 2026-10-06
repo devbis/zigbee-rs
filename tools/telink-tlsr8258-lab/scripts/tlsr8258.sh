@@ -315,14 +315,15 @@ verify_layout() {
             "$ramcode_len" >&2
         exit 1
     fi
-    # The security journal starts at 0x74000 and factory data at 0x76000.
-    # The legacy 256 KiB threshold is informational; lab images must not reach
-    # the security journal or factory data.
+    # Production TB-04 NV journals start at 0x70000 (APS, then child table at
+    # 0x72000 and security at 0x74000) and factory data at 0x76000. The legacy
+    # 256 KiB threshold is informational; lab images must not reach any of
+    # them, so flashing a lab image cannot erase a commissioned device's state.
     if [[ -f "$BIN_PATH" ]]; then
         local bin_size
         bin_size=$(wc -c < "$BIN_PATH" | tr -d ' ')
-        if (( bin_size > 0x74000 )); then
-            printf 'layout-check FAIL: .bin size=%d (0x%X) reaches security journal at 0x74000\n' \
+        if (( bin_size > 0x70000 )); then
+            printf 'layout-check FAIL: .bin size=%d (0x%X) reaches APS-table journal at 0x70000\n' \
                 "$bin_size" "$bin_size" >&2
             exit 1
         fi

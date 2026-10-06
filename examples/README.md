@@ -119,10 +119,10 @@ image sizes.
 
 ## Router firmware
 
-| example | frontend | child support | validation |
-|---|---|---|---|
-| [`nrf52840-router`](nrf52840-router/) | `AlwaysOnEndDeviceApp` | none | build/layout; HIL acceptance open |
-| [`telink-tlsr8258-router`](telink-tlsr8258-router/) | `ParentRouterApp` | persistent children, bindings, groups, optional durable application-key installation | build/layout; prior join/restart/relay evidence; corrected child acceptance open |
+| example | frontend | child support | commissioning after Leave | validation |
+|---|---|---|---|---|
+| [`nrf52840-router`](nrf52840-router/) | `AlwaysOnEndDeviceApp` | none | Button 1 short press | build/layout; HIL acceptance open |
+| [`telink-tlsr8258-router`](telink-tlsr8258-router/) | `ParentRouterApp` | persistent children, bindings, groups, optional durable application-key installation | power cycle (TB-04 has no button) | build/layout; prior join/restart/relay evidence; corrected child acceptance open |
 
 ## Telink power variants
 

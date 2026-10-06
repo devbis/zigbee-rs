@@ -151,6 +151,10 @@ impl LevelControlCluster {
 }
 
 impl Cluster for LevelControlCluster {
+    fn cluster_role(&mut self) -> super::ClusterRole<'_> {
+        super::ClusterRole::SceneState(self)
+    }
+
     fn cluster_id(&self) -> ClusterId {
         ClusterId::LEVEL_CONTROL
     }
@@ -166,7 +170,18 @@ impl Cluster for LevelControlCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 let level = payload[0];
-                let transition_time = u16::from_le_bytes([payload[1], payload[2]]);
+                // Level range is 0x00..=0xFE (ZCL r8 §3.10.2.4.1.1).
+                if level == 0xFF {
+                    return Err(ZclStatus::InvalidField);
+                }
+                let mut transition_time = u16::from_le_bytes([payload[1], payload[2]]);
+                // 0xFFFF: use OnOffTransitionTime (ZCL r8 §3.10.2.4.1.2).
+                if transition_time == 0xFFFF {
+                    transition_time = match self.store.get(ATTR_ON_OFF_TRANSITION_TIME) {
+                        Some(ZclValue::U16(t)) => *t,
+                        _ => 0,
+                    };
+                }
                 if transition_time == 0 {
                     self.set_level(level);
                     self.transitions.stop(ATTR_CURRENT_LEVEL.0);
@@ -223,7 +238,11 @@ impl Cluster for LevelControlCluster {
                 }
                 let mode = payload[0];
                 let step_size = payload[1];
-                let transition_time = u16::from_le_bytes([payload[2], payload[3]]);
+                let mut transition_time = u16::from_le_bytes([payload[2], payload[3]]);
+                // 0xFFFF: move as fast as able (ZCL r8 §3.10.2.4.3.3).
+                if transition_time == 0xFFFF {
+                    transition_time = 0;
+                }
                 let current = self.current_level();
                 let new_level = if mode == 0 {
                     current.saturating_add(step_size).min(0xFE)
@@ -332,5 +351,30 @@ mod tests {
         // zeroed — advancing time should produce no further updates.
         cluster.tick(100);
         assert_eq!(cluster.current_level(), 0x00);
+    }
+
+    #[test]
+    fn move_to_level_rejects_0xff_and_uses_on_off_transition_time_for_0xffff() {
+        let mut c = LevelControlCluster::new();
+        assert_eq!(
+            c.handle_command(CMD_MOVE_TO_LEVEL, &[0xFF, 0, 0]),
+            Err(ZclStatus::InvalidField)
+        );
+        // OnOffTransitionTime = 0 → immediate.
+        c.handle_command(CMD_MOVE_TO_LEVEL, &[0x40, 0xFF, 0xFF])
+            .unwrap();
+        assert_eq!(c.current_level(), 0x40);
+        // OnOffTransitionTime = 20 ds → a 2 s transition.
+        c.attributes_mut()
+            .set(ATTR_ON_OFF_TRANSITION_TIME, ZclValue::U16(20))
+            .unwrap();
+        c.handle_command(CMD_MOVE_TO_LEVEL, &[0x80, 0xFF, 0xFF])
+            .unwrap();
+        assert_eq!(
+            c.attributes().get(ATTR_REMAINING_TIME),
+            Some(&ZclValue::U16(20))
+        );
+        c.tick(20);
+        assert_eq!(c.current_level(), 0x80);
     }
 }

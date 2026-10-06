@@ -153,7 +153,11 @@ pub struct QueryNextImageRequest {
 
 impl QueryNextImageRequest {
     /// Serialize into a buffer. Returns bytes written.
+    /// Returns 0 (nothing written) if `buf` is too small.
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        if buf.len() < 9 + 2 * self.hardware_version.is_some() as usize {
+            return 0;
+        }
         buf[0] = self.field_control;
         buf[1..3].copy_from_slice(&self.manufacturer_code.to_le_bytes());
         buf[3..5].copy_from_slice(&self.image_type.to_le_bytes());
@@ -221,7 +225,11 @@ pub struct ImageBlockRequest {
 
 impl ImageBlockRequest {
     /// Serialize into a buffer. Returns bytes written.
+    /// Returns 0 (nothing written) if `buf` is too small.
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        if buf.len() < 14 {
+            return 0;
+        }
         buf[0] = self.field_control;
         buf[1..3].copy_from_slice(&self.manufacturer_code.to_le_bytes());
         buf[3..5].copy_from_slice(&self.image_type.to_le_bytes());
@@ -262,6 +270,10 @@ pub enum ParsedBlockResponse {
 
 impl ParsedBlockResponse {
     /// Parse from payload bytes.
+    ///
+    /// Returns `None` for truncated payloads and for success blocks carrying
+    /// more than 64 data bytes (the maximum `max_data_size` this client
+    /// requests), so data is never silently truncated.
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.is_empty() {
             return None;
@@ -287,10 +299,10 @@ impl ParsedBlockResponse {
                     );
                     return None;
                 }
-                let mut block_data = heapless::Vec::new();
-                for &b in &data[14..14 + data_size as usize] {
-                    let _ = block_data.push(b);
-                }
+                // A block larger than the 64-byte buffer cannot be stored
+                // without dropping bytes; reject it rather than truncate.
+                let block_data =
+                    heapless::Vec::from_slice(&data[14..14 + data_size as usize]).ok()?;
                 Some(Self::Success(ImageBlockResponse {
                     status,
                     manufacturer_code: mfr,
@@ -328,7 +340,11 @@ pub struct UpgradeEndRequest {
 
 impl UpgradeEndRequest {
     /// Serialize into a buffer. Returns bytes written.
+    /// Returns 0 (nothing written) if `buf` is too small.
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        if buf.len() < 9 {
+            return 0;
+        }
         buf[0] = self.status;
         buf[1..3].copy_from_slice(&self.manufacturer_code.to_le_bytes());
         buf[3..5].copy_from_slice(&self.image_type.to_le_bytes());
@@ -383,6 +399,8 @@ pub struct OtaCluster {
     block_size: u8,
     /// Hardware version (included in QueryNextImageRequest if set).
     hardware_version: Option<u16>,
+    /// Caller-provided random value for QueryJitter selection.
+    notify_random: Option<u8>,
 }
 
 impl OtaCluster {
@@ -488,6 +506,20 @@ impl OtaCluster {
             target_size: 0,
             block_size: DEFAULT_BLOCK_SIZE,
             hardware_version: None,
+            notify_random: None,
+        }
+    }
+
+    /// Update a server-maintained (read-only) attribute.
+    ///
+    /// These attributes are read-only over the air, so the ZCL write path
+    /// (`set`) would reject them; internal updates use `set_raw`. Failure
+    /// means the attribute is not registered, which is a programming error.
+    fn set_attr(&mut self, id: AttributeId, value: ZclValue) {
+        let result = self.store.set_raw(id, value);
+        debug_assert!(result.is_ok(), "OTA attribute 0x{:04X} missing", id.0);
+        if result.is_err() {
+            log::warn!("[OTA] attribute 0x{:04X} update failed", id.0);
         }
     }
 
@@ -513,17 +545,13 @@ impl OtaCluster {
 
     /// Set the UpgradeServerID attribute (IEEE address of the OTA server).
     pub fn set_upgrade_server_id(&mut self, ieee: u64) {
-        let _ = self
-            .store
-            .set(ATTR_UPGRADE_SERVER_ID, ZclValue::IeeeAddr(ieee));
+        self.set_attr(ATTR_UPGRADE_SERVER_ID, ZclValue::IeeeAddr(ieee));
     }
 
     /// Build a Query Next Image Request to initiate an OTA check.
     pub fn start_query(&mut self) -> OtaAction {
         self.state = OtaState::QuerySent;
-        let _ = self
-            .store
-            .set(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
+        self.set_attr(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
         let hw = self.hardware_version;
         OtaAction::SendQuery(QueryNextImageRequest {
             field_control: if hw.is_some() { 0x01 } else { 0x00 },
@@ -629,20 +657,18 @@ impl OtaCluster {
     /// Abort the current OTA operation.
     pub fn abort(&mut self) {
         self.state = OtaState::Idle;
-        let _ = self
-            .store
-            .set(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
-        let _ = self.store.set(ATTR_FILE_OFFSET, ZclValue::U32(0xFFFFFFFF));
+        self.set_attr(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
+        self.set_attr(ATTR_FILE_OFFSET, ZclValue::U32(0xFFFFFFFF));
     }
 
     /// Mark download as complete and transition to Verifying.
     pub fn mark_download_complete(&mut self) {
         self.state = OtaState::Verifying;
-        let _ = self.store.set(
+        self.set_attr(
             ATTR_IMAGE_UPGRADE_STATUS,
             ZclValue::Enum8(STATUS_DOWNLOAD_COMPLETE),
         );
-        let _ = self.store.set(
+        self.set_attr(
             ATTR_DOWNLOADED_FILE_VERSION,
             ZclValue::U32(self.target_version),
         );
@@ -651,7 +677,7 @@ impl OtaCluster {
     /// Mark verification passed, move to WaitingActivate.
     pub fn mark_verified(&mut self) -> OtaAction {
         self.state = OtaState::WaitingActivate;
-        let _ = self.store.set(
+        self.set_attr(
             ATTR_IMAGE_UPGRADE_STATUS,
             ZclValue::Enum8(STATUS_WAITING_TO_UPGRADE),
         );
@@ -665,23 +691,56 @@ impl OtaCluster {
 
     /// Mark OTA as failed.
     pub fn mark_failed(&mut self) -> OtaAction {
-        let version = self.target_version;
+        self.fail_with(ZclStatus::InvalidImage as u8)
+    }
+
+    /// Fail the transfer, reporting `status` in the Upgrade End Request
+    /// (INVALID_IMAGE / ABORT, ZCL r8 §11.13.9).
+    fn fail_with(&mut self, status: u8) -> OtaAction {
         self.state = OtaState::Failed;
-        let _ = self
-            .store
-            .set(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
+        self.set_attr(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
         OtaAction::SendEndRequest(UpgradeEndRequest {
-            status: 0x96, // INVALID_IMAGE per ZCL spec §11.13.9.5
+            status,
             manufacturer_code: self.manufacturer_code,
             image_type: self.image_type,
-            file_version: version,
+            file_version: self.target_version,
         })
+    }
+
+    /// Cross-check a downloaded image header against the Query Next Image
+    /// Response that started the download (ZCL r8 §11.4.2, §11.13.6):
+    /// manufacturer code, image type, file version and total image size must
+    /// match, and when both the header and this device carry a hardware
+    /// version it must be within the header's min/max range.
+    pub fn validate_image_header(&self, header: &super::ota_image::OtaImageHeader) -> bool {
+        let hw_ok = match (
+            self.hardware_version,
+            header.min_hardware_version,
+            header.max_hardware_version,
+        ) {
+            (Some(hw), Some(min), Some(max)) => (min..=max).contains(&hw),
+            _ => true,
+        };
+        header.manufacturer_code == self.manufacturer_code
+            && header.image_type == self.image_type
+            && header.file_version == self.target_version
+            && header.total_image_size == self.target_size
+            && hw_ok
+    }
+
+    /// Supply a random value in `1..=100` used to apply the QueryJitter of
+    /// the next Image Notify (ZCL r8 §11.13.3.4). Without one, a notify
+    /// is treated as if the device was selected.
+    pub fn set_notify_random(&mut self, random: u8) {
+        self.notify_random = Some(random);
     }
 
     // ── Private command handlers ─────────────────────────────
 
     fn handle_image_notify(&mut self, payload: &[u8]) -> OtaAction {
-        if self.state != OtaState::Idle {
+        // A notify is only acted on when no transfer is in progress; a
+        // previously failed transfer may be restarted.
+        if !matches!(self.state, OtaState::Idle | OtaState::Failed) {
             log::debug!(
                 "[OTA] Image Notify received in state {:?}, ignoring",
                 self.state
@@ -689,33 +748,47 @@ impl OtaCluster {
             return OtaAction::None;
         }
 
-        // ImageNotify payload type determines what fields are present:
-        //   0 = jitter only, 1 = +mfg, 2 = +image_type, 3 = +version
-        // If fields are present and don't match our device, ignore.
-        if !payload.is_empty() {
-            let payload_type = payload[0];
-
-            if payload_type >= 1 && payload.len() >= 4 {
-                let mfg = u16::from_le_bytes([payload[2], payload[3]]);
-                if mfg != 0xFFFF && mfg != self.manufacturer_code {
-                    log::debug!("[OTA] ImageNotify mfg 0x{:04X} not for us", mfg);
-                    return OtaAction::None;
-                }
+        // ImageNotify (ZCL r8 §11.13.3): payload type, QueryJitter, then
+        //   type 1 = +mfg, 2 = +image_type, 3 = +file version.
+        // Fields that are present and don't match our device are ignored.
+        // An empty notify is tolerated as "type 0, jitter 100" (legacy
+        // servers); any present-but-invalid field rejects the command.
+        let payload_type = payload.first().copied().unwrap_or(0);
+        let jitter = if payload.is_empty() {
+            100
+        } else {
+            payload.get(1).copied().unwrap_or(0)
+        };
+        const NOTIFY_LEN: [usize; 4] = [0, 4, 6, 10];
+        let field = |i: usize| u16::from_le_bytes([payload[i], payload[i + 1]]);
+        if payload_type > 3
+            || payload.len() < NOTIFY_LEN[payload_type as usize]
+            || !(1..=100).contains(&jitter)
+        {
+            log::debug!("[OTA] Malformed Image Notify");
+            return OtaAction::None;
+        }
+        if payload_type >= 1 && field(2) != 0xFFFF && field(2) != self.manufacturer_code {
+            log::debug!("[OTA] ImageNotify mfg not for us");
+            return OtaAction::None;
+        }
+        if payload_type >= 2 && field(4) != 0xFFFF && field(4) != self.image_type {
+            log::debug!("[OTA] ImageNotify type not for us");
+            return OtaAction::None;
+        }
+        if payload_type >= 3 {
+            let ver = u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]);
+            if ver != 0xFFFFFFFF && ver == self.current_version {
+                log::debug!("[OTA] ImageNotify version matches current, ignoring");
+                return OtaAction::None;
             }
-            if payload_type >= 2 && payload.len() >= 6 {
-                let img = u16::from_le_bytes([payload[4], payload[5]]);
-                if img != 0xFFFF && img != self.image_type {
-                    log::debug!("[OTA] ImageNotify type 0x{:04X} not for us", img);
-                    return OtaAction::None;
-                }
-            }
-            if payload_type >= 3 && payload.len() >= 10 {
-                let ver = u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]);
-                if ver != 0xFFFFFFFF && ver == self.current_version {
-                    log::debug!("[OTA] ImageNotify version matches current, ignoring");
-                    return OtaAction::None;
-                }
-            }
+        }
+        // QueryJitter: only devices drawing a value <= jitter respond.
+        if let Some(random) = self.notify_random.take()
+            && random > jitter
+        {
+            log::debug!("[OTA] ImageNotify jitter: not selected");
+            return OtaAction::None;
         }
 
         log::info!("[OTA] Image Notify received — starting query");
@@ -775,11 +848,11 @@ impl OtaCluster {
             total_size: size,
         };
 
-        let _ = self.store.set(
+        self.set_attr(
             ATTR_IMAGE_UPGRADE_STATUS,
             ZclValue::Enum8(STATUS_DOWNLOAD_IN_PROGRESS),
         );
-        let _ = self.store.set(ATTR_FILE_OFFSET, ZclValue::U32(0));
+        self.set_attr(ATTR_FILE_OFFSET, ZclValue::U32(0));
 
         self.build_block_request(0, size)
     }
@@ -797,12 +870,16 @@ impl OtaCluster {
             }
         }
 
-        let parsed = match ParsedBlockResponse::parse(payload) {
-            Some(p) => p,
-            None => {
-                log::warn!("[OTA] Failed to parse Block Response");
-                return OtaAction::None;
+        let Some(parsed) = ParsedBlockResponse::parse(payload) else {
+            // A success block claiming more data than requested cannot be
+            // stored without a hole; abort instead of stalling (§11.13.8).
+            if payload.first() == Some(&0) && payload.get(13).is_some_and(|&n| n > self.block_size)
+            {
+                log::warn!("[OTA] Block larger than MaxDataSize, aborting");
+                return self.fail_with(ZclStatus::Abort as u8);
             }
+            log::warn!("[OTA] Failed to parse Block Response");
+            return OtaAction::None;
         };
 
         match parsed {
@@ -831,6 +908,13 @@ impl OtaCluster {
                     log::warn!("[OTA] Rejecting empty or oversized image block");
                     return self.mark_failed();
                 }
+                // Never advance the offset beyond the bytes actually stored,
+                // and never accept more than the requested MaxDataSize.
+                if block.data_size > self.block_size || block.data.len() != block.data_size as usize
+                {
+                    log::warn!("[OTA] Block exceeds requested MaxDataSize, aborting");
+                    return self.fail_with(ZclStatus::Abort as u8);
+                }
 
                 // Update state
                 let total = self.target_size;
@@ -838,7 +922,7 @@ impl OtaCluster {
                     offset: new_offset,
                     total_size: total,
                 };
-                let _ = self.store.set(ATTR_FILE_OFFSET, ZclValue::U32(new_offset));
+                self.set_attr(ATTR_FILE_OFFSET, ZclValue::U32(new_offset));
 
                 log::debug!(
                     "[OTA] Block: offset={} size={} progress={}%",
@@ -855,7 +939,7 @@ impl OtaCluster {
             }
             ParsedBlockResponse::WaitForData(wait) => {
                 let delay = wait.request_time.saturating_sub(wait.current_time);
-                let _ = self.store.set(
+                self.set_attr(
                     ATTR_MIN_BLOCK_PERIOD,
                     ZclValue::U16(wait.minimum_block_period),
                 );
@@ -934,7 +1018,7 @@ impl OtaCluster {
                 delay_secs: delay,
                 elapsed: 0,
             };
-            let _ = self.store.set(
+            self.set_attr(
                 ATTR_IMAGE_UPGRADE_STATUS,
                 ZclValue::Enum8(STATUS_COUNT_DOWN),
             );
@@ -1039,17 +1123,192 @@ impl Cluster for OtaCluster {
         self.target_version = 0;
         self.target_size = 0;
         self.block_size = DEFAULT_BLOCK_SIZE;
-        let _ = self
-            .store
-            .set_raw(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
-        let _ = self
-            .store
-            .set_raw(ATTR_FILE_OFFSET, ZclValue::U32(0xFFFFFFFF));
-        let _ = self
-            .store
-            .set_raw(ATTR_DOWNLOADED_FILE_VERSION, ZclValue::U32(0xFFFFFFFF));
-        let _ = self
-            .store
-            .set_raw(ATTR_DOWNLOADED_STACK_VERSION, ZclValue::U16(0xFFFF));
+        self.set_attr(ATTR_IMAGE_UPGRADE_STATUS, ZclValue::Enum8(STATUS_NORMAL));
+        self.set_attr(ATTR_FILE_OFFSET, ZclValue::U32(0xFFFFFFFF));
+        self.set_attr(ATTR_DOWNLOADED_FILE_VERSION, ZclValue::U32(0xFFFFFFFF));
+        self.set_attr(ATTR_DOWNLOADED_STACK_VERSION, ZclValue::U16(0xFFFF));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clusters::ota_image::OtaImageHeader;
+
+    const MFR: u16 = 0x1234;
+    const TYPE: u16 = 0x0001;
+
+    fn downloading(size: u32) -> OtaCluster {
+        let mut c = OtaCluster::new(MFR, TYPE, 1);
+        c.start_query();
+        let mut rsp = [0u8; 13];
+        rsp[1..3].copy_from_slice(&MFR.to_le_bytes());
+        rsp[3..5].copy_from_slice(&TYPE.to_le_bytes());
+        rsp[5..9].copy_from_slice(&2u32.to_le_bytes());
+        rsp[9..13].copy_from_slice(&size.to_le_bytes());
+        assert!(matches!(
+            c.process_server_command(0x02, &rsp),
+            OtaAction::SendBlockRequest(_)
+        ));
+        c
+    }
+
+    fn block(offset: u32, data: &[u8]) -> heapless::Vec<u8, 128> {
+        let mut p = heapless::Vec::new();
+        p.push(0).unwrap();
+        p.extend_from_slice(&MFR.to_le_bytes()).unwrap();
+        p.extend_from_slice(&TYPE.to_le_bytes()).unwrap();
+        p.extend_from_slice(&2u32.to_le_bytes()).unwrap();
+        p.extend_from_slice(&offset.to_le_bytes()).unwrap();
+        p.push(data.len() as u8).unwrap();
+        p.extend_from_slice(data).unwrap();
+        p
+    }
+
+    fn attr(c: &OtaCluster, id: AttributeId) -> ZclValue {
+        c.attributes().get(id).unwrap().clone()
+    }
+
+    #[test]
+    fn read_only_attributes_are_updated_internally() {
+        let mut c = downloading(1000);
+        assert_eq!(
+            attr(&c, ATTR_IMAGE_UPGRADE_STATUS),
+            ZclValue::Enum8(STATUS_DOWNLOAD_IN_PROGRESS)
+        );
+        assert_eq!(attr(&c, ATTR_FILE_OFFSET), ZclValue::U32(0));
+        assert!(matches!(
+            c.process_server_command(0x05, &block(0, &[1; 10])),
+            OtaAction::WriteBlock { offset: 0, .. }
+        ));
+        assert_eq!(attr(&c, ATTR_FILE_OFFSET), ZclValue::U32(10));
+        c.set_upgrade_server_id(0x0011_2233_4455_6677);
+        assert_eq!(
+            attr(&c, ATTR_UPGRADE_SERVER_ID),
+            ZclValue::IeeeAddr(0x0011_2233_4455_6677)
+        );
+        // WAIT_FOR_DATA updates MinimumBlockPeriod.
+        let mut w = [0u8; 11];
+        w[0] = 0x97;
+        w[5] = 5;
+        w[9] = 250;
+        c.process_server_command(0x05, &w);
+        assert_eq!(attr(&c, ATTR_MIN_BLOCK_PERIOD), ZclValue::U16(250));
+    }
+
+    #[test]
+    fn oversized_block_aborts_instead_of_leaving_a_hole() {
+        // Larger than the 64-byte buffer.
+        let mut c = downloading(1000);
+        match c.process_server_command(0x05, &block(0, &[7; 80])) {
+            OtaAction::SendEndRequest(r) => assert_eq!(r.status, ZclStatus::Abort as u8),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(c.state(), OtaState::Failed);
+        // Fits the buffer but exceeds the requested MaxDataSize.
+        let mut c = downloading(1000);
+        c.set_block_size(32);
+        match c.process_server_command(0x05, &block(0, &[7; 40])) {
+            OtaAction::SendEndRequest(r) => assert_eq!(r.status, ZclStatus::Abort as u8),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(attr(&c, ATTR_FILE_OFFSET), ZclValue::U32(0));
+        assert!(ParsedBlockResponse::parse(&block(0, &[0; 65])).is_none());
+    }
+
+    #[test]
+    fn image_header_is_cross_checked_against_query_response() {
+        let mut c = downloading(1000);
+        c.set_hardware_version(3);
+        let mut raw = [0u8; 70];
+        raw[0..4].copy_from_slice(&0x0BEE_F11Eu32.to_le_bytes());
+        raw[4..6].copy_from_slice(&0x0100u16.to_le_bytes());
+        raw[6..8].copy_from_slice(&68u16.to_le_bytes());
+        raw[8..10].copy_from_slice(&0x0006u16.to_le_bytes()); // dest + hw
+        raw[10..12].copy_from_slice(&MFR.to_le_bytes());
+        raw[12..14].copy_from_slice(&TYPE.to_le_bytes());
+        raw[14..18].copy_from_slice(&2u32.to_le_bytes());
+        raw[52..56].copy_from_slice(&1000u32.to_le_bytes());
+        raw[56..64].copy_from_slice(&0x0807_0605_0403_0201u64.to_le_bytes());
+        raw[64..66].copy_from_slice(&2u16.to_le_bytes());
+        raw[66..68].copy_from_slice(&4u16.to_le_bytes());
+        let (hdr, len) = OtaImageHeader::parse(&raw).unwrap();
+        assert_eq!(len, 68);
+        assert_eq!(hdr.upgrade_file_destination, Some(0x0807_0605_0403_0201));
+        assert_eq!(hdr.min_hardware_version, Some(2));
+        assert_eq!(hdr.max_hardware_version, Some(4));
+        assert!(c.validate_image_header(&hdr));
+        let mut bad = hdr.clone();
+        bad.total_image_size = 999;
+        assert!(!c.validate_image_header(&bad));
+        let mut bad = hdr.clone();
+        bad.file_version = 3;
+        assert!(!c.validate_image_header(&bad));
+        let mut bad = hdr;
+        bad.min_hardware_version = Some(4);
+        assert!(!c.validate_image_header(&bad));
+    }
+
+    #[test]
+    fn image_notify_honours_jitter_state_and_length() {
+        let mut c = OtaCluster::new(MFR, TYPE, 1);
+        // Jitter 0 or > 100 and truncated payloads are malformed.
+        assert!(matches!(c.process_server_command(0, &[0]), OtaAction::None));
+        assert!(matches!(
+            c.process_server_command(0, &[0, 0]),
+            OtaAction::None
+        ));
+        assert!(matches!(
+            c.process_server_command(0, &[0, 101]),
+            OtaAction::None
+        ));
+        assert!(matches!(
+            c.process_server_command(0, &[1, 50, 0x34]),
+            OtaAction::None
+        ));
+        assert!(matches!(
+            c.process_server_command(0, &[4, 50]),
+            OtaAction::None
+        ));
+        // Random value above the jitter: not selected (value is consumed).
+        c.set_notify_random(60);
+        assert!(matches!(
+            c.process_server_command(0, &[0, 50]),
+            OtaAction::None
+        ));
+        c.set_notify_random(50);
+        assert!(matches!(
+            c.process_server_command(0, &[0, 50]),
+            OtaAction::SendQuery(_)
+        ));
+        // Ignored while a transfer is in progress.
+        assert!(matches!(
+            c.process_server_command(0, &[0, 100]),
+            OtaAction::None
+        ));
+        assert_eq!(c.state(), OtaState::QuerySent);
+    }
+
+    #[test]
+    fn request_serializers_never_panic_on_small_buffers() {
+        let c = downloading(1000);
+        let OtaAction::SendBlockRequest(req) = c.next_block_request() else {
+            panic!()
+        };
+        let mut buf = [0u8; 32];
+        let full = req.serialize(&mut buf);
+        for cap in 0..full {
+            assert_eq!(req.serialize(&mut buf[..cap]), 0);
+        }
+        let end = UpgradeEndRequest {
+            status: 0,
+            manufacturer_code: MFR,
+            image_type: TYPE,
+            file_version: 2,
+        };
+        let full = end.serialize(&mut buf);
+        for cap in 0..full {
+            assert_eq!(end.serialize(&mut buf[..cap]), 0);
+        }
     }
 }

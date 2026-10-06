@@ -23,7 +23,9 @@ cortex-m-rt = { version = "0.7", features = ["device"] }
 # Compile out transitive logging in the production image.
 log = { version = "0.4", default-features = false }
 
-# Panic handler for embedded target
+# Panic handler required by `no_std`. Release builds from this directory use
+# the `immediate-abort` panic strategy (see `.cargo/config.toml`), so it is
+# never reached there: every panic site traps into `HardFault` instead.
 panic-halt = "1.0"
 
 [features]
@@ -36,4 +38,5 @@ phy6252 = ["phy62x2-evk/phy6252", "phy62x2-evk-product/phy6252"]
 opt-level = "z"
 lto = true
 codegen-units = 1
+# `.cargo/config.toml` overrides this with `immediate-abort` for the XIP image.
 panic = "abort"

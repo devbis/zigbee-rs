@@ -257,6 +257,11 @@ pub enum DiagnosticEvent {
         failures: u8,
     },
     FactoryReset,
+    /// Factory-new after an explicit Leave; no automatic network search until
+    /// the composition root requests commissioning.
+    AwaitingCommissioningRequest,
+    /// The composition root explicitly requested commissioning.
+    CommissioningRequested,
     Fatal(RouterAppError),
 }
 

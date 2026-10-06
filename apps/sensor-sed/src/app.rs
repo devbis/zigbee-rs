@@ -102,10 +102,25 @@ where
     endpoint: u8,
     last_report: R::Mark,
     last_tick: R::Mark,
-    fast_poll_started: R::Mark,
-    fast_poll_duration_ms: u32,
-    last_rejoin_attempt: R::Mark,
-    last_status: R::Mark,
+    /// Timed fast-poll window `(start, duration)`. Cleared as soon as it
+    /// expires so a narrow platform counter cannot make an old start mark
+    /// look recent again after rollover.
+    fast_poll: Option<(R::Mark, u32)>,
+    /// Last bounded MAC poll window; `None` until the first one runs.
+    last_poll: Option<R::Mark>,
+    /// Delay applied after the next failed unjoined commissioning attempt.
+    join_backoff_ms: u32,
+    /// Measured time still to sleep before the next unjoined attempt.
+    ///
+    /// Decremented by the measured duration of each bounded wait instead of
+    /// comparing against a long-lived mark, so a 30-minute backoff remains
+    /// correct on platforms whose native counter wraps in minutes.
+    join_wait_ms: u32,
+    /// Factory-new after an explicit leave: do not search for a network
+    /// until the user presses the commissioning button.
+    awaiting_button: bool,
+    /// Whether the previous service iteration observed a joined network.
+    network_up: bool,
     rejoin_count: u8,
     annce_retries_left: u8,
     last_annce: R::Mark,
@@ -154,10 +169,12 @@ where
             endpoint,
             last_report: now,
             last_tick: now,
-            fast_poll_started: now,
-            fast_poll_duration_ms: 0,
-            last_rejoin_attempt: now,
-            last_status: now,
+            fast_poll: None,
+            last_poll: None,
+            join_backoff_ms: policy.join_retry_ms,
+            join_wait_ms: 0,
+            awaiting_button: false,
+            network_up: false,
             rejoin_count: 0,
             annce_retries_left: 0,
             last_annce: now,
@@ -180,12 +197,76 @@ where
     }
 
     fn start_fast_poll(&mut self, duration_ms: u32) {
-        self.fast_poll_started = self.mark();
-        self.fast_poll_duration_ms = duration_ms;
+        self.fast_poll = Some((self.mark(), duration_ms));
     }
 
-    fn fast_poll_active(&self) -> bool {
-        self.elapsed_ms(self.fast_poll_started) < self.fast_poll_duration_ms
+    /// Remaining time in the timed fast-poll window, clearing it on expiry.
+    ///
+    /// Called on every service iteration (through
+    /// [`next_wait_ms`](Self::next_wait_ms)), so an expired window is dropped
+    /// long before any platform counter can roll over and alias its start.
+    fn fast_poll_remaining_ms(&mut self) -> Option<u32> {
+        let (started, duration_ms) = self.fast_poll?;
+        let elapsed_ms = self.elapsed_ms(started);
+        if elapsed_ms < duration_ms {
+            Some(duration_ms - elapsed_ms)
+        } else {
+            self.fast_poll = None;
+            None
+        }
+    }
+
+    fn fast_poll_active(&mut self) -> bool {
+        self.fast_poll_remaining_ms().is_some()
+    }
+
+    /// Whether a short button press can start commissioning on this product.
+    const fn button_commissions() -> bool {
+        !matches!(A::SHORT_PRESS, ShortPressAction::None)
+    }
+
+    /// Sleep for the current backoff delay before the next unjoined attempt
+    /// and double the following delay up to the 30-minute cap.
+    fn schedule_join_backoff(&mut self) {
+        let delay_ms = self.join_backoff_ms;
+        self.join_wait_ms = delay_ms;
+        self.join_backoff_ms = policy::next_join_retry_ms(delay_ms, self.policy.join_retry_ms);
+        // Runtime RunAgain hints are serviced by the next attempt's tick; an
+        // idle unjoined device must not wake early for them.
+        self.run_again = None;
+        self.resources
+            .diagnostics
+            .record(DiagnosticEvent::JoinBackoff { delay_ms });
+    }
+
+    /// Restart the backoff sequence at the product's initial delay.
+    fn reset_join_backoff(&mut self) {
+        self.join_backoff_ms = self.policy.join_retry_ms;
+        self.join_wait_ms = 0;
+    }
+
+    /// Enter the factory-new state after an explicit leave.
+    ///
+    /// Products with a commissioning button sleep until it is pressed and
+    /// never search for a network on their own. A product without a usable
+    /// short-press action would otherwise be unrecoverable without a power
+    /// cycle, so it falls back to the bounded unjoined backoff instead.
+    fn enter_factory_new_after_leave(&mut self) {
+        self.network_up = false;
+        self.fast_poll = None;
+        self.run_again = None;
+        self.reset_join_backoff();
+        self.resources.status.set(SensorStatus::Off);
+        if Self::button_commissions() {
+            self.awaiting_button = true;
+            self.join_wait_ms = 0;
+            self.resources
+                .diagnostics
+                .record(DiagnosticEvent::WaitingForButton);
+        } else {
+            self.awaiting_button = false;
+            self.schedule_join_backoff();
+        }
     }
 
     /// Start Finding & Binding target mode on this sensor endpoint.
@@ -233,11 +314,14 @@ where
         match error {
             NodeError::Persistence(error) => self.persistence_failure(error),
             NodeError::Profile(error) => {
+                // A profile/cluster configuration error does not risk
+                // security-counter reuse, so restart through the product
+                // supervisor instead of halting forever without a watchdog.
                 self.resources
                     .diagnostics
                     .record(DiagnosticEvent::ProfileFailure(error));
                 self.resources.status.set(SensorStatus::Fault);
-                core::panic!("profile error");
+                self.resources.supervisor.reset()
             }
         }
     }
@@ -283,8 +367,10 @@ where
             .set(SensorStatus::Joined { active: true });
         self.start_fast_poll(self.policy.fresh_join_fast_ms);
         self.last_tick = now;
-        self.last_rejoin_attempt = now;
-        self.last_status = now;
+        self.last_poll = None;
+        self.network_up = true;
+        self.awaiting_button = false;
+        self.reset_join_backoff();
         self.annce_retries_left = self.policy.announce_retries;
         self.last_annce = now;
         self.interview_done = false;
@@ -411,8 +497,9 @@ where
     }
 
     /// Clear durable security/network state and immediately attempt a
-    /// fresh join. Used for both a coordinator-driven Leave/factory-reset
-    /// request and the repeated-secure-rejoin-failure fallback.
+    /// fresh join. Used only for the repeated-secure-rejoin-failure fallback;
+    /// an explicit leave waits for the user instead (see
+    /// [`enter_factory_new_after_leave`](Self::enter_factory_new_after_leave)).
     async fn rejoin_after_reset(&mut self) -> bool {
         if self.factory_reset().await && self.join_or_resume().await {
             self.reset_post_join_state();
@@ -500,6 +587,10 @@ where
             Err(error) => self.persistence_failure(error),
         };
 
+        if !resumed_at_boot {
+            // Power-on commissioning is a real network search: show it.
+            self.blink_join_attempt().await;
+        }
         if self.join_or_resume_with_rejoin_tracking().await {
             self.resources
                 .status
@@ -518,8 +609,7 @@ where
         let now = self.mark();
         self.last_report = now;
         self.last_tick = now;
-        self.last_rejoin_attempt = now;
-        self.last_status = now;
+        self.last_poll = None;
         self.rejoin_count = 0;
         self.last_annce = now;
         self.interview_done = false;
@@ -542,10 +632,14 @@ where
                 .set(SensorStatus::Joined { active: true });
             self.start_fast_poll(duration_ms);
         } else {
-            self.fast_poll_started = now;
-            self.fast_poll_duration_ms = 0;
+            // A factory-new or network-lost device found nothing at power-on:
+            // sleep through the bounded exponential backoff.
+            self.fast_poll = None;
             self.resources.status.set(SensorStatus::Off);
+            self.reset_join_backoff();
+            self.schedule_join_backoff();
         }
+        self.network_up = joined;
         self.annce_retries_left = if joined && !resumed_at_boot {
             self.policy.announce_retries
         } else {
@@ -624,9 +718,11 @@ where
                 self.resources.status.set(SensorStatus::Off);
                 // The stack already marked itself left (and `state_dirty`);
                 // persist that promptly rather than waiting for the next
-                // scheduled checkpoint. No rejoin action here — the normal
-                // unjoined retry loop picks it back up.
+                // scheduled checkpoint. A requested leave (Mgmt_Leave without
+                // rejoin, local Leave/FactoryReset) leaves the device
+                // factory-new: wait for the user rather than searching.
                 self.checkpoint_security();
+                self.enter_factory_new_after_leave();
                 false
             }
             StackEvent::AttributeReport {
@@ -776,10 +872,16 @@ where
                 false
             }
             StackEvent::LeaveRequested => {
+                // NWK Leave without rejoin, or Trust Center Remove-Device.
+                // The runtime has already persisted the factory-new security
+                // state; clear the in-memory network state the same way and
+                // then wait for the user instead of rejoining automatically.
                 self.resources
                     .diagnostics
                     .record(DiagnosticEvent::LeaveRequested);
-                self.rejoin_after_reset().await
+                self.factory_reset().await;
+                self.enter_factory_new_after_leave();
+                false
             }
             StackEvent::BasicResetToFactoryDefaults => {
                 self.resources
@@ -804,6 +906,7 @@ where
     /// device: drain up to four queued indirect frames per outer-loop
     /// iteration, same as the original firmware.
     async fn service_joined_polls(&mut self) {
+        self.last_poll = Some(self.mark());
         for _poll_round in 0..4u8 {
             match self.node.device_mut().poll().await {
                 Ok(Some(indication)) => {
@@ -851,7 +954,12 @@ where
             self.read_sensors().await;
         }
 
-        let tick_elapsed = (self.elapsed_ms(self.last_tick) / 1_000).min(60);
+        // Charge the runtime every whole second that really elapsed. The
+        // former 60-second cap silently lost time whenever a product policy
+        // slept longer than a minute (slow poll or sample interval), which
+        // stretched every runtime timer. `last_tick` advances by exactly the
+        // charged amount, so the sub-second remainder carries forward.
+        let tick_elapsed = (self.elapsed_ms(self.last_tick) / 1_000).min(u32::from(u16::MAX));
         if tick_elapsed != 0 {
             self.last_tick = W::add_ms(self.last_tick, tick_elapsed * 1_000);
         }
@@ -882,9 +990,8 @@ where
                 });
             } else if self.was_identifying {
                 self.identify_phase_on = false;
-                self.resources.status.set(SensorStatus::Joined {
-                    active: self.fast_poll_active(),
-                });
+                let active = self.fast_poll_active();
+                self.resources.status.set(SensorStatus::Joined { active });
             }
             self.was_identifying = identifying;
         }
@@ -906,79 +1013,113 @@ where
         }
     }
 
-    /// Not-joined blink + bounded retry cadence.
+    /// Double blink shown only while a commissioning attempt actually runs.
+    async fn blink_join_attempt(&mut self) {
+        if !St::PRESENT {
+            return;
+        }
+        // on, gap, on: one await site per wait keeps the future small.
+        let mut second_flash = false;
+        loop {
+            self.resources
+                .status
+                .set(SensorStatus::Joining { on: true });
+            self.resources
+                .wake
+                .delay_ms(self.policy.status.blink_on_ms)
+                .await;
+            self.resources
+                .status
+                .set(SensorStatus::Joining { on: false });
+            if second_flash {
+                break;
+            }
+            second_flash = true;
+            self.resources
+                .wake
+                .delay_ms(self.policy.status.blink_gap_ms)
+                .await;
+        }
+    }
+
+    /// Unjoined lifecycle: sleep through the exponential backoff (or until
+    /// the user button after an explicit leave) and make one bounded attempt
+    /// when the measured backoff has elapsed.
+    async fn service_unjoined(&mut self) {
+        if self.network_up {
+            // The network was lost while joined (parent loss, rejoin request,
+            // failed secure rejoin). The event that caused it already made
+            // one immediate attempt, so continue with the backoff.
+            self.network_up = false;
+            self.fast_poll = None;
+            if !self.awaiting_button {
+                self.reset_join_backoff();
+                self.schedule_join_backoff();
+            }
+            return;
+        }
+        if self.awaiting_button || self.join_wait_ms != 0 {
+            return;
+        }
+        self.attempt_unjoined_commissioning().await;
+    }
+
+    /// One unjoined commissioning attempt.
     ///
     /// `tick_and_handle()` owns scheduled secure-rejoin retries; do not also
     /// call `secure_rejoin()` in the same cycle or each failure would produce
     /// two over-the-air attempts. Fresh commissioning is started only when no
     /// durable secure-rejoin retry remains pending.
-    async fn service_unjoined(&mut self) {
-        if St::PRESENT
-            && self.elapsed_ms(self.last_status) >= self.policy.status.unjoined_blink_period_ms
-        {
-            self.last_status = self.mark();
-            // Double blink.
-            self.resources
-                .status
-                .set(SensorStatus::Joining { on: true });
-            self.resources
-                .wake
-                .delay_ms(self.policy.status.blink_on_ms)
-                .await;
-            self.resources
-                .status
-                .set(SensorStatus::Joining { on: false });
-            self.resources
-                .wake
-                .delay_ms(self.policy.status.blink_gap_ms)
-                .await;
-            self.resources
-                .status
-                .set(SensorStatus::Joining { on: true });
-            self.resources
-                .wake
-                .delay_ms(self.policy.status.blink_on_ms)
-                .await;
-            self.resources
-                .status
-                .set(SensorStatus::Joining { on: false });
-        }
+    async fn attempt_unjoined_commissioning(&mut self) {
+        self.rejoin_count = self.rejoin_count.wrapping_add(1);
+        self.resources
+            .diagnostics
+            .record(DiagnosticEvent::JoinRetry {
+                attempt: self.rejoin_count,
+            });
+        self.blink_join_attempt().await;
+        let had_secure_rejoin_pending = self.node.device().secure_rejoin_pending();
+        self.tick_and_handle(0).await;
 
-        if self.elapsed_ms(self.last_rejoin_attempt) >= self.policy.join_retry_ms {
-            self.rejoin_count = self.rejoin_count.wrapping_add(1);
-            self.last_rejoin_attempt = self.mark();
-            self.resources
-                .diagnostics
-                .record(DiagnosticEvent::JoinRetry {
-                    attempt: self.rejoin_count,
-                });
-            let had_secure_rejoin_pending = self.node.device().secure_rejoin_pending();
-            self.tick_and_handle(0).await;
+        let joined_now = if self.node.device().is_joined() {
+            true
+        } else if self.awaiting_button {
+            // The tick delivered an explicit leave; do not search.
+            false
+        } else if had_secure_rejoin_pending || self.node.device().secure_rejoin_pending() {
+            // The tick above either performed the scheduled secure
+            // rejoin, or its bounded-failure fallback already attempted
+            // the fresh join. Do not duplicate either operation in the
+            // same retry cycle.
+            false
+        } else {
+            self.join_or_resume_with_rejoin_tracking().await
+        };
+        self.finish_unjoined_attempt(joined_now);
+    }
 
-            let joined_now = if self.node.device().is_joined() {
-                true
-            } else if had_secure_rejoin_pending || self.node.device().secure_rejoin_pending() {
-                // The tick above either performed the scheduled secure
-                // rejoin, or its bounded-failure fallback already attempted
-                // the fresh join. Do not duplicate either operation in the
-                // same retry cycle.
-                false
-            } else {
-                self.join_or_resume_with_rejoin_tracking().await
-            };
-            if joined_now {
-                self.reset_post_join_state();
+    fn finish_unjoined_attempt(&mut self, joined_now: bool) {
+        if joined_now || self.node.device().is_joined() {
+            self.reset_post_join_state();
+        } else {
+            self.resources.status.set(SensorStatus::Off);
+            if !self.awaiting_button {
+                self.schedule_join_backoff();
             }
         }
     }
 
+    /// User-requested commissioning: leave the wait-for-button state, restart
+    /// the backoff at its initial delay, and try immediately.
     async fn join_from_button(&mut self) {
         self.resources
             .diagnostics
             .record(DiagnosticEvent::ButtonJoin);
-        if self.join_or_resume_with_rejoin_tracking().await {
-            self.reset_post_join_state();
-        }
+        self.awaiting_button = false;
+        self.reset_join_backoff();
+        self.blink_join_attempt().await;
+        let joined_now = self.join_or_resume_with_rejoin_tracking().await;
+        self.finish_unjoined_attempt(joined_now);
     }
 
     async fn force_report_from_button(&mut self) {
@@ -1003,34 +1144,44 @@ where
             .set(SensorStatus::Reporting { on: false });
     }
 
+    /// Next wait timeout, whether the joined fast-poll period is active, and
+    /// the sleep depth to request.
     #[inline(never)]
-    fn next_wait_ms(&self) -> (u32, bool) {
+    fn next_wait_ms(&mut self) -> (u32, bool, SleepDepth) {
         #[inline(always)]
         fn shorten(current_ms: u32, candidate_ms: u32) -> u32 {
             current_ms.min(candidate_ms.max(1))
         }
 
+        if !self.node.device().is_joined() {
+            // Unjoined: sleep at the steady-state depth between attempts,
+            // in bounded chunks whose measured time is accumulated.
+            let mut wait_ms = if self.awaiting_button {
+                policy::MAX_WAIT_MS
+            } else {
+                self.join_wait_ms.min(policy::MAX_WAIT_MS)
+            };
+            if let Some(watchdog_ms) = self.resources.supervisor.max_wait_ms() {
+                wait_ms = shorten(wait_ms, watchdog_ms);
+            }
+            return (wait_ms.max(1), false, self.policy.slow_sleep_depth);
+        }
+
         let now = self.mark();
-        let joined = self.node.device().is_joined();
         let identifying = self.node.device().is_identifying(self.endpoint);
         let ota_active = O::ENABLED && self.resources.ota.is_active(self.node.profile());
-        let fast_poll_elapsed_ms = W::elapsed_ms(now, self.fast_poll_started);
-        let timed_fast_poll = fast_poll_elapsed_ms < self.fast_poll_duration_ms;
-        let in_fast_poll = timed_fast_poll
-            || identifying
-            || ota_active
-            || self.node.device().has_pending_protocol_work();
+        let fast_poll_remaining_ms = self.fast_poll_remaining_ms();
+        let pending_protocol_work = self.node.device().has_pending_protocol_work();
+        let in_fast_poll =
+            fast_poll_remaining_ms.is_some() || identifying || ota_active || pending_protocol_work;
         let mut wait_ms = if in_fast_poll {
             self.policy.fast_poll_ms
         } else {
             self.policy.slow_poll_ms
         };
 
-        if timed_fast_poll {
-            wait_ms = shorten(
-                wait_ms,
-                policy::remaining_ms(fast_poll_elapsed_ms, self.fast_poll_duration_ms),
-            );
+        if let Some(remaining_ms) = fast_poll_remaining_ms {
+            wait_ms = shorten(wait_ms, remaining_ms);
         }
 
         if let Some((started, delay_ms)) = self.run_again {
@@ -1040,40 +1191,21 @@ where
             );
         }
 
-        if joined {
+        wait_ms = shorten(
+            wait_ms,
+            policy::remaining_ms(
+                W::elapsed_ms(now, self.last_report),
+                self.policy.sample_interval_ms,
+            ),
+        );
+        if self.annce_retries_left > 0 {
             wait_ms = shorten(
                 wait_ms,
                 policy::remaining_ms(
-                    W::elapsed_ms(now, self.last_report),
-                    self.policy.sample_interval_ms,
+                    W::elapsed_ms(now, self.last_annce),
+                    self.policy.announce_retry_ms,
                 ),
             );
-            if self.annce_retries_left > 0 {
-                wait_ms = shorten(
-                    wait_ms,
-                    policy::remaining_ms(
-                        W::elapsed_ms(now, self.last_annce),
-                        self.policy.announce_retry_ms,
-                    ),
-                );
-            }
-        } else {
-            wait_ms = shorten(
-                wait_ms,
-                policy::remaining_ms(
-                    W::elapsed_ms(now, self.last_rejoin_attempt),
-                    self.policy.join_retry_ms,
-                ),
-            );
-            if St::PRESENT {
-                wait_ms = shorten(
-                    wait_ms,
-                    policy::remaining_ms(
-                        W::elapsed_ms(now, self.last_status),
-                        self.policy.status.unjoined_blink_period_ms,
-                    ),
-                );
-            }
         }
 
         if O::ENABLED
@@ -1085,7 +1217,37 @@ where
             wait_ms = shorten(wait_ms, watchdog_ms);
         }
 
-        (wait_ms.max(1), in_fast_poll)
+        let sleep_depth = if ota_active || pending_protocol_work {
+            SleepDepth::Active
+        } else if in_fast_poll {
+            self.policy.fast_sleep_depth
+        } else {
+            self.policy.slow_sleep_depth
+        };
+        (wait_ms.max(1), in_fast_poll, sleep_depth)
+    }
+
+    /// Whether a wake should run the bounded MAC poll window.
+    ///
+    /// Timer and button wakes keep the original behavior. An `Activity` wake
+    /// means only that a platform skipped or shortened its sleep, so it polls
+    /// the parent only once the current poll interval has really elapsed;
+    /// otherwise every vetoed sleep would transmit an extra Data Request.
+    fn poll_due(&self, wake_reason: WakeReason, in_fast_poll: bool) -> bool {
+        match wake_reason {
+            WakeReason::Timer | WakeReason::Button => true,
+            WakeReason::Activity => match self.last_poll {
+                None => true,
+                Some(last_poll) => {
+                    let interval_ms = if in_fast_poll {
+                        self.policy.fast_poll_ms
+                    } else {
+                        self.policy.slow_poll_ms
+                    };
+                    self.elapsed_ms(last_poll) >= interval_ms
+                }
+            },
+        }
     }
 
     async fn handle_button_press(&mut self) {
@@ -1143,7 +1305,8 @@ where
                             .diagnostics
                             .record(DiagnosticEvent::ButtonLeave);
                         if self.factory_reset().await {
-                            self.resources.status.set(SensorStatus::Off);
+                            // Stay factory-new until the next press.
+                            self.enter_factory_new_after_leave();
                         }
                     } else {
                         self.join_from_button().await;
@@ -1172,10 +1335,15 @@ where
     }
 
     async fn step_initialized(&mut self) {
-        let (poll_ms, in_fast_poll) = self.next_wait_ms();
+        let joined = self.node.device().is_joined();
+        let (poll_ms, in_fast_poll, sleep_depth) = self.next_wait_ms();
 
         // Log transition from fast→slow poll.
-        if self.was_fast_polling && !in_fast_poll {
+        if !joined {
+            // Unjoined waits have no poll period; a later join restarts the
+            // fast-poll window explicitly.
+            self.was_fast_polling = false;
+        } else if self.was_fast_polling && !in_fast_poll {
             let cfg = self.node.remote_reporting_cluster_count();
             self.resources
                 .diagnostics
@@ -1194,19 +1362,7 @@ where
         }
 
         self.resources.supervisor.heartbeat();
-        let ota_active = O::ENABLED && self.resources.ota.is_active(self.node.profile());
-        let sleep_depth = if self.node.device().is_joined()
-            && !ota_active
-            && !self.node.device().has_pending_protocol_work()
-        {
-            if in_fast_poll {
-                self.policy.fast_sleep_depth
-            } else {
-                self.policy.slow_sleep_depth
-            }
-        } else {
-            SleepDepth::Active
-        };
+        let wait_started = self.mark();
         let wait_result = {
             let node = &mut self.node;
             let resources = &mut self.resources;
@@ -1227,14 +1383,22 @@ where
             Err(_) => self.wake_failure(),
         };
         self.resources.supervisor.heartbeat();
+        if !joined {
+            // Each unjoined wait is at most one chunk, so this measurement
+            // never spans a native counter rollover.
+            let waited_ms = self.elapsed_ms(wait_started);
+            self.join_wait_ms = self.join_wait_ms.saturating_sub(waited_ms);
+        }
 
-        match wake_reason {
-            WakeReason::Button => self.handle_button_press().await,
-            WakeReason::Timer | WakeReason::Activity => {}
+        let poll_due = self.poll_due(wake_reason, in_fast_poll);
+        if wake_reason == WakeReason::Button {
+            self.handle_button_press().await;
         }
 
         if self.node.device().is_joined() {
-            self.service_joined_polls().await;
+            if poll_due {
+                self.service_joined_polls().await;
+            }
             self.service_periodic_joined().await;
         } else {
             self.service_unjoined().await;

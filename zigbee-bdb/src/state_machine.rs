@@ -151,8 +151,12 @@ impl<M: MacDriver> BdbLayer<M> {
             test
         )))]
         let cap = CommissioningMode::STEERING;
+        // Advertise formation only when the radio can actually own a PAN:
+        // `network_formation_with_persistence` rejects a MAC without
+        // coordinator capability, so the capability bitmap must agree.
         #[cfg(any(not(feature = "end-device"), feature = "router"))]
-        if device_type == DeviceType::Coordinator {
+        if device_type == DeviceType::Coordinator && self.zdo.nwk().mac().capabilities().coordinator
+        {
             cap = cap.or(CommissioningMode::FORMATION);
         }
         #[cfg(any(feature = "finding-binding", test))]
@@ -189,7 +193,36 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Steering returns at network-up; when it arms the unique-TCLK exchange,
     /// the caller must drive [`crate::BdbLayer::advance_tclk_exchange`] before
     /// starting later commissioning methods.
+    ///
+    /// Formation needs a durable commit point; this entry point has none, so
+    /// a requested formation step fails with `PersistenceFailure`. Use
+    /// [`Self::commission_with_formation_persistence`] on a node that may
+    /// form a network.
     pub async fn commission(&mut self) -> Result<(), BdbStatus> {
+        self.commission_inner(
+            #[cfg(any(not(feature = "end-device"), feature = "router"))]
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::commission`] with a durable formed-network commit, so the
+    /// Network Formation step can actually run
+    /// (see [`Self::network_formation_with_persistence`]).
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
+    pub async fn commission_with_formation_persistence(
+        &mut self,
+        persistence: &mut dyn crate::formation::FormationPersistence,
+    ) -> Result<(), BdbStatus> {
+        self.commission_inner(Some(persistence)).await
+    }
+
+    async fn commission_inner(
+        &mut self,
+        #[cfg(any(not(feature = "end-device"), feature = "router"))] formation_persistence: Option<
+            &mut dyn crate::formation::FormationPersistence,
+        >,
+    ) -> Result<(), BdbStatus> {
         let mode = self.attributes.commissioning_mode;
         let cap = self.attributes.node_commissioning_capability;
         // Gate requested mode by the BDB Table 5 capability bitmap.
@@ -251,7 +284,11 @@ impl<M: MacDriver> BdbLayer<M> {
         #[cfg(any(not(feature = "end-device"), feature = "router"))]
         if effective.contains(CommissioningMode::FORMATION) {
             self.state = BdbState::NetworkFormation;
-            match self.network_formation().await {
+            let formed = match formation_persistence {
+                Some(persistence) => self.network_formation_with_persistence(persistence).await,
+                None => self.network_formation().await,
+            };
+            match formed {
                 Ok(()) => {
                     log::info!("[BDB] Network Formation succeeded");
                     any_success = true;
@@ -309,6 +346,9 @@ impl<M: MacDriver> BdbLayer<M> {
         // Step 2: Reset lower layers (NWK + MAC) — clears neighbor table,
         // security material, routing table, frame counters
         let _ = self.zdo.nlme_reset(false);
+        // No ZDO client transaction survives a factory reset: release every
+        // request-response slot (F&B, TCLK Node_Desc, application requests).
+        self.zdo.cancel_all_pending();
 
         // Step 3: Clear APS state — binding table, group table, key table
         self.zdo.aps_mut().binding_table_mut().clear();
@@ -325,8 +365,12 @@ impl<M: MacDriver> BdbLayer<M> {
 
     /// Leave the current network and immediately attempt to rejoin.
     ///
-    /// Useful for recovering from communication problems — performs
-    /// a clean leave followed by rejoin with the stored NWK key.
+    /// Useful for recovering from communication problems. The leave is sent
+    /// with the Rejoin flag so the NWK keeps the network identity and key;
+    /// the node then tries a secured rejoin, a Trust Center rejoin on a
+    /// centralized network and finally steering, preferring the last
+    /// operating channel without permanently narrowing
+    /// `bdbPrimaryChannelSet`.
     pub async fn leave_and_rejoin(&mut self) -> Result<(), BdbStatus> {
         if !self.attributes.node_is_on_a_network {
             return Err(BdbStatus::NotOnNetwork);
@@ -334,28 +378,27 @@ impl<M: MacDriver> BdbLayer<M> {
 
         log::info!("[BDB] Leave-and-rejoin…");
 
-        // Remember key material before leaving (leave clears NWK state)
         let channel = self.zdo.nwk().nib().logical_channel;
-        let _epid = self.zdo.nwk().nib().extended_pan_id;
 
-        // Leave (but keep BDB on-network flag so rejoin knows we had a network)
-        let _ = self.zdo.nwk_mut().nlme_leave(false).await;
+        // Leave with rejoin=true: a full leave would erase the network
+        // identity and key that the rejoin below depends on.
+        let _ = self.zdo.nwk_mut().nlme_leave(true).await;
 
-        // The device still considers itself "on a network" for rejoin purposes
-        // (node_is_on_a_network stays true so rejoin() works)
-
-        // Attempt rejoin on the last-known channel first
-        let result = self.rejoin().await;
-
-        if result.is_err() {
-            // Full rejoin failed — try steering from scratch
-            log::warn!("[BDB] Leave-and-rejoin: rejoin failed, trying full steering");
-            self.attributes.node_is_on_a_network = false;
-            // Restore last-known channel in primary set for targeted scan
-            self.attributes.primary_channel_set = zigbee_types::ChannelMask(1u32 << channel);
-            return self.network_steering().await;
+        // node_is_on_a_network stays true so the rejoin procedures run.
+        if self.rejoin_with_trust_center_fallback().await.is_ok() {
+            return Ok(());
         }
 
+        log::warn!("[BDB] Leave-and-rejoin: rejoin failed, trying full steering");
+        self.attributes.node_is_on_a_network = false;
+        self.state = BdbState::Idle;
+        // Prefer the last-known channel for this one steering attempt only.
+        let primary_channel_set = self.attributes.primary_channel_set;
+        if channel != 0 {
+            self.attributes.primary_channel_set = zigbee_types::ChannelMask(1u32 << channel);
+        }
+        let result = self.network_steering().await;
+        self.attributes.primary_channel_set = primary_channel_set;
         result
     }
 
@@ -364,20 +407,47 @@ impl<M: MacDriver> BdbLayer<M> {
     ///
     /// Call this when the device loses its parent or detects network loss.
     /// It performs:
-    /// 1. NWK discovery on the last-known channel
-    /// 2. NLME-JOIN with Rejoin method (uses stored NWK key)
+    /// 1. Secured rejoin (last channel first, then the BDB channel sets)
+    /// 2. On a centralized network whose parents were heard but refused the
+    ///    secured rejoin, a Trust Center rejoin
     /// 3. Device announce
     ///
-    /// Falls back to full steering if rejoin fails.
+    /// Falls back to full steering if both rejoin methods fail.
     pub async fn rejoin(&mut self) -> Result<(), BdbStatus> {
-        if self.rejoin_previous_network().await.is_ok() {
+        if self.rejoin_with_trust_center_fallback().await.is_ok() {
             return Ok(());
         }
 
-        log::warn!("[BDB] Secured rejoin failed — falling back to steering");
+        log::warn!("[BDB] Rejoin failed — falling back to steering");
         self.attributes.node_is_on_a_network = false;
         self.state = BdbState::Idle;
         self.network_steering().await
+    }
+
+    /// Secured rejoin, then (centralized security only) Trust Center rejoin.
+    async fn rejoin_with_trust_center_fallback(&mut self) -> Result<(), BdbStatus> {
+        let status = match self.rejoin_previous_network().await {
+            Ok(()) => return Ok(()),
+            Err(status) => status,
+        };
+        // A Trust Center rejoin only helps when the network was heard: the
+        // node may have missed a network-key update. With no beacons at all a
+        // second full scan would just double the outage.
+        if status == BdbStatus::NoScanResponse
+            || status == BdbStatus::NotOnNetwork
+            || self.attributes.node_join_link_key_type.is_distributed()
+        {
+            return Err(status);
+        }
+        log::warn!("[BDB] Secured rejoin failed — attempting Trust Center rejoin");
+        // The failed secured rejoin only rolled back the live joined flags;
+        // the stored network identity still authorizes the TC rejoin.
+        self.attributes.node_is_on_a_network = true;
+        self.trust_center_rejoin_previous_network().await?;
+        let nwk_addr = self.zdo.nwk().nib().network_address;
+        let ieee = self.zdo.nwk().nib().ieee_address;
+        let _ = self.zdo.device_annce(nwk_addr, ieee).await;
+        Ok(())
     }
 
     /// Rejoin only the previously commissioned network using the stored NWK
@@ -421,14 +491,18 @@ impl<M: MacDriver> BdbLayer<M> {
             .await
     }
 
-    async fn rejoin_previous_network_mode<F>(
+    /// Shared secured / Trust Center rejoin body.
+    ///
+    /// The replay-commit hook is taken as a trait object and the body is kept
+    /// out of line so every caller (volatile, persistent and Trust Center
+    /// rejoin) shares one copy of the scan/parent-selection state machine
+    /// instead of monomorphizing it per closure type.
+    #[inline(never)]
+    async fn rejoin_previous_network_mode(
         &mut self,
-        replay_commit: &mut F,
+        mut replay_commit: &mut dyn FnMut(zigbee_nwk::security::NwkReplayCounter) -> bool,
         trust_center_rejoin: bool,
-    ) -> Result<(), BdbStatus>
-    where
-        F: FnMut(zigbee_nwk::security::NwkReplayCounter) -> bool,
-    {
+    ) -> Result<(), BdbStatus> {
         if !self.attributes.node_is_on_a_network {
             return Err(BdbStatus::NotOnNetwork);
         }
@@ -444,15 +518,37 @@ impl<M: MacDriver> BdbLayer<M> {
         self.attributes.node_is_on_a_network = false;
         log::info!("[BDB] Attempting rejoin on previous network…");
 
-        let nib = self.zdo.nwk().nib();
-        let channel = nib.logical_channel;
-        let channel_mask = zigbee_types::ChannelMask(1u32 << channel);
+        let channel = self.zdo.nwk().nib().logical_channel;
+        // R22 §3.6.1.4.2 / BDB v3.0.1 §7.1: rejoin attempts alternate between
+        // the last operating channel and a widened scan of the BDB primary +
+        // secondary channel sets (every 2.4 GHz channel if both are empty),
+        // so a node that missed a channel change (Mgmt_NWK_Update / frequency
+        // agility) recovers on its next attempt without making every attempt
+        // pay for a full scan. Success returns to the last-channel first scan.
+        let last_channel = 1u32 << channel;
+        let channel_mask = zigbee_types::ChannelMask(if self.rejoin_scan_widened {
+            let all = zigbee_types::ChannelMask::ALL_2_4GHZ.0;
+            let sets = (self.attributes.primary_channel_set.0
+                | self.attributes.secondary_channel_set.0)
+                & all;
+            if sets == 0 { all } else { sets | last_channel }
+        } else {
+            last_channel
+        });
+        self.rejoin_scan_widened = !self.rejoin_scan_widened;
 
         self.zdo.nwk_mut().reset_rejoin_diagnostics();
-        let mut networks = match self.zdo.nlme_network_discovery(channel_mask, 3).await {
+        let mut networks = match self
+            .zdo
+            .nlme_network_discovery(channel_mask, self.attributes.scan_duration)
+            .await
+        {
             Ok(n) => n,
             Err(_) => {
-                log::warn!("[BDB] Rejoin: no networks found on channel {}", channel);
+                log::warn!(
+                    "[BDB] Rejoin: no networks found on mask 0x{:08X}",
+                    channel_mask.0
+                );
                 self.rollback_failed_rejoin(
                     crate::attributes::BdbCommissioningStatus::NoScanResponse,
                 );
@@ -466,9 +562,9 @@ impl<M: MacDriver> BdbLayer<M> {
         let suitable = self.zdo.nwk().select_rejoin_parents(&mut networks);
         if suitable == 0 {
             log::warn!(
-                "[BDB] Rejoin: {} beacon(s) on channel {}, none suitable as parent",
+                "[BDB] Rejoin: {} beacon(s) on mask 0x{:08X}, none suitable as parent",
                 networks.len(),
-                channel,
+                channel_mask.0,
             );
             self.rollback_failed_rejoin(crate::attributes::BdbCommissioningStatus::NoNetwork);
             return Err(BdbStatus::SteeringFailure);
@@ -487,20 +583,21 @@ impl<M: MacDriver> BdbLayer<M> {
 
             let rejoin = if trust_center_rejoin {
                 self.zdo
-                    .nlme_trust_center_rejoin_with_replay_commit(network, replay_commit)
+                    .nlme_trust_center_rejoin_with_replay_commit(network, &mut replay_commit)
                     .await
             } else {
                 self.zdo
-                    .nlme_rejoin_with_replay_commit(network, replay_commit)
+                    .nlme_rejoin_with_replay_commit(network, &mut replay_commit)
                     .await
             };
             match rejoin {
                 Ok(nwk_addr) => {
                     if trust_center_rejoin {
-                        // The old network key may be stale. Keep the APS link
-                        // key, but remove live NWK material so an unsecured
-                        // Transport-Key is treated as authorization rather
-                        // than as an unauthenticated key update.
+                        // The old network key may be stale. Keep the APS
+                        // link key, but remove live NWK material so an
+                        // unsecured Transport-Key is treated as
+                        // authorization rather than as an unauthenticated
+                        // key update.
                         let nwk = self.zdo.aps_mut().nwk_mut();
                         nwk.security_mut().clear_network_keys();
                         nwk.nib_mut().security_enabled = false;
@@ -515,12 +612,13 @@ impl<M: MacDriver> BdbLayer<M> {
                             return Err(BdbStatus::SteeringFailure);
                         }
                         // Keep the persisted Table 6 regime authoritative.
-                        // A rejoin may use a later generated unique TCLK, for
-                        // which Table 6 has no separate value.
+                        // A rejoin may use a later generated unique TCLK,
+                        // for which Table 6 has no separate value.
                         let _ = self.zdo.aps_mut().take_network_key_join_method();
                     }
 
                     log::info!("[BDB] Rejoin successful as 0x{:04X}", nwk_addr.0);
+                    self.rejoin_scan_widened = false;
                     self.attributes.node_is_on_a_network = true;
                     self.attributes.commissioning_status =
                         crate::attributes::BdbCommissioningStatus::Success;
@@ -537,7 +635,7 @@ impl<M: MacDriver> BdbLayer<M> {
             }
         }
 
-        log::warn!("[BDB] Previous network did not accept secured rejoin");
+        log::warn!("[BDB] Previous network did not accept rejoin");
         self.rollback_failed_rejoin(crate::attributes::BdbCommissioningStatus::NoNetwork);
         Err(BdbStatus::SteeringFailure)
     }
@@ -730,5 +828,63 @@ mod tests {
             crate::attributes::BdbCommissioningStatus::NoNetwork
         );
         assert_eq!(bdb.state(), &BdbState::Idle);
+    }
+
+    #[cfg(feature = "centralized-tclk")]
+    #[test]
+    fn rejoin_widens_the_scan_when_the_network_moved_channel() {
+        // The network moved from channel 15 to channel 20 while the node was
+        // away. The first, last-channel attempt hears nothing...
+        let mut bdb = restored_bdb(false);
+        let mut moved = rejoin_beacon();
+        moved.channel = 20;
+        bdb.zdo_mut().nwk_mut().mac_mut().add_beacon(moved);
+        assert_eq!(
+            block_on(bdb.trust_center_rejoin_previous_network()),
+            Err(BdbStatus::NoScanResponse)
+        );
+        assert!(bdb.zdo().nwk().mac().tx_history().is_empty());
+
+        // ...so the next attempt widens the scan to the BDB channel sets.
+        bdb.attributes_mut().node_is_on_a_network = true;
+        bdb.zdo_mut()
+            .nwk_mut()
+            .mac_mut()
+            .enqueue_rx(McpsDataIndication {
+                src_address: MacAddress::Short(PAN_ID, ShortAddress::COORDINATOR),
+                dst_address: MacAddress::Short(PAN_ID, OLD_ADDRESS),
+                lqi: 250,
+                payload: unsecured_rejoin_response(),
+                security_use: false,
+            });
+
+        // The rejoin request reached the parent on the new channel; only the
+        // (absent) Transport-Key makes this attempt fail.
+        assert_eq!(
+            block_on(bdb.trust_center_rejoin_previous_network()),
+            Err(BdbStatus::SteeringFailure)
+        );
+        assert!(!bdb.zdo().nwk().mac().tx_history().is_empty());
+        assert_eq!(bdb.zdo().nwk().nib().logical_channel, 20);
+    }
+
+    #[test]
+    fn leave_and_rejoin_does_not_permanently_narrow_the_primary_channel_set() {
+        let mut bdb = restored_bdb(false);
+        let primary = bdb.attributes().primary_channel_set;
+
+        assert!(block_on(bdb.leave_and_rejoin()).is_err());
+        assert_eq!(bdb.attributes().primary_channel_set, primary);
+        assert!(!bdb.is_on_network());
+    }
+
+    #[test]
+    fn factory_reset_releases_every_zdo_client_slot() {
+        let mut bdb = restored_bdb(false);
+        assert!(block_on(bdb.zdo_mut().start_node_desc_req(ShortAddress::COORDINATOR)).is_ok());
+        assert_eq!(bdb.zdo().pending_count(), 1);
+
+        assert_eq!(block_on(bdb.factory_reset()), Ok(()));
+        assert_eq!(bdb.zdo().pending_count(), 0);
     }
 }

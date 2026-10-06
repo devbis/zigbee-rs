@@ -39,6 +39,13 @@ pub enum GroupAction {
     None,
 }
 
+/// Group IDs outside 0x0001..=0xFFF7 are invalid (ZCL r8 §3.6.2.3) and are
+/// answered with INVALID_VALUE.
+#[inline]
+pub fn valid_group_id(group_id: u16) -> bool {
+    (0x0001..=0xFFF7).contains(&group_id)
+}
+
 /// Groups cluster implementation.
 pub struct GroupsCluster {
     store: AttributeStore<4>,
@@ -60,11 +67,11 @@ impl GroupsCluster {
         let _ = store.register(
             AttributeDefinition {
                 id: ATTR_NAME_SUPPORT,
-                data_type: ZclDataType::U8,
+                data_type: ZclDataType::Bitmap8,
                 access: AttributeAccess::ReadOnly,
                 name: "NameSupport",
             },
-            ZclValue::U8(0x00), // Group names not supported
+            ZclValue::Bitmap8(0x00), // Group names not supported
         );
         Self {
             store,
@@ -74,6 +81,10 @@ impl GroupsCluster {
     }
 
     fn add_group(&mut self, group_id: u16) -> u8 {
+        if !valid_group_id(group_id) {
+            self.last_action = GroupAction::None;
+            return ZclStatus::InvalidValue as u8;
+        }
         if self.groups.contains(&group_id) {
             self.last_action = GroupAction::None;
             return 0x8A; // DUPLICATE_EXISTS
@@ -93,6 +104,9 @@ impl GroupsCluster {
     /// Add a group externally (called by runtime for AddGroupIfIdentifying).
     /// Does not trigger GroupAction — caller is responsible for APS table sync.
     pub fn add_group_external(&mut self, group_id: u16) -> u8 {
+        if !valid_group_id(group_id) {
+            return ZclStatus::InvalidValue as u8;
+        }
         if self.groups.contains(&group_id) {
             return 0x8A; // DUPLICATE_EXISTS
         }
@@ -103,6 +117,10 @@ impl GroupsCluster {
     }
 
     fn remove_group(&mut self, group_id: u16) -> u8 {
+        if !valid_group_id(group_id) {
+            self.last_action = GroupAction::None;
+            return ZclStatus::InvalidValue as u8;
+        }
         if let Some(pos) = self.groups.iter().position(|&g| g == group_id) {
             self.groups.swap_remove(pos);
             self.last_action = GroupAction::Removed(group_id);
@@ -148,7 +166,9 @@ impl Cluster for GroupsCluster {
                     return Err(ZclStatus::MalformedCommand);
                 }
                 let group_id = u16::from_le_bytes([payload[0], payload[1]]);
-                let status = if self.groups.contains(&group_id) {
+                let status = if !valid_group_id(group_id) {
+                    ZclStatus::InvalidValue as u8
+                } else if self.groups.contains(&group_id) {
                     ZclStatus::Success as u8
                 } else {
                     ZclStatus::NotFound as u8
@@ -250,4 +270,40 @@ impl Cluster for GroupsCluster {
     /// group table, which a Basic cluster reset MUST NOT touch (that is the
     /// job of the full BDB factory-reset procedure). Deliberate no-op.
     fn reset_to_factory_defaults(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_ids_outside_valid_range_are_invalid_value() {
+        let mut g = GroupsCluster::new();
+        for gid in [0x0000u16, 0xFFF8, 0xFFFF] {
+            let p = gid.to_le_bytes();
+            for cmd in [CMD_ADD_GROUP, CMD_VIEW_GROUP, CMD_REMOVE_GROUP] {
+                let rsp = g.handle_command(cmd, &p).unwrap();
+                assert_eq!(rsp[0], ZclStatus::InvalidValue as u8, "{cmd:?} {gid:#x}");
+            }
+            assert!(matches!(g.take_action(), GroupAction::None));
+            assert_eq!(g.add_group_external(gid), ZclStatus::InvalidValue as u8);
+        }
+        for gid in [0x0001u16, 0xFFF7] {
+            let rsp = g.handle_command(CMD_ADD_GROUP, &gid.to_le_bytes()).unwrap();
+            assert_eq!(rsp[0], ZclStatus::Success as u8);
+        }
+    }
+
+    #[test]
+    fn name_support_is_a_bitmap8() {
+        let g = GroupsCluster::new();
+        assert_eq!(
+            g.attributes().find(ATTR_NAME_SUPPORT).unwrap().data_type,
+            ZclDataType::Bitmap8
+        );
+        assert_eq!(
+            g.attributes().get(ATTR_NAME_SUPPORT),
+            Some(&ZclValue::Bitmap8(0))
+        );
+    }
 }

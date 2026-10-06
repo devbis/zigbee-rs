@@ -62,80 +62,15 @@ measure final artifacts, but exceeding a former budget does not fail the
 build. Physical Flash/RAM limits, protected partitions, OTA-slot bounds,
 stack reserves, and linker/layout checks remain mandatory.
 
-Baseline snapshot: **2026-09-06**, with TLSR8258 parent-router measurements
-refreshed **2026-09-07** and EFR32MG1/ESP32-C6/H2 refreshed **2026-09-08**.
-The parent router and ESP32-C6 failed the regression budgets enforced at those
-snapshots; EFR32MG1 and ESP32-H2 passed their build/layout gates. Those former
-budgets are now historical comparisons, not live blockers. PHY62x2 occupied-XIP
-measurements were refreshed **2026-09-15**: PHY6222 fits, while PHY6252 still
-fails the physical limit. These are not exact-image hardware reruns. Prior
-hardware evidence is called out separately below. Margins against former
-budgets are not physical headroom.
+Recorded image sizes, physical limits, and RAM/stack snapshots are kept in a
+single place: the book's
+[Firmware Size](docs/book/src/advanced/firmware-size.md) page. CI firmware
+jobs also upload `*.size.json` measurements with their artifacts (PHY62x2 is
+measured by its layout check instead); those describe the exact commit that
+was built, whereas the book's tables are dated snapshots.
 
-| image | measured bytes | physical limit / former regression budget | margin vs reference | measured artifact |
-|---|---:|---:|---:|---|
-| PHY6222 sensor | 130,752 | 130,816 hard XIP | 64 | occupied XIP span |
-| PHY6252 feature-selected sensor | 130,912 | 130,816 hard XIP | -96 | failed-link occupied XIP span |
-| BL702 sensor | 189,442 | 192,512 regression | 3,070 | raw linked `.bin` |
-| nRF52840 sensor, default | 224,472 | 225,280 regression | 808 | raw `.bin` |
-| nRF52840 sensor, BME280 | 231,792 | 245,760 regression | 13,968 | raw `.bin` |
-| nRF52840 sensor, SHT31 | 228,216 | 241,664 regression | 13,448 | raw `.bin` |
-| nRF52840 always-on End Device | 210,072 | 253,952 regression | 43,880 | raw `.bin` |
-| nRF52840 UF2 ProMicro | 222,968 | 237,568 regression | 14,600 | linked image before UF2 |
-| nRF52840 UF2 MDK | 222,848 | 237,568 regression | 14,720 | linked image before UF2 |
-| nRF52840 UF2 PCA10059 | 224,536 | 237,568 regression | 13,032 | linked image before UF2 |
-| nRF52840 UF2 DK | 224,552 | 237,568 regression | 13,016 | linked image before UF2 |
-| nRF52833 sensor, default | 224,464 | 225,280 regression | 816 | raw `.bin` |
-| nRF52833 sensor, BME280 | 231,784 | 245,760 regression | 13,976 | raw `.bin` |
-| nRF52833 sensor, SHT31 | 228,208 | 241,664 regression | 13,456 | raw `.bin` |
-| EFR32MG1 sensor | 163,236 | 167,936 regression | 4,700 | raw `.bin` |
-| EFR32MG21 sensor | 202,820 | 212,992 regression | 10,172 | raw `.bin` |
-| CC2340R5 sensor, pinned SDK | 223,536 | 225,280 regression | 1,744 | raw `.bin` |
-| ESP32-C6 sensor | 369,248 | 368,640 regression | -608 | application image; above former budget |
-| ESP32-H2 sensor | 354,096 | 356,352 regression | 2,256 | application image |
-| TLSR8258 sensor, default SUSPEND | 290,616 | 294,912 regression | 4,296 | raw `.bin` |
-| TLSR8258 sensor, LOW32K 250 ms | 295,548 | 299,008 regression | 3,460 | raw `.bin` |
-| TLSR8258 sensor, LOW32K 10 s | 295,552 | 299,008 regression | 3,456 | raw `.bin` |
-| TLSR8258 parent router | 433,756 | 430,080 regression | -3,676 | raw `.bin`; above former budget |
-
-Additional exact packaging and physical limits:
-
-- PHY6252's feature-selected failed link is 96 B over the mandatory 130,816 B
-  XIP slot. No current executable/package is qualified; its hardware path
-  remains unverified.
-- BL702's packaged boot image is 197,648 B. The packager/device physical slot
-  is 1,044,480 B; the product still independently protects its
-  `0x000FE000..0x00100000` security journal and linked XIP limit.
-- EFR32MG1's prior Zigbee OTA container is 162,538 B and assumes the resident
-  Gecko bootloader; it has not been regenerated for the current image.
-- EFR32MG21 has no OTA packaging path.
-- CC2340R5's physical application slot is 516,096 B.
-- ESP32-C6/H2 merged flash images are 434,784 B and 419,632 B respectively.
-  The prior 368,098 B C6 and 352,994 B H2 Zigbee OTA containers
-  have not been regenerated for the current applications. Each OTA slot is
-  2,031,616 B.
-- TLSR8258's physical application boundary is 458,752 B (`0x70000`).
-
-### Static RAM snapshot
-
-Exact RAM/layout measurements recorded with this snapshot:
-
-| image | `.data` | `.bss` | static total | available/linked stack |
-|---|---:|---:|---:|---:|
-| PHY6222 / PHY6252 | 652 | 4,288 | 4,940 | 54,384 |
-| EFR32MG1 | 260 | 14,720 | 14,980 | 16,760 |
-| EFR32MG21 | 308 | 18,280 | 18,588 | 46,944 |
-| CC2340R5 | 16 | 4,756 | 4,772 | — |
-| ESP32-C6 | 3,008 | 50,344 | 53,352 | — |
-| ESP32-H2 | 2,652 | 50,272 | 52,924 | — |
-| TLSR8258 LOW32K fresh-root SVC stack | — | — | — | 8,448 |
-
-ESP32-H2 initialized data includes 84 B in `.data.wifi`.
-EFR32MG1's application still has exactly `0x7C00` bytes of usable SRAM. Its
-available stack is 376 B above the 16 KiB gate. The TLSR8258 retained
-fresh-root SVC stack is 256 B above its 8 KiB gate. Static-section numbers are
-not runtime high-water proof; use each target's linker/layout checker and
-hardware watermark where available.
+Both PHY62x2 variants fit their mandatory 130,816 B XIP slot (see
+[PHY6222 / PHY6252](#phy6222--phy6252)).
 
 ## nRF52840 and nRF52833
 
@@ -225,8 +160,11 @@ has since been removed; physical OTA and other validation checks remain.
 ## BL702 XT-ZB1
 
 ```bash
+python3 -m pip install --require-hashes --no-deps \
+  -r tools/bl702-image-tool/build-requirements.txt
+python3 -m pip install --require-hashes --no-deps --no-build-isolation \
+  -r tools/bl702-image-tool/requirements.txt
 cd examples/bl702-sensor
-python3 -m pip install bflb-mcu-tool==1.10.0 pyserial
 ./build-image.sh
 ```
 
@@ -285,16 +223,18 @@ The physical application slot remains 516,096 B.
 cd examples/phy6222-sensor
 cargo +nightly-2026-08-01 build --release --locked
 
-# This PHY6252 feature build currently fails the physical XIP limit.
+# PHY6252 feature build; same physical XIP gate.
 cargo +nightly-2026-08-01 build --release --locked \
   --no-default-features --features phy6252
 ```
 
-The default PHY6222 occupied XIP span is 130,752 B against the hard 130,816 B
-gate, leaving 64 B. The exact PHY6252 feature build has a failed-link span of
-130,912 B, exceeding the same physical gate by 96 B; it produces no validated
-executable/package. These limits remain mandatory after removal of artificial
-regression budgets. Neither measurement is hardware proof.
+The default PHY6222 occupied XIP span is 128,640 B against the hard 130,816 B
+gate, leaving 2,176 B. The PHY6252 feature build occupies 128,576 B, leaving
+2,240 B under the same physical gate. Release builds from
+`examples/phy6222-sensor` use the `immediate-abort` panic strategy (configured
+in its `.cargo/config.toml`): panics trap into the halting `HardFault` handler.
+These limits remain mandatory after removal of artificial regression budgets.
+Neither measurement is hardware proof.
 
 Package the default PHY6222 image exactly as CI does:
 

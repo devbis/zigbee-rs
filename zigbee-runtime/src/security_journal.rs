@@ -27,6 +27,11 @@
 //! snapshot first and the security-state record last, so a power cut cannot
 //! activate a partial generation.
 //!
+//! Every generation number is written once. If a marginal commit nevertheless
+//! leaves two committed records with the same generation, the scan resolves
+//! them deterministically and never lowers an outgoing-counter reservation
+//! (see `resolve_duplicate_generation`).
+//!
 //! The default 4 KiB logical sector has 32 slots and can represent all 112
 //! replay domains of a router build, but a completely populated snapshot uses
 //! 28 replay slots plus one state slot. Only three slots (12 frame commits)
@@ -179,10 +184,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
     }
 
     pub fn storage_mut(&mut self) -> &mut S {
-        self.cached = None;
-        self.cached_replay.clear();
-        self.replay_generation = None;
-        self.scanned = false;
+        self.invalidate();
         &mut self.storage
     }
 
@@ -307,20 +309,77 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
                 let Some((generation, state)) = Self::decode_record(&record) else {
                     continue;
                 };
-                let replace = match newest {
-                    Some(current) => generation > current.generation,
-                    None => true,
+                let candidate = LocatedState {
+                    generation,
+                    sector,
+                    state,
                 };
-                if replace {
-                    newest = Some(LocatedState {
-                        generation,
-                        sector,
-                        state,
-                    });
+                match &mut newest {
+                    None => newest = Some(candidate),
+                    Some(current) if generation > current.generation => *current = candidate,
+                    Some(current) if generation == current.generation => {
+                        Self::resolve_duplicate_generation(current, &candidate)
+                    }
+                    Some(_) => {}
                 }
             }
         }
         Ok(newest)
+    }
+
+    /// Choose between two committed records that carry the same generation.
+    ///
+    /// The writer assigns every generation exactly once, so a duplicate only
+    /// appears after a marginal commit write that failed verification, was
+    /// retried under the same generation and later read back as committed.
+    /// The journal cannot tell which copy the runtime acted on, so:
+    ///
+    /// * the result is independent of scan order: the copy with the larger
+    ///   `(global_counter_limit, tclk_counter_limit)` reservation wins, then
+    ///   the later physical position (sector, then slot), and
+    /// * the outgoing-counter reservations never move backwards: the chosen
+    ///   copy's global (and, for the same TCLK, TCLK) limits are raised to
+    ///   the larger of the two, because either reservation may have been
+    ///   used for transmission.
+    ///
+    /// Reporting `Corrupt` instead would also block `store()`, so a factory
+    /// reset could no longer write a fresh record and the device would need
+    /// an external flash erase to recover.
+    ///
+    /// `first` (the earlier physical position) is updated in place to the
+    /// chosen copy; `second` is the later one.
+    fn resolve_duplicate_generation(first: &mut LocatedState, second: &LocatedState) {
+        if first.state == second.state {
+            return;
+        }
+        let rank = |located: &LocatedState| {
+            (
+                located.state.global_counter_limit,
+                located.state.tclk_counter_limit,
+            )
+        };
+        // Both merges are symmetric, so compute them before choosing.
+        let global_counter_limit = first
+            .state
+            .global_counter_limit
+            .max(second.state.global_counter_limit);
+        let same_tclk = first.state.tclk_present
+            && second.state.tclk_present
+            && first.state.trust_center_address == second.state.trust_center_address
+            && first.state.trust_center_link_key == second.state.trust_center_link_key;
+        let tclk_counter_limit = first
+            .state
+            .tclk_counter_limit
+            .max(second.state.tclk_counter_limit);
+        // The scan visits sector 0 before sector 1 and lower slots first, so
+        // `second` is always the later physical position.
+        if rank(first) <= rank(second) {
+            *first = *second;
+        }
+        first.state.global_counter_limit = global_counter_limit;
+        if same_tclk {
+            first.state.tclk_counter_limit = tclk_counter_limit;
+        }
     }
 
     fn current(&mut self) -> Result<Option<LocatedState>, SecurityStoreError> {
@@ -499,7 +558,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
 
     fn scan_replay(
         &mut self,
-        located: LocatedState,
+        sector: usize,
+        generation: u32,
     ) -> Result<
         heapless::Vec<PersistentReplayCounter, MAX_PERSISTENT_REPLAY_COUNTERS>,
         SecurityStoreError,
@@ -507,8 +567,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         let mut replay = heapless::Vec::new();
         let mut record = [0u8; SECURITY_JOURNAL_SLOT_SIZE];
         for slot in 0..Self::SLOTS_PER_SECTOR {
-            self.read_slot(located.sector, slot, &mut record)?;
-            if Self::replay_header_generation(&record) != Some(located.generation) {
+            self.read_slot(sector, slot, &mut record)?;
+            if Self::replay_header_generation(&record) != Some(generation) {
                 continue;
             }
             for index in 0..REPLAY_ENTRIES_PER_SLOT {
@@ -525,12 +585,20 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         Ok(replay)
     }
 
-    fn ensure_replay_cache(&mut self, located: LocatedState) -> Result<(), SecurityStoreError> {
+    fn ensure_replay_cache(&mut self, located: &LocatedState) -> Result<(), SecurityStoreError> {
         if self.replay_generation != Some(located.generation) {
-            self.cached_replay = self.scan_replay(located)?;
+            self.cached_replay = self.scan_replay(located.sector, located.generation)?;
             self.replay_generation = Some(located.generation);
         }
         Ok(())
+    }
+
+    /// Forget every cached view so the next access rescans the flash.
+    fn invalidate(&mut self) {
+        self.cached = None;
+        self.cached_replay.clear();
+        self.replay_generation = None;
+        self.scanned = false;
     }
 
     fn slot_is_erased(&mut self, sector: usize, slot: usize) -> Result<bool, SecurityStoreError> {
@@ -651,17 +719,72 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
         self.write_record(sector, state_slot, generation, state)
     }
 
+    /// Write `state` and the complete `replay` snapshot as `generation`.
+    ///
+    /// The new generation goes into an erased run of the current sector when
+    /// one is large enough, otherwise (or when `rollover` forces it) into the
+    /// freshly erased other sector. On success the caches describe the new
+    /// generation and `replay` is moved into the replay cache; on failure every
+    /// cache is dropped so the next access rescans the flash.
+    #[inline(never)]
+    fn commit_generation(
+        &mut self,
+        current_sector: Option<usize>,
+        rollover: bool,
+        generation: u32,
+        state: &PersistentSecurityState,
+        replay: &mut heapless::Vec<PersistentReplayCounter, MAX_PERSISTENT_REPLAY_COUNTERS>,
+    ) -> Result<(), SecurityStoreError> {
+        let needed = 1 + Self::replay_snapshot_slots(replay.len());
+        if needed > Self::SLOTS_PER_SECTOR {
+            return Err(SecurityStoreError::Full);
+        }
+        let (target, state_slot, erase) = match current_sector {
+            Some(sector) => match if rollover {
+                None
+            } else {
+                self.find_erased_run(sector, needed)?
+            } {
+                Some(slot) => (sector, slot, false),
+                None => (1 - sector, 0, true),
+            },
+            None => (0, 0, true),
+        };
+        let sector = self.sectors[target];
+        let result = (|| {
+            if erase {
+                self.storage
+                    .erase(sector, sector + SECTOR_SIZE as u32)
+                    .map_err(|_| SecurityStoreError::Hardware)?;
+            }
+            self.activate_generation(target, state_slot, generation, state, replay)
+        })();
+        if result.is_ok() {
+            self.cached = Some(LocatedState {
+                generation,
+                sector: target,
+                state: *state,
+            });
+            self.cached_replay = core::mem::take(replay);
+            self.replay_generation = Some(generation);
+        } else {
+            self.invalidate();
+        }
+        result
+    }
+
     fn find_replay_append_position(
         &mut self,
-        located: LocatedState,
+        sector: usize,
+        generation: u32,
     ) -> Result<Option<(usize, usize, bool)>, SecurityStoreError> {
         let mut record = [0u8; SECURITY_JOURNAL_SLOT_SIZE];
         for slot in 0..Self::SLOTS_PER_SECTOR {
-            self.read_slot(located.sector, slot, &mut record)?;
+            self.read_slot(sector, slot, &mut record)?;
             if record.iter().all(|byte| *byte == 0xFF) {
                 return Ok(Some((slot, 0, true)));
             }
-            if Self::replay_header_generation(&record) != Some(located.generation) {
+            if Self::replay_header_generation(&record) != Some(generation) {
                 continue;
             }
             for index in 0..REPLAY_ENTRIES_PER_SLOT {
@@ -743,45 +866,16 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
             && located.state.extended_pan_id == state.extended_pan_id
             && located.state.ieee_address == state.ieee_address
         {
-            self.ensure_replay_cache(located)?;
+            self.ensure_replay_cache(&located)?;
             replay = self.cached_replay.clone();
         }
-        let needed = 1 + Self::replay_snapshot_slots(replay.len());
-        if needed > Self::SLOTS_PER_SECTOR {
-            return Err(SecurityStoreError::Full);
-        }
-
-        let (target, state_slot, erase) = match current {
-            Some(located) => match self.find_erased_run(located.sector, needed)? {
-                Some(slot) => (located.sector, slot, false),
-                None => (1 - located.sector, 0, true),
-            },
-            None => (0, 0, true),
-        };
-        let sector = self.sectors[target];
-        let result = (|| {
-            if erase {
-                self.storage
-                    .erase(sector, sector + SECTOR_SIZE as u32)
-                    .map_err(|_| SecurityStoreError::Hardware)?;
-            }
-            self.activate_generation(target, state_slot, generation, state, &replay)
-        })();
-        if result.is_ok() {
-            self.cached = Some(LocatedState {
-                generation,
-                sector: target,
-                state: *state,
-            });
-            self.cached_replay = replay;
-            self.replay_generation = Some(generation);
-        } else {
-            self.cached = None;
-            self.cached_replay.clear();
-            self.replay_generation = None;
-            self.scanned = false;
-        }
-        result
+        self.commit_generation(
+            current.map(|located| located.sector),
+            false,
+            generation,
+            state,
+            &mut replay,
+        )
     }
 
     fn visit_replay_counters(
@@ -791,7 +885,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
         let Some(located) = self.current()? else {
             return Ok(());
         };
-        self.ensure_replay_cache(located)?;
+        self.ensure_replay_cache(&located)?;
         for replay in self.cached_replay.iter().copied() {
             visitor(replay);
         }
@@ -808,7 +902,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
         if !located.state.commissioned {
             return Err(SecurityStoreError::Corrupt);
         }
-        self.ensure_replay_cache(located)?;
+        self.ensure_replay_cache(&located)?;
         if self
             .cached_replay
             .iter()
@@ -818,7 +912,9 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
             return Ok(());
         }
 
-        if let Some((slot, index, initialize)) = self.find_replay_append_position(located)? {
+        if let Some((slot, index, initialize)) =
+            self.find_replay_append_position(located.sector, located.generation)?
+        {
             let result = (|| {
                 if initialize {
                     self.write_replay_header(located.sector, slot, located.generation)?;
@@ -840,34 +936,13 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
             .ok_or(SecurityStoreError::GenerationExhausted)?;
         let mut compacted = self.cached_replay.clone();
         Self::merge_replay(&mut compacted, replay)?;
-        let needed = 1 + Self::replay_snapshot_slots(compacted.len());
-        if needed > Self::SLOTS_PER_SECTOR {
-            return Err(SecurityStoreError::Full);
-        }
-        let target = 1 - located.sector;
-        let sector = self.sectors[target];
-        let result = self
-            .storage
-            .erase(sector, sector + SECTOR_SIZE as u32)
-            .map_err(|_| SecurityStoreError::Hardware)
-            .and_then(|()| {
-                self.activate_generation(target, 0, generation, &located.state, &compacted)
-            });
-        if result.is_ok() {
-            self.cached = Some(LocatedState {
-                generation,
-                sector: target,
-                state: located.state,
-            });
-            self.cached_replay = compacted;
-            self.replay_generation = Some(generation);
-        } else {
-            self.cached = None;
-            self.cached_replay.clear();
-            self.replay_generation = None;
-            self.scanned = false;
-        }
-        result
+        self.commit_generation(
+            Some(located.sector),
+            true,
+            generation,
+            &located.state,
+            &mut compacted,
+        )
     }
 
     fn tombstone_replay_counters(
@@ -877,7 +952,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
         let Some(located) = self.current()? else {
             return Ok(());
         };
-        self.ensure_replay_cache(located)?;
+        self.ensure_replay_cache(&located)?;
         let mut compacted = self.cached_replay.clone();
         let previous_len = compacted.len();
         compacted.retain(|replay| !replay.matches_tombstone(tombstone));
@@ -889,38 +964,13 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
             .generation
             .checked_add(1)
             .ok_or(SecurityStoreError::GenerationExhausted)?;
-        let needed = 1 + Self::replay_snapshot_slots(compacted.len());
-        if needed > Self::SLOTS_PER_SECTOR {
-            return Err(SecurityStoreError::Full);
-        }
-        let (target, state_slot, erase) = match self.find_erased_run(located.sector, needed)? {
-            Some(slot) => (located.sector, slot, false),
-            None => (1 - located.sector, 0, true),
-        };
-        let sector = self.sectors[target];
-        let result = (|| {
-            if erase {
-                self.storage
-                    .erase(sector, sector + SECTOR_SIZE as u32)
-                    .map_err(|_| SecurityStoreError::Hardware)?;
-            }
-            self.activate_generation(target, state_slot, generation, &located.state, &compacted)
-        })();
-        if result.is_ok() {
-            self.cached = Some(LocatedState {
-                generation,
-                sector: target,
-                state: located.state,
-            });
-            self.cached_replay = compacted;
-            self.replay_generation = Some(generation);
-        } else {
-            self.cached = None;
-            self.cached_replay.clear();
-            self.replay_generation = None;
-            self.scanned = false;
-        }
-        result
+        self.commit_generation(
+            Some(located.sector),
+            false,
+            generation,
+            &located.state,
+            &mut compacted,
+        )
     }
 
     fn retain_replay_counters(
@@ -930,7 +980,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
         let Some(located) = self.current()? else {
             return Ok(0);
         };
-        self.ensure_replay_cache(located)?;
+        self.ensure_replay_cache(&located)?;
         let mut compacted = self.cached_replay.clone();
         let previous_len = compacted.len();
         compacted.retain(|replay| retain(*replay));
@@ -943,38 +993,14 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
             .generation
             .checked_add(1)
             .ok_or(SecurityStoreError::GenerationExhausted)?;
-        let needed = 1 + Self::replay_snapshot_slots(compacted.len());
-        if needed > Self::SLOTS_PER_SECTOR {
-            return Err(SecurityStoreError::Full);
-        }
-        let (target, state_slot, erase) = match self.find_erased_run(located.sector, needed)? {
-            Some(slot) => (located.sector, slot, false),
-            None => (1 - located.sector, 0, true),
-        };
-        let sector = self.sectors[target];
-        let result = (|| {
-            if erase {
-                self.storage
-                    .erase(sector, sector + SECTOR_SIZE as u32)
-                    .map_err(|_| SecurityStoreError::Hardware)?;
-            }
-            self.activate_generation(target, state_slot, generation, &located.state, &compacted)
-        })();
-        if result.is_ok() {
-            self.cached = Some(LocatedState {
-                generation,
-                sector: target,
-                state: located.state,
-            });
-            self.cached_replay = compacted;
-            self.replay_generation = Some(generation);
-        } else {
-            self.cached = None;
-            self.cached_replay.clear();
-            self.replay_generation = None;
-            self.scanned = false;
-        }
-        result.map(|()| removed)
+        self.commit_generation(
+            Some(located.sector),
+            false,
+            generation,
+            &located.state,
+            &mut compacted,
+        )
+        .map(|()| removed)
     }
 }
 
@@ -1614,6 +1640,76 @@ mod tests {
         journal.store(&state(0x400)).unwrap();
         journal.store(&state(0x800)).unwrap();
         assert_eq!(journal.load().unwrap().unwrap().global_counter_limit, 0x800);
+    }
+
+    /// Two committed copies of one generation, one per sector, as left by a
+    /// marginal commit that was retried under the same generation.
+    fn duplicate_generation_journal(
+        sector0: &PersistentSecurityState,
+        sector1: &PersistentSecurityState,
+    ) -> SecurityStateJournal<MockFlash> {
+        let mut journal =
+            SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
+        journal.store(sector0).unwrap();
+        journal.write_record(1, 0, 0, sector1).unwrap();
+        journal.storage_mut();
+        journal
+    }
+
+    #[test]
+    fn duplicate_generations_resolve_deterministically_without_lowering_counters() {
+        let mut high_global = commissioned_state();
+        high_global.global_counter_limit = 0x800;
+        high_global.tclk_counter_limit = 0x100;
+        high_global.parent_address = 0x1111;
+        let mut high_tclk = commissioned_state();
+        high_tclk.global_counter_limit = 0x400;
+        high_tclk.tclk_counter_limit = 0x900;
+        high_tclk.parent_address = 0x2222;
+
+        let mut expected = high_global;
+        expected.tclk_counter_limit = 0x900;
+        for (sector0, sector1) in [(&high_global, &high_tclk), (&high_tclk, &high_global)] {
+            let mut journal = duplicate_generation_journal(sector0, sector1);
+            assert_eq!(
+                journal.load(),
+                Ok(Some(expected)),
+                "the larger global reservation must win in either physical order, \
+                 keeping the larger TCLK reservation for the same link key"
+            );
+        }
+
+        // A different TCLK keeps its own reservation.
+        let mut other_tclk = high_tclk;
+        other_tclk.trust_center_link_key = [9; 16];
+        let mut journal = duplicate_generation_journal(&other_tclk, &high_global);
+        let mut expected = high_global;
+        expected.tclk_counter_limit = 0x100;
+        assert_eq!(journal.load(), Ok(Some(expected)));
+
+        // Equal reservations: the later physical copy wins, independent of content.
+        let mut later = high_global;
+        later.parent_address = 0x3333;
+        let mut journal = duplicate_generation_journal(&high_global, &later);
+        assert_eq!(journal.load(), Ok(Some(later)));
+    }
+
+    #[test]
+    fn duplicate_generation_is_superseded_by_the_next_store() {
+        let mut first = commissioned_state();
+        first.global_counter_limit = 0x800;
+        let mut second = commissioned_state();
+        second.global_counter_limit = 0x400;
+        second.parent_address = 0x2222;
+        let mut journal = duplicate_generation_journal(&first, &second);
+        let resolved = journal.load().unwrap().unwrap();
+        assert_eq!(resolved, first);
+
+        let mut next = resolved;
+        next.global_counter_limit = 0xC00;
+        journal.store(&next).unwrap();
+        journal.storage_mut();
+        assert_eq!(journal.load(), Ok(Some(next)));
     }
 
     #[test]

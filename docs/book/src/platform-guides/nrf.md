@@ -111,6 +111,11 @@ AlwaysOnEndDeviceApp::new(node, policy, parts)?;
 indirect delivery, or advertise Router/Link Status behavior. It is therefore
 a receiver-on, always-on End Device.
 
+Button 1 is product-mapped in `nrf52840_router_product::button`: a short
+press calls `request_commissioning()` (the only automatic-search trigger,
+besides a power cycle, after a Leave without rejoin), and a three-second hold
+commits the journal-aware factory reset.
+
 This composition uses Embassy's pinned-nightly static task allocation. The
 compiler emits storage for the actual main future; it no longer tries to
 allocate that future from the insufficient default 4 KiB arena. The linker

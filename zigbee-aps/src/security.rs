@@ -360,7 +360,20 @@ pub struct ApsSecurity {
     /// mistaken for production provisioning.
     distributed_security_link_key: Option<AesKey>,
     /// Aggregate replay state for the two global commissioning keys.
+    ///
+    /// One floor per global key regardless of sender (finding F15, kept by
+    /// design): per-sender floors would let attacker-chosen IEEE addresses
+    /// exhaust the table or evict the Trust Center's floor. The accepted
+    /// cost is that a *second* legitimate sender under the same global key
+    /// (or a Trust Center whose APS counter restarted, e.g. after its own
+    /// factory reset) is rejected until its counter passes the floor. The
+    /// floor is dropped by [`Self::clear_keys`] (leave / factory reset) and
+    /// whenever the global key value changes.
     global_replay_table: heapless::Vec<ApsReplayCounter, MAX_ACTIVE_GLOBAL_REPLAY_DOMAINS>,
+    /// Key-pair entries whose key was replaced by [`Self::add_key`] while
+    /// carrying a committed incoming floor: that floor was established under
+    /// the previous key and no frame has yet been verified with the new one.
+    stale_incoming_floors: heapless::Vec<(IeeeAddress, ApsKeyType), MAX_KEY_TABLE_ENTRIES>,
 }
 
 impl ApsSecurity {
@@ -370,7 +383,61 @@ impl ApsSecurity {
             default_tc_link_key: DEFAULT_TC_LINK_KEY,
             distributed_security_link_key: None,
             global_replay_table: heapless::Vec::new(),
+            stale_incoming_floors: heapless::Vec::new(),
         }
+    }
+
+    fn set_stale_incoming_floor(
+        &mut self,
+        partner: &IeeeAddress,
+        key_type: ApsKeyType,
+        stale: bool,
+    ) {
+        match (self.stale_floor_index(partner, key_type), stale) {
+            (None, true) => {
+                // Capacity equals the key table, so this cannot overflow.
+                let _ = self.stale_incoming_floors.push((*partner, key_type));
+            }
+            (Some(index), false) => {
+                self.stale_incoming_floors.swap_remove(index);
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the committed incoming replay floor of this key-pair entry was
+    /// established under a previous key value (the key was replaced and no
+    /// frame has been verified with the new key since).
+    pub fn incoming_floor_predates_key(&self, partner: &IeeeAddress, key_type: ApsKeyType) -> bool {
+        self.stale_floor_index(partner, key_type).is_some()
+    }
+
+    #[inline(never)]
+    fn stale_floor_index(&self, partner: &IeeeAddress, key_type: ApsKeyType) -> Option<usize> {
+        self.stale_incoming_floors
+            .iter()
+            .position(|(address, kind)| address == partner && *kind == key_type)
+    }
+
+    /// Reset the incoming replay floor of a key-pair entry only if it belongs
+    /// to a previous key value. A floor committed under the current key is
+    /// never lowered: that would re-admit already-seen frames (R22 §4.4.1.2).
+    /// Returns whether the floor was reset.
+    pub fn reset_stale_incoming_floor(
+        &mut self,
+        partner: &IeeeAddress,
+        key_type: ApsKeyType,
+    ) -> bool {
+        if !self.incoming_floor_predates_key(partner, key_type) {
+            return false;
+        }
+        self.set_stale_incoming_floor(partner, key_type, false);
+        if let Some(entry) = self.find_key_mut(partner, key_type) {
+            entry.incoming_frame_counter = 0;
+            entry.incoming_frame_counter_valid = false;
+            return true;
+        }
+        false
     }
 
     /// Set the default Trust Center link key.
@@ -441,16 +508,20 @@ impl ApsSecurity {
     /// Add a link key to the key table. Returns Err if table is full.
     pub fn add_key(&mut self, entry: ApsLinkKeyEntry) -> Result<(), ApsLinkKeyEntry> {
         // Update existing entry for same partner
-        if let Some(existing) = self
-            .key_table
-            .iter_mut()
-            .find(|e| e.partner_address == entry.partner_address && e.key_type == entry.key_type)
-        {
+        if let Some(existing) = self.find_key_mut(&entry.partner_address, entry.key_type) {
+            let key_changed = existing.key != entry.key;
             existing.key = entry.key;
             existing.outgoing_frame_counter = entry.outgoing_frame_counter;
             existing.outgoing_frame_counter_limit = entry.outgoing_frame_counter_limit;
             existing.incoming_frame_counter = entry.incoming_frame_counter;
             existing.incoming_frame_counter_valid = entry.incoming_frame_counter_valid;
+            if key_changed {
+                self.set_stale_incoming_floor(
+                    &entry.partner_address,
+                    entry.key_type,
+                    entry.incoming_frame_counter_valid,
+                );
+            }
             return Ok(());
         }
         self.key_table.push(entry)?;
@@ -459,29 +530,59 @@ impl ApsSecurity {
 
     /// Remove a link key by partner address and key type.
     pub fn remove_key(&mut self, partner: &IeeeAddress, key_type: ApsKeyType) -> bool {
-        if let Some(idx) = self
-            .key_table
-            .iter()
-            .position(|e| e.partner_address == *partner && e.key_type == key_type)
-        {
-            self.key_table.swap_remove(idx);
+        if let Some(idx) = self.key_index(partner, key_type) {
+            self.wipe_and_remove_key_slot(idx);
+            self.set_stale_incoming_floor(partner, key_type, false);
             true
         } else {
             false
         }
     }
 
+    /// Remove the entry at `index` without leaving its key — or a stale copy
+    /// of any other key — in a released slot: the entry is swapped (both
+    /// slots rewritten) to the tail, wiped there in place, then popped.
+    fn wipe_and_remove_key_slot(&mut self, index: usize) {
+        let last = self.key_table.len() - 1;
+        self.key_table.swap(index, last);
+        zigbee_crypto::zeroize_key(&mut self.key_table[last].key);
+        if let Some(mut removed) = self.key_table.pop() {
+            zigbee_crypto::zeroize_key(&mut removed.key);
+        }
+    }
+
     /// Remove all negotiated link keys while retaining the configured default
-    /// Trust Center key.
+    /// Trust Center key. Key material is wiped before the slots are released.
     pub fn clear_keys(&mut self) {
+        for entry in self.key_table.iter_mut() {
+            zigbee_crypto::zeroize_key(&mut entry.key);
+        }
         self.key_table.clear();
         self.global_replay_table.clear();
+        self.stale_incoming_floors.clear();
     }
 
     /// Remove application link keys while retaining Trust Center link keys.
     pub fn clear_application_link_keys(&mut self) {
+        let mut index = 0;
+        while index < self.key_table.len() {
+            if self.key_table[index].key_type == ApsKeyType::ApplicationLinkKey {
+                self.wipe_and_remove_key_slot(index);
+            } else {
+                index += 1;
+            }
+        }
+        self.stale_incoming_floors
+            .retain(|(_, kind)| *kind != ApsKeyType::ApplicationLinkKey);
+    }
+
+    /// Index of the key-pair entry for `(partner, key_type)`. Every key-table
+    /// lookup goes through this one out-of-line search.
+    #[inline(never)]
+    fn key_index(&self, partner: &IeeeAddress, key_type: ApsKeyType) -> Option<usize> {
         self.key_table
-            .retain(|entry| entry.key_type != ApsKeyType::ApplicationLinkKey);
+            .iter()
+            .position(|e| e.partner_address == *partner && e.key_type == key_type)
     }
 
     /// Find a link key for a partner device.
@@ -490,9 +591,8 @@ impl ApsSecurity {
         partner: &IeeeAddress,
         key_type: ApsKeyType,
     ) -> Option<&ApsLinkKeyEntry> {
-        self.key_table
-            .iter()
-            .find(|e| e.partner_address == *partner && e.key_type == key_type)
+        let index = self.key_index(partner, key_type)?;
+        self.key_table.get(index)
     }
 
     /// Find a mutable link-key entry for a partner device.
@@ -501,9 +601,8 @@ impl ApsSecurity {
         partner: &IeeeAddress,
         key_type: ApsKeyType,
     ) -> Option<&mut ApsLinkKeyEntry> {
-        self.key_table
-            .iter_mut()
-            .find(|e| e.partner_address == *partner && e.key_type == key_type)
+        let index = self.key_index(partner, key_type)?;
+        self.key_table.get_mut(index)
     }
 
     /// Find any link key for a partner device (TC link key preferred).
@@ -576,11 +675,7 @@ impl ApsSecurity {
         key_type: ApsKeyType,
         counter: u32,
     ) -> bool {
-        if let Some(entry) = self
-            .key_table
-            .iter()
-            .find(|e| e.partner_address == *partner && e.key_type == key_type)
-        {
+        if let Some(entry) = self.find_key(partner, key_type) {
             !entry.incoming_frame_counter_valid || counter > entry.incoming_frame_counter
         } else {
             // Unknown partner — allow with default TC link key (first contact)
@@ -597,13 +692,13 @@ impl ApsSecurity {
         counter: u32,
     ) {
         if let Some(entry) = self
-            .key_table
-            .iter_mut()
-            .find(|e| e.partner_address == *partner && e.key_type == key_type)
+            .find_key_mut(partner, key_type)
             .filter(|e| !e.incoming_frame_counter_valid || counter > e.incoming_frame_counter)
         {
             entry.incoming_frame_counter = counter;
             entry.incoming_frame_counter_valid = true;
+            // The floor is now established under the current key.
+            self.set_stale_incoming_floor(partner, key_type, false);
         }
     }
 
@@ -705,11 +800,7 @@ impl ApsSecurity {
         partner: &IeeeAddress,
         key_type: ApsKeyType,
     ) -> Option<u32> {
-        if let Some(entry) = self
-            .key_table
-            .iter_mut()
-            .find(|e| e.partner_address == *partner && e.key_type == key_type)
-        {
+        if let Some(entry) = self.find_key_mut(partner, key_type) {
             if entry.outgoing_frame_counter >= entry.outgoing_frame_counter_limit {
                 log::error!("[APS] Link-key frame counter reservation exhausted");
                 return None;
@@ -845,6 +936,95 @@ impl Default for ApsSecurity {
 #[cfg(test)]
 mod ccm_tests {
     use super::*;
+
+    fn link_key_entry(partner: u8, key: u8, key_type: ApsKeyType) -> ApsLinkKeyEntry {
+        ApsLinkKeyEntry {
+            partner_address: [partner; 8],
+            key: [key; 16],
+            key_type,
+            outgoing_frame_counter: 0,
+            outgoing_frame_counter_limit: 0x100,
+            incoming_frame_counter: 0,
+            incoming_frame_counter_valid: false,
+        }
+    }
+
+    /// Key bytes of the first `slots` (previously initialised) table slots,
+    /// including slots past `len()` that removal released.
+    fn raw_slot_keys(security: &ApsSecurity, slots: usize) -> heapless::Vec<AesKey, 4> {
+        let base = security.key_table.as_ptr();
+        (0..slots)
+            .map(|index| {
+                // SAFETY: every inspected slot lies within the inline buffer
+                // and was fully initialised by an earlier `add_key`.
+                unsafe { core::ptr::read(core::ptr::addr_of!((*base.add(index)).key)) }
+            })
+            .collect()
+    }
+
+    /// Finding F14: removing, clearing or swap-removing link keys wipes the
+    /// key material instead of leaving it in released table slots.
+    #[test]
+    fn removed_link_keys_do_not_linger_in_released_slots() {
+        let mut security = ApsSecurity::new();
+        security
+            .add_key(link_key_entry(1, 0xA1, ApsKeyType::TrustCenterLinkKey))
+            .unwrap();
+        security
+            .add_key(link_key_entry(2, 0xA2, ApsKeyType::ApplicationLinkKey))
+            .unwrap();
+        security
+            .add_key(link_key_entry(3, 0xA3, ApsKeyType::TrustCenterLinkKey))
+            .unwrap();
+
+        // swap_remove of the first entry moves entry 3 into slot 0.
+        assert!(security.remove_key(&[1; 8], ApsKeyType::TrustCenterLinkKey));
+        assert!(
+            !raw_slot_keys(&security, 3).contains(&[0xA1; 16]),
+            "the removed key must be wiped"
+        );
+
+        security.clear_application_link_keys();
+        assert!(!raw_slot_keys(&security, 3).contains(&[0xA2; 16]));
+        assert!(
+            security
+                .find_key(&[3; 8], ApsKeyType::TrustCenterLinkKey)
+                .is_some()
+        );
+
+        security.clear_keys();
+        assert!(!raw_slot_keys(&security, 3).contains(&[0xA3; 16]));
+    }
+
+    /// Finding F9: replacing a key value that carries a committed floor marks
+    /// the floor stale; verifying a frame under the new key, or re-adding the
+    /// same key value, does not.
+    #[test]
+    fn replay_floor_is_stale_only_after_a_key_value_change() {
+        let mut security = ApsSecurity::new();
+        let partner = [7; 8];
+        let mut entry = link_key_entry(7, 0x11, ApsKeyType::TrustCenterLinkKey);
+        entry.incoming_frame_counter = 50;
+        entry.incoming_frame_counter_valid = true;
+        security.add_key(entry.clone()).unwrap();
+        security.add_key(entry.clone()).unwrap();
+        assert!(!security.incoming_floor_predates_key(&partner, ApsKeyType::TrustCenterLinkKey));
+        assert!(!security.reset_stale_incoming_floor(&partner, ApsKeyType::TrustCenterLinkKey));
+
+        entry.key = [0x22; 16];
+        security.add_key(entry).unwrap();
+        assert!(security.incoming_floor_predates_key(&partner, ApsKeyType::TrustCenterLinkKey));
+        security.commit_frame_counter(&partner, ApsKeyType::TrustCenterLinkKey, 51);
+        assert!(!security.incoming_floor_predates_key(&partner, ApsKeyType::TrustCenterLinkKey));
+        assert!(!security.reset_stale_incoming_floor(&partner, ApsKeyType::TrustCenterLinkKey));
+        assert_eq!(
+            security
+                .find_key(&partner, ApsKeyType::TrustCenterLinkKey)
+                .unwrap()
+                .incoming_frame_counter,
+            51
+        );
+    }
 
     #[test]
     fn aps_security_builds_the_expected_nonce() {
@@ -1028,13 +1208,24 @@ fn hmac_mmo_with<P: ForwardAesProvider>(
     inner_input[..16].copy_from_slice(&ipad_key);
     let inner_len = 16 + message.len();
     inner_input[16..inner_len].copy_from_slice(message);
-    let inner_hash = aes_mmo_hash_with(provider, &inner_input[..inner_len]).ok()?;
+    let inner_hash = aes_mmo_hash_with(provider, &inner_input[..inner_len]).ok();
+    zigbee_crypto::zeroize(&mut inner_input);
+    zigbee_crypto::zeroize_key(&mut ipad_key);
+    let Some(mut inner_hash) = inner_hash else {
+        zigbee_crypto::zeroize_key(&mut opad_key);
+        return None;
+    };
 
     // Outer hash: Hash(opad_key || inner_hash)
     let mut outer_input = [0u8; 32];
     outer_input[..16].copy_from_slice(&opad_key);
     outer_input[16..32].copy_from_slice(&inner_hash);
-    aes_mmo_hash_with(provider, &outer_input).ok()
+    let result = aes_mmo_hash_with(provider, &outer_input).ok();
+    // The pads and the inner hash are key-equivalent; wipe the stack copies.
+    zigbee_crypto::zeroize(&mut outer_input);
+    zigbee_crypto::zeroize_key(&mut opad_key);
+    zigbee_crypto::zeroize_key(&mut inner_hash);
+    result
 }
 
 /// Derive Key-Transport Key from TC link key (Zigbee spec §4.5.3.4).

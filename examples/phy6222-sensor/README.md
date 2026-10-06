@@ -50,9 +50,9 @@ cargo +nightly-2026-08-01 build --release --locked \
   --no-default-features --features phy6252
 ```
 
-The PHY6252 feature-selected build currently fails the physical XIP gate by
-96 bytes; it does not produce a validated image. Selecting the feature prevents
-the known out-of-range 512 KiB NV addresses, but hardware remains unverified.
+The PHY6252 feature-selected build passes the same physical XIP gate.
+Selecting the feature prevents the known out-of-range 512 KiB NV addresses,
+but hardware remains unverified.
 
 Both PHY62x2 product variants select centralized Trust Center commissioning.
 They do not provision a distributed-security key, so distributed commissioning
@@ -118,20 +118,24 @@ Occupied-XIP measurements with `nightly-2026-08-01` on macOS:
 
 | feature image | occupied XIP span | hard gate | result |
 |---|---:|---:|---:|
-| PHY6222 (default) | 130,752 | 130,816 | 64 bytes free |
-| PHY6252 (`--no-default-features --features phy6252`) | 130,912 | 130,816 | 96 bytes over |
+| PHY6222 (default) | 128,640 | 130,816 | 2,176 bytes free |
+| PHY6252 (`--no-default-features --features phy6252`) | 128,576 | 130,816 | 2,240 bytes free |
 
 The PHY target configuration enables linker identical-code folding
-(`--icf=all`) for identical monomorphized functions. With unchanged compiler,
-features, software AES, and linker boundaries, the default occupied span falls
-from 132,416 to 130,752 bytes. SRAM placement and size are unchanged. Folded
-functions can share addresses; function-address uniqueness is not an identity
-contract. The layout check still requires the flash-operation path in SRAM.
+(`--icf=all`) for identical monomorphized functions. Folded functions can share
+addresses; function-address uniqueness is not an identity contract. The layout
+check still requires the flash-operation path in SRAM.
 
-The default measurement is from the linked ELF and passes the layout, AES, and
-role checks. The PHY6252 measurement is from the failed link map; folding reduces
-its previous 1,760-byte overflow but does not make that feature image fit. These
-local measurements do not establish Linux CI or hardware qualification.
+Release builds from this directory use the nightly `immediate-abort` panic
+strategy (`.cargo/config.toml`). Each panic site is one `udf` trap into the
+cortex-m-rt default `HardFault` handler, which halts like `panic-halt` but also
+stops lower-priority interrupts; the faulting PC identifies the site. This
+removes 3,328 bytes of panic arguments and `Location` records. SRAM placement
+and size are unchanged.
+
+Both measurements are from linked ELFs that pass the layout, AES, and role
+checks. These local measurements do not establish Linux CI or hardware
+qualification.
 
 The packaged PHY6 file includes loader metadata and is not the gate metric. No
 AON sleep current or battery-life value is claimed.

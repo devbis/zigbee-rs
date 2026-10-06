@@ -54,13 +54,17 @@ impl<T: RadioInstance, R: RngInstance> RadioPhy for NrfRadioPhy<'_, T, R> {
 
         let mut packet = Packet::new();
         packet.copy_from_slice(frame);
-        self.radio.try_send(&mut packet).await.map_err(|error| {
-            if error == RadioError::ChannelInUse {
-                PhyError::ChannelBusy
-            } else {
-                Self::map_radio_error(error)
-            }
-        })
+        // Cancel-safe: dropping this future mid-TX stops the radio before the
+        // stack-owned packet buffer goes away.
+        super::send_packet_cancel_safe(&mut self.radio, &mut packet)
+            .await
+            .map_err(|error| {
+                if error == RadioError::ChannelInUse {
+                    PhyError::ChannelBusy
+                } else {
+                    Self::map_radio_error(error)
+                }
+            })
     }
 
     async fn send_ack(&mut self, _sequence: u8, _frame_pending: bool) -> Result<(), PhyError> {

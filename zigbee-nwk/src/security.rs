@@ -83,6 +83,14 @@ impl NwkSecurityHeader {
     /// Per Zigbee PRO R22 §4.5.1.1: extended nonce SHALL be set to 1.
     pub const ZIGBEE_DEFAULT: u8 = 0x05 | (0x01 << 3) | (1 << 5); // 0x2D
 
+    /// `true` when the over-the-air security control names the network key
+    /// (key identifier 1) with the extended nonce, i.e. the only NWK-layer
+    /// form R22 §4.3.1.2 / §4.5.1.1 allows. The security level bits are
+    /// ignored because they are zeroed on the air (§4.3.1.1 step 6).
+    pub fn uses_network_key_with_extended_nonce(&self) -> bool {
+        self.security_control & !0x07 == Self::ZIGBEE_DEFAULT & !0x07
+    }
+
     pub fn parse(data: &[u8]) -> Option<(Self, usize)> {
         if data.len() < NWK_AUX_HEADER_LEN {
             return None;
@@ -395,26 +403,21 @@ impl NwkSecurity {
     }
 
     /// Check an incoming counter in the replay domain of one network key.
+    ///
+    /// A source without an entry is always admissible: when the table is
+    /// full, the verified commit evicts the least-recently-updated entry (see
+    /// [`Self::commit_frame_counter_for_key_protecting`]) rather than locking
+    /// every new neighbour out for the lifetime of the key.
     pub fn check_frame_counter_for_key(
         &self,
         source: &IeeeAddress,
         key_sequence: u8,
         counter: u32,
     ) -> bool {
-        if let Some(entry) = self
-            .frame_counter_table
+        self.frame_counter_table
             .iter()
             .find(|e| e.source == *source && e.key_sequence == key_sequence)
-        {
-            counter > entry.counter
-        } else {
-            // First frame from this source — accept if table has room
-            if self.frame_counter_table.is_full() {
-                log::warn!("[NWK] Replay table full — rejecting frame from new source");
-                return false;
-            }
-            true
-        }
+            .is_none_or(|entry| counter > entry.counter)
     }
 
     /// Commit frame counter after successful MIC verification.
@@ -431,22 +434,62 @@ impl NwkSecurity {
         key_sequence: u8,
         counter: u32,
     ) {
-        if let Some(entry) = self
-            .frame_counter_table
-            .iter_mut()
-            .find(|e| e.source == *source && e.key_sequence == key_sequence)
+        self.commit_frame_counter_for_key_protecting(source, key_sequence, counter, &|_| false);
+    }
+
+    /// Commit a verified counter, evicting a stale entry when the table is
+    /// full.
+    ///
+    /// The table is kept in least-recently-updated order: every commit moves
+    /// its entry to the back. Eviction takes the front-most entry whose source
+    /// `protect` does not claim (the NWK layer protects its parent and
+    /// children), falling back to the overall least-recently-updated entry.
+    ///
+    /// Replay implications: entries are created only here, i.e. after MIC
+    /// verification, so only holders of the network key can churn the table;
+    /// unauthenticated frames can never evict anything. NWK security is
+    /// hop-by-hop, so sources are one-hop neighbours. An evicted neighbour's
+    /// next frame re-creates its entry at that counter, so frames it sent
+    /// before the eviction could be replayed in that window. Choosing the
+    /// least-recently-heard, non-parent/non-child source keeps this window
+    /// on the least active link instead of refusing every new neighbour for
+    /// the life of the key, which the previous reject-when-full policy did.
+    pub fn commit_frame_counter_for_key_protecting(
+        &mut self,
+        source: &IeeeAddress,
+        key_sequence: u8,
+        counter: u32,
+        protect: &dyn Fn(&IeeeAddress) -> bool,
+    ) {
+        let table = &mut self.frame_counter_table;
+        let mut entry = FrameCounterEntry {
+            source: *source,
+            key_sequence,
+            counter,
+        };
+        let from = match table
+            .iter()
+            .position(|e| e.source == *source && e.key_sequence == key_sequence)
         {
-            if counter > entry.counter {
-                entry.counter = counter;
+            Some(index) => {
+                entry.counter = entry.counter.max(table[index].counter);
+                index
             }
-        } else {
-            // New source — add to table (already checked not full in check_frame_counter)
-            let _ = self.frame_counter_table.push(FrameCounterEntry {
-                source: *source,
-                key_sequence,
-                counter,
-            });
+            None if table.is_full() => {
+                log::warn!("[NWK] Replay table full — evicting least recently heard source");
+                table.iter().position(|e| !protect(&e.source)).unwrap_or(0)
+            }
+            None => {
+                let _ = table.push(entry);
+                return;
+            }
+        };
+        // Move the refreshed (or replacing) entry to the most-recent end.
+        let last = table.len() - 1;
+        for index in from..last {
+            table[index] = table[index + 1].clone();
         }
+        table[last] = entry;
     }
 
     /// Restore a durable replay floor only when the installed key still
@@ -813,6 +856,39 @@ mod tests {
         security.commit_frame_counter_for_key(&source, 2, 1);
         assert!(!security.check_frame_counter_for_key(&source, 2, 1));
         assert!(!security.check_frame_counter_for_key(&source, 1, 100));
+    }
+
+    #[test]
+    fn a_full_replay_table_evicts_the_least_recently_heard_unprotected_source() {
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        let source = |i: usize| [i as u8 + 1; 8];
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES {
+            security.commit_frame_counter_for_key(&source(i), 1, 100);
+        }
+        // Source 0 (the parent) and source 1 are heard again, so source 2 is
+        // the least recently heard; the parent is also protected.
+        security.commit_frame_counter_for_key(&source(1), 1, 101);
+        let parent = source(0);
+
+        // A new neighbour is admitted rather than locked out forever.
+        let newcomer = [0xF0; 8];
+        assert!(security.check_frame_counter_for_key(&newcomer, 1, 5));
+        security.commit_frame_counter_for_key_protecting(&newcomer, 1, 5, &|s| *s == parent);
+
+        assert!(!security.check_frame_counter_for_key(&newcomer, 1, 5));
+        // The parent kept its floor although it is now the oldest entry.
+        assert!(!security.check_frame_counter_for_key(&parent, 1, 100));
+        assert!(!security.check_frame_counter_for_key(&source(1), 1, 101));
+        // Source 2 was evicted: its replay floor is gone.
+        assert!(security.check_frame_counter_for_key(&source(2), 1, 1));
+        for i in 3..MAX_FRAME_COUNTER_ENTRIES {
+            assert!(!security.check_frame_counter_for_key(&source(i), 1, 100));
+        }
+
+        // Without protection the oldest entry (the parent) goes first.
+        security.commit_frame_counter_for_key(&[0xF1; 8], 1, 1);
+        assert!(security.check_frame_counter_for_key(&parent, 1, 1));
     }
 
     #[test]

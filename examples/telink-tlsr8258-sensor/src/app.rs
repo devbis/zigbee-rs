@@ -1,8 +1,8 @@
 //! TLSR8258 composition of the shared sleepy-sensor lifecycle.
 
-use core::mem::MaybeUninit;
 #[cfg(feature = "retention-proof")]
 use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 
 use sensor_sed_app::{NoOta, SensorApp, SensorSedParts};
 use zigbee_mac::telink::TelinkMac;
@@ -12,12 +12,12 @@ use zigbee_runtime::profile::ApplicationProfile;
 use zigbee_zcl::clusters::basic::PowerSource;
 
 use tlsr8258_tb04::{leds::StatusLeds, resources::BoardResources};
+#[cfg(not(feature = "retention-proof"))]
+use tlsr8258_tb04_product::sensor::TelinkSuspendWake;
 use tlsr8258_tb04_product::sensor::{
     DATE_CODE, MANUFACTURER, MODEL, SENSOR_POLICY, SW_BUILD, SensorRgbStatus, SyntheticEnvironment,
     TelinkNoDiagnostics, TelinkSupervisor, USER_ACTIONS, fixed_battery, sensor_profile,
 };
-#[cfg(not(feature = "retention-proof"))]
-use tlsr8258_tb04_product::sensor::TelinkSuspendWake;
 #[cfg(feature = "retention-proof")]
 use tlsr8258_tb04_product::sensor::{
     RetainedSensorApp, TelinkRetentionWake, fail_closed_retention_reset,
@@ -336,7 +336,12 @@ fn commit_retained_app_header() {
 
 #[cfg(feature = "retention-proof")]
 fn retained_app_valid() -> bool {
-    let header = unsafe { &*TELINK_RETAINED_APP_HEADER.0.get().cast::<RetainedAppHeader>() };
+    let header = unsafe {
+        &*TELINK_RETAINED_APP_HEADER
+            .0
+            .get()
+            .cast::<RetainedAppHeader>()
+    };
     header.valid() && stack_guard_is_intact()
 }
 
@@ -401,9 +406,9 @@ pub fn cold_run() -> ! {
     let (security_partition, _child_partition, _aps_partition) =
         tlsr8258_tb04_product::storage::split_flash(resources.flash);
     let security_store = unsafe {
-        TELINK_RETAINED_SECURITY_STORAGE.initialize(
-            tlsr8258_tb04_product::storage::security_store(security_partition),
-        )
+        TELINK_RETAINED_SECURITY_STORAGE.initialize(tlsr8258_tb04_product::storage::security_store(
+            security_partition,
+        ))
     };
     if device
         .reset_security_state_if_identity_changed(security_store, ieee_address)

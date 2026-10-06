@@ -41,9 +41,20 @@ pub struct PowerManager {
     mode: PowerMode,
     last_activity_ms: u32,
     last_poll_ms: u32,
+    /// Consecutive polls the parent did not acknowledge. While non-zero the
+    /// next poll is due after a bounded exponential back-off instead of the
+    /// full poll interval (see [`PowerManager::record_failed_poll`]).
+    failed_polls: u8,
     pending_tx: bool,
     pending_reports: bool,
 }
+
+/// First retry delay after a poll the parent did not acknowledge.
+pub const FAILED_POLL_RETRY_BASE_MS: u32 = 1_000;
+/// Largest back-off exponent: the retry delay doubles per consecutive failure
+/// up to `FAILED_POLL_RETRY_BASE_MS << FAILED_POLL_MAX_SHIFT` and never
+/// exceeds the configured poll interval.
+const FAILED_POLL_MAX_SHIFT: u8 = 5;
 
 impl PowerManager {
     pub fn new(mode: PowerMode) -> Self {
@@ -51,6 +62,7 @@ impl PowerManager {
             mode,
             last_activity_ms: 0,
             last_poll_ms: 0,
+            failed_polls: 0,
             pending_tx: false,
             pending_reports: false,
         }
@@ -71,9 +83,37 @@ impl PowerManager {
         self.last_activity_ms = now_ms;
     }
 
-    /// Record that a MAC poll was sent.
+    /// Record that a MAC poll was sent and acknowledged by the parent.
     pub fn record_poll(&mut self, now_ms: u32) {
         self.last_poll_ms = now_ms;
+        self.failed_polls = 0;
+    }
+
+    /// Record a poll the parent did not acknowledge.
+    ///
+    /// The attempt still counts as a poll for pacing, so retries no longer
+    /// depend on how often the caller ticks (a tight tick loop used to re-poll
+    /// a silent parent on every tick and drain the battery). The retry is due
+    /// after `FAILED_POLL_RETRY_BASE_MS`, doubling per consecutive failure and
+    /// capped at the configured poll interval, so a transient miss is retried
+    /// quickly while a dead parent costs at most one poll per interval.
+    pub fn record_failed_poll(&mut self, now_ms: u32) {
+        self.last_poll_ms = now_ms;
+        self.failed_polls = self.failed_polls.saturating_add(1);
+    }
+
+    /// Consecutive unacknowledged polls since the last acknowledged one.
+    pub fn failed_polls(&self) -> u8 {
+        self.failed_polls
+    }
+
+    /// Delay from the last poll attempt to the next due poll.
+    fn effective_poll_interval(&self, poll_interval_ms: u32) -> u32 {
+        if self.failed_polls == 0 {
+            return poll_interval_ms;
+        }
+        let shift = (self.failed_polls - 1).min(FAILED_POLL_MAX_SHIFT);
+        poll_interval_ms.min(FAILED_POLL_RETRY_BASE_MS << shift)
     }
 
     /// Set whether there are pending transmissions.
@@ -105,6 +145,7 @@ impl PowerManager {
                     return SleepDecision::StayAwake;
                 }
 
+                let poll_interval_ms = self.effective_poll_interval(poll_interval_ms);
                 let since_poll = now_ms.wrapping_sub(self.last_poll_ms);
                 if since_poll >= poll_interval_ms {
                     // Need to poll soon
@@ -130,7 +171,10 @@ impl PowerManager {
         match self.mode {
             PowerMode::Sleepy {
                 poll_interval_ms, ..
-            } => now_ms.wrapping_sub(self.last_poll_ms) >= poll_interval_ms,
+            } => {
+                now_ms.wrapping_sub(self.last_poll_ms)
+                    >= self.effective_poll_interval(poll_interval_ms)
+            }
             _ => false,
         }
     }
@@ -160,6 +204,50 @@ mod tests {
         power.record_poll(1_000);
         assert!(!power.should_poll(1_999));
         assert!(power.should_poll(2_000));
+    }
+
+    #[test]
+    fn failed_polls_back_off_exponentially_up_to_the_poll_interval() {
+        let mut power = PowerManager::new(PowerMode::Sleepy {
+            poll_interval_ms: 7_500,
+            wake_duration_ms: 300,
+        });
+
+        power.record_failed_poll(10_000);
+        // Re-ticking at the same instant must not re-poll.
+        assert!(!power.should_poll(10_000));
+        assert!(!power.should_poll(10_999));
+        assert!(power.should_poll(11_000));
+        assert!(matches!(
+            power.decide(10_500),
+            super::SleepDecision::LightSleep(500)
+        ));
+
+        power.record_failed_poll(11_000);
+        assert!(!power.should_poll(12_999));
+        assert!(power.should_poll(13_000));
+
+        power.record_failed_poll(13_000);
+        assert!(power.should_poll(17_000));
+
+        // 8 s back-off is capped by the 7.5 s poll interval.
+        power.record_failed_poll(17_000);
+        assert!(!power.should_poll(24_499));
+        assert!(power.should_poll(24_500));
+
+        // Saturates instead of overflowing on a long outage.
+        for _ in 0..300 {
+            power.record_failed_poll(30_000);
+        }
+        assert_eq!(power.failed_polls(), u8::MAX);
+        assert!(!power.should_poll(37_499));
+        assert!(power.should_poll(37_500));
+
+        // An acknowledged poll restores the normal cadence.
+        power.record_poll(40_000);
+        assert_eq!(power.failed_polls(), 0);
+        assert!(!power.should_poll(47_499));
+        assert!(power.should_poll(47_500));
     }
 
     #[test]

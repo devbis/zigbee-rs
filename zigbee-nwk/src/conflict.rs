@@ -158,15 +158,14 @@ impl<M: MacDriver> NwkLayer<M> {
 
         #[cfg(feature = "router")]
         {
-            let known = self
-                .neighbors
-                .find_by_short(address)
-                .map(|entry| entry.ieee_address);
+            let known = self.find_ieee_by_short(address);
             match known {
                 Some(NULL_IEEE) | None => {
                     // Nothing recorded yet — learn the mapping. This is what makes
                     // the *next* statement of identity able to detect a conflict.
-                    self.update_neighbor_address(address, ieee);
+                    // It goes to the address map only: the device may be any
+                    // number of hops away (R22 §3.6.1.5 vs. nwkAddressMap).
+                    self.update_address_map(address, ieee);
                     AddressCheck::Consistent
                 }
                 Some(existing) if existing == ieee => AddressCheck::Consistent,
@@ -417,6 +416,16 @@ impl<M: MacDriver> NwkLayer<M> {
         // so a stale entry cannot send our traffic to the offending device.
         self.routing.remove(previous);
         self.neighbors.remove(previous);
+        // R22 §3.6.1.9.3: tell the next higher layer the address changed
+        // (NLME-NWK-STATUS.indication, "network address update"), which it
+        // answers with a Device_annce for the new address.
+        #[cfg(feature = "router")]
+        {
+            self.pending_nwk_status = Some(crate::NlmeNwkStatusIndication {
+                status: crate::frames::NetworkStatusCommand::NETWORK_ADDRESS_UPDATE,
+                network_addr: candidate,
+            });
+        }
         log::warn!(
             "[NWK] Short address changed 0x{:04X} -> 0x{:04X} after conflict",
             previous.0,
@@ -1153,6 +1162,22 @@ mod tests {
         assert_ne!(assigned, ShortAddress::COORDINATOR);
         assert!(assigned.0 < 0xFFF8);
         assert_eq!(router.nib().network_address, assigned);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_new_local_address_raises_a_network_address_update_status() {
+        let mut router = node(DeviceType::Router);
+        assert_eq!(router.take_nwk_status_indication(), None);
+        let assigned = block_on(router.assign_new_local_address()).expect("an address is free");
+        assert_eq!(
+            router.take_nwk_status_indication(),
+            Some(crate::NlmeNwkStatusIndication {
+                status: crate::frames::NetworkStatusCommand::NETWORK_ADDRESS_UPDATE,
+                network_addr: assigned,
+            }),
+        );
+        assert_eq!(router.take_nwk_status_indication(), None, "reported once");
     }
 
     // ── R22 §3.6.1.13 PAN identifier conflicts ──────────────────

@@ -64,5 +64,21 @@ then
     exit 1
 fi
 
+# SRAM-resident flash routines run while XIP is bypassed or erased; every
+# direct branch must stay in SRAM and no register-indirect call may leave it.
+ram_code_escape=$("$OBJDUMP" -d -j .data --no-show-raw-insn "$ELF" | awk '
+    $2 ~ /^(b|bl|blx|bx|b(eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al))(\.[nw])?$/ {
+        if ($3 ~ /^0x/) {
+            if ($3 !~ /^0x1fff/) print
+        } else if (!($2 == "bx" && $3 == "lr")) {
+            print
+        }
+    }')
+if [ -n "$ram_code_escape" ]; then
+    echo "SRAM code branches outside SRAM (XIP may be unavailable):" >&2
+    echo "$ram_code_escape" >&2
+    exit 1
+fi
+
 echo "PHY62x2 layout: ROM jump table, run descriptor, XIP, and flash RAM code are valid"
 echo "PHY62x2 XIP occupied span: $xip_occupied_bytes / $XIP_SLOT_BYTES bytes"

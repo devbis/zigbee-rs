@@ -18,10 +18,13 @@
  */
 MEMORY
 {
-    /* The final 48 KiB are not available to the linked image:
+    /* The final 64 KiB are not available to the linked image, matching the
+     * production TB-04 layout so a lab image cannot erase its journals:
+     *   0x70000..0x72000 APS binding/group journal
+     *   0x72000..0x74000 child-table journal
      *   0x74000..0x76000 security-state journal
      *   0x76000..0x80000 factory/configuration data */
-    FLASH : ORIGIN = 0x00000000, LENGTH = 0x74000
+    FLASH : ORIGIN = 0x00000000, LENGTH = 0x70000
     RAM   : ORIGIN = 0x00840000, LENGTH = 0x10000
 }
 
@@ -162,6 +165,7 @@ SECTIONS
     _bin_size_ = _code_size_ + SIZEOF(.data);
     _bin_size_div_16 = (_bin_size_ + 15) / 16;
     _etext = _dstored_;
+    _aps_nv_start_ = 0x70000;
     _security_nv_start_ = 0x74000;
     _security_nv_end_ = 0x76000;
 
@@ -189,8 +193,8 @@ SECTIONS
         "ERROR: .rf_dma extends into the IRQ stack region");
     _assert_stack_under_diag = ASSERT(_svc_stack_top <= _diag_start_,
         "ERROR: SVC stack overlaps the diagnostic record");
-    _assert_image_below_security_nv = ASSERT(_bin_size_ <= _security_nv_start_,
-        "ERROR: firmware image overlaps security journal at 0x74000");
+    _assert_image_below_aps_nv = ASSERT(_bin_size_ <= _aps_nv_start_,
+        "ERROR: firmware image overlaps APS-table journal at 0x70000");
 
     /DISCARD/ :
     {

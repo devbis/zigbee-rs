@@ -6,16 +6,16 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Allow deploying to GitHub Pages
+# Least privilege by default; only deploy-site receives Pages/OIDC tokens.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
-# Only one Pages deploy at a time
+# Supersede stale runs for the same PR/branch, but give every main/master
+# push its own group so each commit is fully checked. Pages deployment is
+# serialized separately on the deploy-site job.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ci-${{ github.workflow }}-${{ (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -88,10 +88,10 @@ jobs:
       # `embassy-nrf`), but their battery-curve and profile logic is
       # host-testable because the hardware dependencies are
       # `cfg(target_os = "none")`-gated.
-      - run: cargo test --manifest-path products/nrf52840-sensor/Cargo.toml
-      - run: cargo test --manifest-path products/nrf52840-sensor/Cargo.toml --features sensor-bme280
-      - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml
-      - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml --features sensor-bme280
+      - run: cargo test --manifest-path products/nrf52840-sensor/Cargo.toml --locked
+      - run: cargo test --manifest-path products/nrf52840-sensor/Cargo.toml --features sensor-bme280 --locked
+      - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml --locked
+      - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml --features sensor-bme280 --locked
 
   standalone-host:
     name: Host ${{ matrix.name }}
@@ -103,58 +103,67 @@ jobs:
           - name: LP-EM-CC2340R5 board
             manifest: boards/lp-em-cc2340r5/Cargo.toml
             workspace: boards/lp-em-cc2340r5
-            locked: false
             features: ""
           - name: CC2340 sensor product
             manifest: products/cc2340-sensor/Cargo.toml
             workspace: products/cc2340-sensor
-            locked: false
             features: ""
           - name: ESP32-C6 sensor product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
-            locked: false
             features: esp32c6
           - name: ESP32-H2 sensor product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
-            locked: false
             features: esp32h2
           - name: ESP32-C6 light-sleep product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
-            locked: false
             features: esp32c6,light-sleep
           - name: ESP32-H2 light-sleep product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
-            locked: false
             features: esp32h2,light-sleep
           - name: nRF52840 always-on End Device product
             manifest: products/nrf52840-router/Cargo.toml
             workspace: products/nrf52840-router
-            locked: true
             features: ""
           - name: EFR32MG21 board
             manifest: boards/efr32mg21-devkit/Cargo.toml
             workspace: boards/efr32mg21-devkit
-            locked: true
             features: ""
           - name: EFR32MG21 sensor product
             manifest: products/efr32mg21-sensor/Cargo.toml
             workspace: products/efr32mg21-sensor
-            locked: true
             features: ""
           - name: PHY6222 sensor product
             manifest: products/phy62x2-evk/Cargo.toml
             workspace: products/phy62x2-evk
-            locked: false
             features: ""
           - name: PHY6252 sensor product
             manifest: products/phy62x2-evk/Cargo.toml
             workspace: products/phy62x2-evk
-            locked: false
             features: phy6252
+          # The EFR32MG1 HAL currently has host clippy findings
+          # (manual is_multiple_of, Result<_, ()>); test it until they are
+          # fixed, then drop `clippy: false`.
+          - name: EFR32MG1 HAL
+            manifest: efr32mg1-hal/Cargo.toml
+            workspace: efr32mg1-hal
+            features: ""
+            clippy: false
+          - name: EFR32MG1 TRADFRI board
+            manifest: boards/efr32mg1-tradfri/Cargo.toml
+            workspace: boards/efr32mg1-tradfri
+            features: ""
+          - name: EFR32MG1 TRADFRI product
+            manifest: products/efr32mg1-tradfri/Cargo.toml
+            workspace: products/efr32mg1-tradfri
+            features: ""
+          - name: EFR32MG21 HAL
+            manifest: efr32mg21-hal/Cargo.toml
+            workspace: efr32mg21-hal
+            features: ""
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
@@ -166,26 +175,22 @@ jobs:
           workspaces: ${{ matrix.workspace }}
           cache-targets: false
           # Variant names are unique; raw feature lists contain cache-invalid commas.
-          key: x86_64-unknown-linux-gnu-host-${{ matrix.name }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', 'boards/**/Cargo.lock', 'products/**/Cargo.lock', 'boards/**/Cargo.toml', 'products/**/Cargo.toml') }}
+          key: x86_64-unknown-linux-gnu-host-${{ matrix.name }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', '*-hal/Cargo.lock', 'boards/**/Cargo.lock', 'products/**/Cargo.lock', '*-hal/Cargo.toml', 'boards/**/Cargo.toml', 'products/**/Cargo.toml') }}
       - name: Test and lint standalone crate
+        env:
+          MANIFEST: ${{ matrix.manifest }}
+          FEATURES: ${{ matrix.features }}
+          CLIPPY: ${{ matrix.clippy }}
         run: |
           HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-          LOCKED=
-          if [[ "${{ matrix.locked }}" == true ]]; then
-            LOCKED=--locked
+          # Every standalone crate commits its Cargo.lock; never re-resolve.
+          ARGS=(--manifest-path "$MANIFEST" --target "$HOST_TARGET" --locked)
+          if [[ -n "$FEATURES" ]]; then
+            ARGS+=(--no-default-features --features "$FEATURES")
           fi
-          if [[ -n "${{ matrix.features }}" ]]; then
-            cargo test --manifest-path "${{ matrix.manifest }}" \
-              --target "$HOST_TARGET" $LOCKED \
-              --no-default-features --features "${{ matrix.features }}"
-            cargo clippy --manifest-path "${{ matrix.manifest }}" \
-              --target "$HOST_TARGET" --all-targets $LOCKED \
-              --no-default-features --features "${{ matrix.features }}" -- -D warnings
-          else
-            cargo test --manifest-path "${{ matrix.manifest }}" \
-              --target "$HOST_TARGET" $LOCKED
-            cargo clippy --manifest-path "${{ matrix.manifest }}" \
-              --target "$HOST_TARGET" --all-targets $LOCKED -- -D warnings
+          cargo test "${ARGS[@]}"
+          if [[ "$CLIPPY" != false ]]; then
+            cargo clippy "${ARGS[@]}" --all-targets -- -D warnings
           fi
 
   clippy:
@@ -252,6 +257,14 @@ jobs:
           cargo fmt --manifest-path examples/phy6222-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg1-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg21-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path efr32mg1-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path efr32mg21-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path phy6222-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/efr32mg1-tradfri/Cargo.toml -- --check
+          cargo fmt --manifest-path products/efr32mg1-tradfri/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/esp32-zigbee-devkit/Cargo.toml -- --check
+          cargo fmt --manifest-path products/esp32-zigbee-devkit/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/phy62x2-evk/Cargo.toml -- --check
 
   doc:
     name: Doc
@@ -791,7 +804,7 @@ jobs:
           python3 products/esp32-zigbee-devkit/partitions/test_esp_app_image.py \
             --write-corpus "$ESP_OTA_PREFLIGHT_CORPUS" --chip esp32c6
           HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-          cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
+          cargo test --locked --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
             --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/esp32c6-ota-host" \
             --no-default-features --features esp32c6 -- --include-ignored
           ./tools/firmware-size-report.sh \
@@ -864,7 +877,7 @@ jobs:
           python3 products/esp32-zigbee-devkit/partitions/test_esp_app_image.py \
             --write-corpus "$ESP_OTA_PREFLIGHT_CORPUS" --chip esp32h2
           HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-          cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
+          cargo test --locked --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
             --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/esp32h2-ota-host" \
             --no-default-features --features esp32h2 -- --include-ignored
           ./tools/firmware-size-report.sh \
@@ -927,7 +940,7 @@ jobs:
           python3 products/esp32-zigbee-devkit/partitions/test_esp_app_image.py \
             --write-corpus "$ESP_OTA_PREFLIGHT_CORPUS" --chip "$CHIP"
           HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-          cargo test --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
+          cargo test --locked --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
             --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/$CHIP-light-sleep-host" \
             --no-default-features --features "$CHIP,light-sleep" -- --include-ignored
           ./tools/firmware-size-report.sh "$CHIP-light-sleep" "${ELF}.app.bin" "${ELF}.size.json"
@@ -973,12 +986,15 @@ jobs:
           python-version: 3.11.9
       - name: Install pinned Bouffalo image tool
         run: |
-          PACKAGE="$RUNNER_TEMP/bflb-mcu-tool-1.10.0.tar.gz"
-          python3 -m pip download --disable-pip-version-check --no-deps \
-            --dest "$RUNNER_TEMP" bflb-mcu-tool==1.10.0
-          echo "cd09a9b2a5652ad8623ae275a49179c48edd8c90a893851000b08e3b104a46ac  $PACKAGE" \
-            | sha256sum --check
-          python3 -m pip install --disable-pip-version-check "$PACKAGE"
+          # Every distribution in the tool's closure is pinned by version and
+          # SHA-256. The two source-only packages are built with the
+          # separately hash-pinned setuptools rather than an unpinned
+          # isolated build environment.
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --no-deps -r tools/bl702-image-tool/build-requirements.txt
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --no-deps --no-build-isolation -r tools/bl702-image-tool/requirements.txt
+          python3 -m pip check
       - name: Create firmware artifacts
         working-directory: examples/bl702-sensor
         run: ./build-image.sh
@@ -1143,7 +1159,7 @@ jobs:
   # modern-tc32/rust toolchain. Stock nightly cannot compile this target.
 
   build-phy6222:
-    name: Build PHY6222 sensor
+    name: Build PHY6222/PHY6252 sensor
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -1193,6 +1209,14 @@ jobs:
             examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.hex
             examples/phy6222-sensor/target/thumbv6m-none-eabi/release/phy6222-sensor.phy6.bin
           if-no-files-found: error
+      # PHY6252 shares the 130,816 B physical XIP slot and the same
+      # mandatory layout gate as PHY6222.
+      - name: Build PHY6252 sensor and check its physical XIP limit
+        working-directory: examples/phy6222-sensor
+        run: |
+          cargo build --release --locked --no-default-features --features phy6252 \
+            --target-dir target/phy6252
+          sh check-layout.sh target/phy6252/thumbv6m-none-eabi/release/phy6222-sensor
 
   # ── EFR32MG1P (Silicon Labs, ARM Cortex-M4F) ─────────────────
   build-efr32mg1:
@@ -1321,6 +1345,14 @@ jobs:
         needs.clippy.result == 'success' && needs.fmt.result == 'success' &&
         needs.doc.result == 'success'
       }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    # Only one Pages deploy at a time; never cancel one already running.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

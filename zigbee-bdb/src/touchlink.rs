@@ -188,9 +188,10 @@ impl<M: MacDriver> BdbLayer<M> {
 
         // Generate transaction ID
         let ieee = self.zdo().nwk().nib().ieee_address;
-        let mut counter = self.touchlink_counter();
+        // Seed from the monotonic clock: the experimental initiator has no
+        // dedicated NV counter and must not borrow a BDB attribute for one.
+        let mut counter = self.zdo().nwk().mac().monotonic_micros();
         let transaction_id = generate_transaction_id(&ieee, &mut counter);
-        self.set_touchlink_counter(counter);
 
         let scan_req = TouchlinkScanRequest {
             transaction_id,
@@ -199,6 +200,17 @@ impl<M: MacDriver> BdbLayer<M> {
         };
 
         let mut responses: heapless::Vec<TouchlinkScanResponse, 8> = heapless::Vec::new();
+
+        // The scan retunes the radio; remember the operating channel so a
+        // node that is already on a network is not stranded on a touchlink
+        // channel when (as without Inter-PAN support) the attempt fails.
+        let operating_channel = self
+            .zdo()
+            .nwk()
+            .mac()
+            .mlme_get(zigbee_mac::pib::PibAttribute::PhyCurrentChannel)
+            .await
+            .ok();
 
         // Scan on each primary Touchlink channel
         for &channel in &TOUCHLINK_PRIMARY_CHANNELS {
@@ -256,6 +268,15 @@ impl<M: MacDriver> BdbLayer<M> {
                 channel,
                 responses.len()
             );
+        }
+
+        if let Some(channel) = operating_channel {
+            let _ = self
+                .zdo_mut()
+                .nwk_mut()
+                .mac_mut()
+                .mlme_set(zigbee_mac::pib::PibAttribute::PhyCurrentChannel, channel)
+                .await;
         }
 
         // Filter by RSSI threshold
@@ -395,40 +416,101 @@ impl<M: MacDriver> BdbLayer<M> {
         Ok(())
     }
 
-    /// Perform a Touchlink factory reset.
-    ///
-    /// Clears network state via the ZDO layer and resets BDB attributes
-    /// to their defaults.
+    /// Perform a Touchlink factory reset (BDB v3.0.1 §8.7 reset to
+    /// factory new): the full [`BdbLayer::factory_reset`].
     pub async fn touchlink_factory_reset(&mut self) -> Result<(), BdbStatus> {
         log::info!("[BDB:Touchlink] Factory reset requested");
+        // A partial NIB wipe would leave the stack joined with live keys,
+        // pending ZDO transactions and an armed TCLK exchange. Use the full
+        // BDB factory reset (leave, NWK/APS reset, attribute defaults).
+        self.factory_reset().await
+    }
+}
 
-        // Clear network parameters in the NWK layer
-        let nwk = self.zdo_mut().nwk_mut();
-        nwk.nib_mut().network_address = ShortAddress(0xFFFF);
-        nwk.nib_mut().pan_id = PanId(0xFFFF);
-        nwk.nib_mut().extended_pan_id = [0u8; 8];
-        nwk.nib_mut().logical_channel = 0;
-        nwk.nib_mut().parent_address = ShortAddress(0xFFFF);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::future::Future;
+    use zigbee_aps::ApsLayer;
+    use zigbee_mac::mock::MockMac;
+    use zigbee_mac::pib::{PibAttribute, PibValue};
+    use zigbee_nwk::{DeviceType, NwkLayer};
+    use zigbee_zdo::ZdoLayer;
 
-        // Reset BDB attributes to defaults
-        self.attributes = crate::attributes::BdbAttributes::default();
+    fn block_on<F: Future>(future: F) -> F::Output {
+        use core::task::{Context, Poll, Waker};
 
-        log::info!("[BDB:Touchlink] Factory reset complete");
-        Ok(())
+        let mut context = Context::from_waker(Waker::noop());
+        let mut future = core::pin::pin!(future);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+        }
     }
 
-    // ── Internal helpers ────────────────────────────────────
-
-    /// Get the current touchlink counter value.
-    ///
-    /// Uses the BDB commissioning group ID as storage for a simple
-    /// counter since no dedicated NV field exists in this implementation.
-    fn touchlink_counter(&self) -> u32 {
-        self.attributes.commissioning_group_id as u32
+    fn joined_bdb() -> BdbLayer<MockMac> {
+        let mut nwk = NwkLayer::new(MockMac::new([0x11; 8]), DeviceType::Router);
+        nwk.set_joined(true);
+        nwk.security_mut().set_network_key([0x5A; 16], 0);
+        {
+            let nib = nwk.nib_mut();
+            nib.pan_id = PanId(0x1A62);
+            nib.network_address = ShortAddress(0x4321);
+            nib.ieee_address = [0x11; 8];
+            nib.logical_channel = 20;
+            nib.parent_address = ShortAddress::COORDINATOR;
+            nib.security_enabled = true;
+            nib.outgoing_frame_counter_limit = 0x400;
+        }
+        let mut zdo = ZdoLayer::new(ApsLayer::new(nwk));
+        zdo.set_local_nwk_addr(ShortAddress(0x4321));
+        zdo.set_local_ieee_addr([0x11; 8]);
+        let mut bdb = BdbLayer::new(zdo);
+        bdb.attributes_mut().node_is_on_a_network = true;
+        bdb
     }
 
-    /// Set the touchlink counter.
-    fn set_touchlink_counter(&mut self, val: u32) {
-        self.attributes.commissioning_group_id = val as u16;
+    fn channel(bdb: &BdbLayer<MockMac>) -> PibValue {
+        block_on(
+            bdb.zdo()
+                .nwk()
+                .mac()
+                .mlme_get(PibAttribute::PhyCurrentChannel),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn failed_touchlink_scan_returns_to_the_operating_channel() {
+        let mut bdb = joined_bdb();
+        block_on(
+            bdb.zdo_mut()
+                .nwk_mut()
+                .mac_mut()
+                .mlme_set(PibAttribute::PhyCurrentChannel, PibValue::U8(20)),
+        )
+        .unwrap();
+        bdb.attributes_mut().commissioning_group_id = 0x1234;
+
+        assert_eq!(
+            block_on(bdb.touchlink_commissioning()),
+            Err(BdbStatus::TouchlinkFailure)
+        );
+        assert_eq!(channel(&bdb), PibValue::U8(20));
+        // bdbCommissioningGroupID is not a scratch transaction counter.
+        assert_eq!(bdb.attributes().commissioning_group_id, 0x1234);
+        assert!(bdb.is_on_network());
+    }
+
+    #[test]
+    fn touchlink_factory_reset_is_a_full_factory_reset() {
+        let mut bdb = joined_bdb();
+        assert!(block_on(bdb.zdo_mut().start_node_desc_req(ShortAddress::COORDINATOR)).is_ok());
+
+        assert_eq!(block_on(bdb.touchlink_factory_reset()), Ok(()));
+        assert!(!bdb.is_on_network());
+        assert!(!bdb.zdo().nwk().is_joined());
+        assert_eq!(bdb.zdo().pending_count(), 0);
     }
 }

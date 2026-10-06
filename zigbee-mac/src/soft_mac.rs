@@ -397,10 +397,68 @@ impl<P: RadioPhy + PlatformServices> SoftMacCore<P> {
             return Ok(None);
         }
 
-        match self.receive_data(POLL_RESPONSE_WAIT_US).await {
-            Ok(indication) => Ok(Some(indication.payload)),
-            Err(MacError::NoData) => Ok(None),
-            Err(error) => Err(error),
+        self.receive_poll_response().await
+    }
+
+    /// Wait for the indirect frame announced by a frame-pending ACK.
+    ///
+    /// IEEE 802.15.4-2015 §6.7.3: after the parent sets Frame Pending it
+    /// delivers the buffered frame *from itself* *to this device*. Other
+    /// traffic heard in the same window (mesh broadcasts, unicasts relayed by
+    /// a different router) is ordinary receive traffic: it is acknowledged
+    /// and queued for `receive_data`, never substituted for the poll result.
+    async fn receive_poll_response(&mut self) -> Result<Option<MacFrame>, MacError> {
+        let started_at = self.monotonic_micros();
+
+        for _ in 0..MAX_SCAN_FRAMES_PER_CHANNEL {
+            let elapsed = self.monotonic_micros().wrapping_sub(started_at);
+            let Some(remaining) = POLL_RESPONSE_WAIT_US.checked_sub(elapsed) else {
+                return Ok(None);
+            };
+            let frame = match self.phy.receive(remaining).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(None),
+                Err(PhyError::CrcFailed) => continue,
+                Err(error) => return Err(Self::map_phy_error(error)),
+            };
+
+            if self.is_poll_response(frame.as_slice()) {
+                return Ok(self
+                    .process_received_data(frame, false)
+                    .await?
+                    .map(|indication| indication.payload));
+            }
+            self.retain_data_frame(frame).await?;
+        }
+
+        Ok(None)
+    }
+
+    /// A poll response is a data frame sent by our parent to our exact
+    /// (non-broadcast) address.
+    fn is_poll_response(&self, data: &[u8]) -> bool {
+        if data.len() < 3 || data[0] & 0x07 != 0x01 {
+            return false;
+        }
+        let (source, destination, payload_offset, _) = parse_mac_addresses(data);
+        payload_offset >= 3
+            && payload_offset <= data.len()
+            && self.is_exact_destination(&destination)
+            && self.is_from_coordinator(&source)
+    }
+
+    fn is_from_coordinator(&self, source: &MacAddress) -> bool {
+        let coordinator_short = self.pib.coord_short_address();
+        let coordinator_extended = self.pib.coord_extended_address();
+        match source {
+            MacAddress::Short(pan_id, address) => {
+                coordinator_short.0 < 0xFFF8
+                    && *address == coordinator_short
+                    && *pan_id == self.pib.pan_id()
+            }
+            MacAddress::Extended(_, address) => {
+                coordinator_extended != [0; 8] && *address == coordinator_extended
+            }
         }
     }
 
@@ -1993,6 +2051,85 @@ mod tests {
 
         assert_eq!(frame.as_slice(), [0xA1, 0xB2]);
         assert_eq!(core.phy().sent_acks.as_slice(), [(0x33, false)]);
+    }
+
+    #[test]
+    fn poll_response_ignores_traffic_not_sent_by_parent_to_us() {
+        let mut core = associated_core();
+        let neighbour_broadcast = build_data_frame(
+            0x40,
+            AddressMode::Short,
+            ShortAddress(0x1111),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0xFFFF)),
+            &[0xBB],
+            false,
+            false,
+        )
+        .unwrap();
+        let neighbour_unicast = build_data_frame(
+            0x41,
+            AddressMode::Short,
+            ShortAddress(0x2222),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
+            &[0xCC],
+            true,
+            false,
+        )
+        .unwrap();
+        let parent_broadcast = build_data_frame(
+            0x42,
+            AddressMode::Short,
+            ShortAddress(0x0000),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0xFFFF)),
+            &[0xDD],
+            false,
+            false,
+        )
+        .unwrap();
+        let parent_unicast = build_data_frame(
+            0x43,
+            AddressMode::Short,
+            ShortAddress(0x0000),
+            &[0; 8],
+            &MacAddress::Short(PanId(0x1234), ShortAddress(0x5678)),
+            &[0xEE],
+            true,
+            false,
+        )
+        .unwrap();
+        let rx = &mut core.phy_mut().rx_frames;
+        rx.push_back(Ok(Some(
+            PhyRxFrame::from_slice(&[0x12, 0x00, 0x01], 255).unwrap(),
+        )))
+        .unwrap();
+        for frame in [
+            &neighbour_broadcast,
+            &neighbour_unicast,
+            &parent_broadcast,
+            &parent_unicast,
+        ] {
+            rx.push_back(Ok(Some(PhyRxFrame::from_slice(frame, 190).unwrap())))
+                .unwrap();
+        }
+
+        let frame = block_on(core.poll()).unwrap().unwrap();
+
+        assert_eq!(frame.as_slice(), [0xEE]);
+        // The neighbour unicast is ACKed on receipt and the parent response
+        // when returned; broadcasts are never ACKed.
+        assert_eq!(
+            core.phy().sent_acks.as_slice(),
+            [(0x41, false), (0x43, false)]
+        );
+        // Everything else stays available to normal reception, in order.
+        for expected in [[0xBB], [0xCC], [0xDD]] {
+            let indication = block_on(core.receive_data(1_000)).unwrap();
+            assert_eq!(indication.payload.as_slice(), expected);
+        }
+        assert_eq!(core.phy().sent_acks.len(), 2);
     }
 
     #[test]

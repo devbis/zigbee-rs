@@ -32,3 +32,5 @@ ASSERT(ORIGIN(BOOT_STATE) + LENGTH(BOOT_STATE) == 0x00100000,
   "ProMicro MBR params/settings must occupy the top two pages");
 ASSERT(ORIGIN(RAM) + LENGTH(RAM) == 0x20040000,
   "ProMicro RAM map must preserve the 0x20002000 origin");
+ASSERT(_stack_start - __euninit >= 16K,
+  "nRF52840 ProMicro static data must leave at least 16 KiB for the stack");

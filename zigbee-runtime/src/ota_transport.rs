@@ -151,6 +151,16 @@ impl OtaSession {
             Some(_) => {}
         }
 
+        if *command_id == CMD_IMAGE_NOTIFY.0 {
+            // QueryJitter (ZCL r8 §11.13.3.4): respond only when a random
+            // value in 1..=100 does not exceed the notify's jitter. Without
+            // entropy the notify is answered, as if selected.
+            let mut random = [0u8; 1];
+            if device.mac_mut().fill_random(&mut random).is_ok() {
+                let random = (u16::from(random[0]) * 100 / 256) as u8 + 1;
+                manager.cluster_mut().set_notify_random(random);
+            }
+        }
         let status = manager.handle_incoming_with_sequence(
             *command_id,
             payload.as_slice(),
@@ -370,9 +380,11 @@ mod tests {
         )
     }
 
-    /// Build a minimal valid OTA file: 56B header + 6B sub-element header,
-    /// no firmware payload — enough to exercise header parsing and a single
-    /// zero-length block without needing multi-block bookkeeping.
+    /// Build a minimal valid OTA file: 56B header + 6B UpgradeImage
+    /// sub-element header + 2B firmware payload (64B total). The header's
+    /// total image size matches the file length, as the OTA manager now
+    /// rejects images whose header disagrees with the advertised size or
+    /// that carry an empty UpgradeImage element.
     fn build_ota_file(mfg: u16, img_type: u16, version: u32) -> heapless::Vec<u8, 64> {
         let mut file = heapless::Vec::<u8, 64>::new();
         let push_bytes = |bytes: &[u8], file: &mut heapless::Vec<u8, 64>| {
@@ -391,9 +403,10 @@ mod tests {
         for _ in 0..32 {
             let _ = file.push(0);
         } // header string
-        push_bytes(&56u32.to_le_bytes(), &mut file); // total image size == header only
+        push_bytes(&64u32.to_le_bytes(), &mut file); // total image size == file length
         push_bytes(&0x0000u16.to_le_bytes(), &mut file); // sub-element tag: UpgradeImage
-        push_bytes(&0u32.to_le_bytes(), &mut file); // sub-element length: 0 bytes of firmware
+        push_bytes(&2u32.to_le_bytes(), &mut file); // sub-element length: 2 bytes of firmware
+        push_bytes(&[0xA5, 0x5A], &mut file); // firmware payload
         file
     }
 
@@ -481,6 +494,47 @@ mod tests {
             sent_before + 1,
             "the query request must have been sent over the air"
         );
+    }
+
+    /// A broadcast Image Notify with QueryJitter 1 is answered by about one
+    /// client in a hundred (ZCL r8 §11.13.3.4): the session draws the
+    /// client's random value from the platform RNG.
+    #[test]
+    fn image_notify_query_jitter_uses_the_platform_rng() {
+        let mut session = OtaSession::new();
+        let mut device = joined_device();
+        let mut mgr = manager(ENDPOINT);
+        // Payload type 0 with QueryJitter 1.
+        let notify = command_event(
+            SERVER_A,
+            ENDPOINT,
+            ClusterId::OTA_UPGRADE.0,
+            CMD_IMAGE_NOTIFY.0,
+            &[0x00, 0x01],
+        );
+        let mut answered = 0;
+        for _ in 0..20 {
+            block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &notify));
+            if mgr.state() == OtaState::QuerySent {
+                answered += 1;
+                mgr.abort();
+            }
+        }
+        assert!(
+            answered <= 1,
+            "QueryJitter 1 answered {answered} of 20 notifies"
+        );
+
+        // QueryJitter 100 selects every client.
+        let notify = command_event(
+            SERVER_A,
+            ENDPOINT,
+            ClusterId::OTA_UPGRADE.0,
+            CMD_IMAGE_NOTIFY.0,
+            &[0x00, 100],
+        );
+        block_on(session.handle_event(&mut device, &mut mgr, ENDPOINT, &notify));
+        assert_eq!(mgr.state(), OtaState::QuerySent);
     }
 
     #[test]

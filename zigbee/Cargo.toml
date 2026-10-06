@@ -26,6 +26,8 @@ distributed-security = ["zigbee-runtime/distributed-security"]
 float32 = ["zigbee-bdb/float32", "zigbee-runtime/float32", "zigbee-zcl/float32"]
 float64 = ["zigbee-bdb/float64", "zigbee-runtime/float64", "zigbee-zcl/float64"]
 groups = ["zigbee-runtime/groups"]
+# Deprecated legacy item-by-item NV persistence (tests/mock examples only).
+legacy-nv = ["zigbee-runtime/legacy-nv"]
 
 [dev-dependencies]
 zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }

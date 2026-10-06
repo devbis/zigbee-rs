@@ -40,12 +40,46 @@ pub mod apsde;
 pub mod apsme;
 pub mod binding;
 pub mod fragment;
+#[cfg(feature = "fragmentation")]
+mod fragment_tx;
 pub mod frames;
 pub mod group;
 pub mod security;
 
 use zigbee_mac::MacDriver;
 use zigbee_nwk::NwkLayer;
+
+/// Volatile wipe of secret material (re-exported from `zigbee-crypto`).
+pub(crate) use zigbee_crypto::zeroize;
+
+/// Stack buffer holding secret material (plaintext keys, derived keys,
+/// key-bearing command payloads) that is wiped on drop, on every return path.
+pub(crate) struct Secret<const N: usize>(pub(crate) [u8; N]);
+
+impl<const N: usize> Secret<N> {
+    pub(crate) const fn zeroed() -> Self {
+        Self([0u8; N])
+    }
+}
+
+impl<const N: usize> Drop for Secret<N> {
+    fn drop(&mut self) {
+        zeroize(&mut self.0);
+    }
+}
+
+impl<const N: usize> core::ops::Deref for Secret<N> {
+    type Target = [u8; N];
+    fn deref(&self) -> &[u8; N] {
+        &self.0
+    }
+}
+
+impl<const N: usize> core::ops::DerefMut for Secret<N> {
+    fn deref_mut(&mut self) -> &mut [u8; N] {
+        &mut self.0
+    }
+}
 
 // ── Well-known endpoints ────────────────────────────────────────
 
@@ -273,6 +307,14 @@ pub struct PendingApsAck {
     /// endpoints nor cluster/profile identifiers. `false` acknowledges a data
     /// frame and echoes the addressing fields.
     pub command: bool,
+    /// Windowed acknowledgement of a fragmented transaction
+    /// (R22 §2.2.5.2.3): when `Some`, the ACK carries the extended header with
+    /// the block number of the receive window and the ACK bitfield.
+    pub fragment: Option<fragment::FragmentAck>,
+    /// APS security of the acknowledged data frame. When `Some`, the ACK is
+    /// APS-secured with the same key, so the sender can authenticate that the
+    /// acknowledgement came from the key holder.
+    pub aps_security: Option<security::ApsKeyOrigin>,
 }
 
 /// An APS unicast awaiting retransmission after its acknowledgement window.
@@ -360,12 +402,24 @@ const APS_ACK_TABLE_SIZE: usize = 4;
 /// runs maintenance far more often.
 pub const APS_ACK_WAIT_DURATION_US: u32 = 1_500_000;
 
-/// APS duplicate rejection entry
+/// APS duplicate rejection entry (R22 §2.2.8.4.2).
+///
+/// Holds the source address, the APS counter and *timing information*: the
+/// monotonic timestamp at which the frame was accepted. Expiry compares that
+/// timestamp with `apsDuplicateRejectionTimeout` (milliseconds) on the
+/// platform's monotonic clock, so it no longer depends on how often the
+/// runtime happens to call [`ApsLayer::age_dup_table`].
 #[derive(Debug, Clone, Copy)]
 struct ApsDuplicateEntry {
     src_addr: u16,
     aps_counter: u8,
-    age: u16,
+    /// `Some(window)` for a *completed fragmented* transaction: every later
+    /// block with this (source, APS counter) is a retransmission caused by a
+    /// lost final acknowledgement, and `window` is the first block of the
+    /// final receive window that acknowledgement must repeat
+    /// (R22 §2.2.8.4.5.2). `None` for an unfragmented frame.
+    fragment_window: Option<u8>,
+    accepted_at_us: u32,
     active: bool,
 }
 
@@ -374,10 +428,27 @@ impl ApsDuplicateEntry {
         Self {
             src_addr: 0,
             aps_counter: 0,
-            age: 0,
+            fragment_window: None,
+            accepted_at_us: 0,
             active: false,
         }
     }
+}
+
+/// Reception state recorded for the frame currently awaiting an upper-layer
+/// durable commit, so an abort can undo it (see
+/// [`ApsLayer::abort_data_persistence`]).
+#[derive(Debug, Clone, Copy)]
+enum ApsRxRollback {
+    /// Duplicate-rejection entry recorded for an accepted frame.
+    Duplicate { src_addr: u16, aps_counter: u8 },
+    /// A fragment block recorded in an in-progress reassembly session.
+    #[cfg(feature = "fragmentation")]
+    FragmentBlock {
+        src_addr: u16,
+        aps_counter: u8,
+        block: u8,
+    },
 }
 
 /// Tracks an outbound APS frame that requested an ACK.
@@ -505,6 +576,13 @@ pub struct ApsLayer<M: MacDriver> {
     pending_data_replay: Option<security::ApsReplayCounter>,
     /// APS duplicate rejection table
     dup_table: [ApsDuplicateEntry; APS_DUP_TABLE_SIZE],
+    /// Reception state to undo if the current frame's durable commit aborts.
+    pending_rx_rollback: Option<ApsRxRollback>,
+    /// Outgoing fragmented transaction (R22 §2.2.8.4.5.1).
+    #[cfg(feature = "fragmentation")]
+    fragment_tx: Option<fragment_tx::FragmentTxSession>,
+    /// Final APSDE-DATA.confirm of the last fragmented transaction.
+    fragment_tx_confirm: Option<apsde::ApsdeDataConfirm>,
     /// Outbound APS ACK tracking (frames awaiting ACK confirmation)
     ack_table: heapless::Vec<PendingApsAckEntry, APS_ACK_TABLE_SIZE>,
     /// Recently confirmed handles retained for durable upper-layer delivery.
@@ -548,6 +626,10 @@ impl<M: MacDriver> ApsLayer<M> {
             pending_application_key_replay: None,
             pending_data_replay: None,
             dup_table: [ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE],
+            pending_rx_rollback: None,
+            #[cfg(feature = "fragmentation")]
+            fragment_tx: None,
+            fragment_tx_confirm: None,
             ack_table: heapless::Vec::new(),
             ack_completions: heapless::Vec::new(),
             next_ack_generation: 1,
@@ -592,6 +674,10 @@ impl<M: MacDriver> ApsLayer<M> {
             core::ptr::addr_of_mut!((*slot).pending_data_replay).write(None);
             core::ptr::addr_of_mut!((*slot).dup_table)
                 .write([ApsDuplicateEntry::empty(); APS_DUP_TABLE_SIZE]);
+            core::ptr::addr_of_mut!((*slot).pending_rx_rollback).write(None);
+            #[cfg(feature = "fragmentation")]
+            core::ptr::addr_of_mut!((*slot).fragment_tx).write(None);
+            core::ptr::addr_of_mut!((*slot).fragment_tx_confirm).write(None);
             core::ptr::addr_of_mut!((*slot).ack_table).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).ack_completions).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).next_ack_generation).write(1);
@@ -714,57 +800,138 @@ impl<M: MacDriver> ApsLayer<M> {
         if let Some(replay) = self.pending_data_replay.take() {
             self.security.commit_replay_counter(replay);
         }
+        self.pending_rx_rollback = None;
     }
 
+    /// Abandon the current data frame's durable commit.
+    ///
+    /// The frame was not durably accepted, so everything reception recorded
+    /// for it is undone as well: its duplicate-rejection entry (or its block in
+    /// a reassembly session) is removed together with the deferred replay
+    /// floor. Otherwise the sender's retransmission — the only way the frame
+    /// can still be delivered — would be acknowledged and discarded as a
+    /// duplicate.
     pub fn abort_data_persistence(&mut self) {
         self.pending_data_replay = None;
+        match self.pending_rx_rollback.take() {
+            Some(ApsRxRollback::Duplicate {
+                src_addr,
+                aps_counter,
+            }) => {
+                for entry in self.dup_table.iter_mut() {
+                    if entry.active
+                        && entry.src_addr == src_addr
+                        && entry.aps_counter == aps_counter
+                    {
+                        entry.active = false;
+                    }
+                }
+            }
+            #[cfg(feature = "fragmentation")]
+            Some(ApsRxRollback::FragmentBlock {
+                src_addr,
+                aps_counter,
+                block,
+            }) => {
+                for entry in self.dup_table.iter_mut() {
+                    if entry.active
+                        && entry.fragment_window.is_some()
+                        && entry.src_addr == src_addr
+                        && entry.aps_counter == aps_counter
+                    {
+                        entry.active = false;
+                    }
+                }
+                self.fragment_rx
+                    .rollback_block(src_addr, aps_counter, block);
+            }
+            None => {}
+        }
     }
 
-    /// Check if an APS frame is a duplicate. Returns true if duplicate.
-    /// If not a duplicate, records it in the table.
-    pub fn is_aps_duplicate(&mut self, src_addr: u16, aps_counter: u8) -> bool {
-        // Check existing entries
-        for entry in self.dup_table.iter() {
-            if entry.active && entry.src_addr == src_addr && entry.aps_counter == aps_counter {
-                return true; // Duplicate
-            }
-        }
-        // Not a duplicate — record it
-        // Find inactive slot first, else evict oldest
-        let mut best_idx: Option<usize> = None;
-        let mut best_age: u16 = 0;
+    /// `apsDuplicateRejectionTimeout` in microseconds of the monotonic clock.
+    fn duplicate_rejection_timeout_us(&self) -> u32 {
+        u32::from(self.aib.aps_duplicate_rejection_timeout).saturating_mul(1000)
+    }
+
+    fn dup_entry_live(entry: &ApsDuplicateEntry, now: u32, timeout_us: u32) -> bool {
+        entry.active && now.wrapping_sub(entry.accepted_at_us) < timeout_us
+    }
+
+    /// Look up a live duplicate-rejection entry.
+    ///
+    /// `fragmented` selects the transaction kind: an unfragmented frame and a
+    /// fragmented transaction never match each other's entries.
+    fn find_duplicate(&self, src_addr: u16, aps_counter: u8, fragmented: bool) -> Option<usize> {
+        let now = self.nwk.mac().monotonic_micros();
+        let timeout = self.duplicate_rejection_timeout_us();
+        self.dup_table.iter().position(|entry| {
+            Self::dup_entry_live(entry, now, timeout)
+                && entry.src_addr == src_addr
+                && entry.aps_counter == aps_counter
+                && entry.fragment_window.is_some() == fragmented
+        })
+    }
+
+    /// Record an accepted transaction in the duplicate-rejection table,
+    /// reusing an expired slot first and otherwise the oldest one.
+    fn record_duplicate(&mut self, src_addr: u16, aps_counter: u8, fragment_window: Option<u8>) {
+        let now = self.nwk.mac().monotonic_micros();
+        let timeout = self.duplicate_rejection_timeout_us();
+        let mut best: Option<(usize, u32)> = None;
         for (i, entry) in self.dup_table.iter().enumerate() {
-            if !entry.active {
-                best_idx = Some(i);
+            if !Self::dup_entry_live(entry, now, timeout) {
+                best = Some((i, u32::MAX));
                 break;
             }
-            if entry.age >= best_age {
-                best_age = entry.age;
-                best_idx = Some(i);
+            let waited = now.wrapping_sub(entry.accepted_at_us);
+            if best.is_none_or(|(_, oldest)| waited >= oldest) {
+                best = Some((i, waited));
             }
         }
-        if let Some(idx) = best_idx {
+        if let Some((idx, _)) = best {
             self.dup_table[idx] = ApsDuplicateEntry {
                 src_addr,
                 aps_counter,
-                age: 0,
+                fragment_window,
+                accepted_at_us: now,
                 active: true,
             };
         }
+    }
+
+    /// Check if an unfragmented APS frame is a duplicate. Returns true if
+    /// duplicate. If not a duplicate, records it in the table.
+    ///
+    /// An entry stays live for `apsDuplicateRejectionTimeout` milliseconds of
+    /// the platform monotonic clock (R22 §2.2.8.4.2).
+    pub fn is_aps_duplicate(&mut self, src_addr: u16, aps_counter: u8) -> bool {
+        if self.find_duplicate(src_addr, aps_counter, false).is_some() {
+            return true;
+        }
+        self.record_duplicate(src_addr, aps_counter, None);
         false
     }
 
-    /// Age the APS duplicate rejection table. Call periodically (e.g. every second).
+    /// Expire duplicate-rejection entries — and stale fragment reassembly
+    /// sessions — by elapsed time.
+    ///
+    /// Timing is read from the platform monotonic clock
+    /// ([`zigbee_mac::PlatformServices::monotonic_micros`], the same base as
+    /// the ACK table), so the call frequency no longer matters: entries expire
+    /// after `apsDuplicateRejectionTimeout` milliseconds whether this runs every
+    /// 10 ms or every few seconds. Lookups apply the same deadline, so calling
+    /// this only reclaims slots early.
     pub fn age_dup_table(&mut self) {
-        let timeout = self.aib.aps_duplicate_rejection_timeout;
+        let now = self.nwk.mac().monotonic_micros();
+        let timeout = self.duplicate_rejection_timeout_us();
         for entry in self.dup_table.iter_mut() {
-            if entry.active {
-                entry.age = entry.age.saturating_add(1);
-                if entry.age >= timeout {
-                    entry.active = false;
-                }
+            if entry.active && !Self::dup_entry_live(entry, now, timeout) {
+                entry.active = false;
             }
         }
+        #[cfg(feature = "fragmentation")]
+        self.fragment_rx.expire(now);
     }
 
     /// Register an outbound frame for ACK tracking.
@@ -905,19 +1072,59 @@ impl<M: MacDriver> ApsLayer<M> {
 
     /// Whether an outbound unicast still needs its peer's acknowledgement.
     pub fn has_pending_ack(&self) -> bool {
+        #[cfg(feature = "fragmentation")]
+        if self.fragment_tx.is_some() {
+            return true;
+        }
         self.ack_table
             .iter()
             .any(|entry| entry.active && !entry.confirmed)
     }
 
+    /// Final APSDE-DATA.confirm of a fragmented transaction (R22
+    /// §2.2.8.4.5.1): `SUCCESS` once every block was acknowledged, `NO_ACK`
+    /// after `apscMaxFrameRetries` unanswered retries, `SECURITY_FAIL` if a
+    /// block could not be secured. `None` while the transaction is in flight
+    /// or when none was started. Taking the result clears it.
+    pub fn take_fragmented_tx_confirm(&mut self) -> Option<apsde::ApsdeDataConfirm> {
+        self.fragment_tx_confirm.take()
+    }
+
     /// Deliver an incoming APS ACK. Returns true if matched a pending request.
+    ///
+    /// This entry point carries no security information, so it only
+    /// completes transmissions that were not APS-secured; the receive path
+    /// uses [`Self::confirm_ack_with_security`].
     pub fn confirm_ack(&mut self, src_addr: u16, aps_counter: u8) -> bool {
+        self.confirm_ack_with_security(src_addr, aps_counter, false)
+    }
+
+    /// Deliver an incoming APS ACK whose APS security state is known.
+    ///
+    /// An APS-secured transmission is only completed by an APS-secured ACK:
+    /// a device holding just the network key could otherwise forge the
+    /// acknowledgement and suppress the retries of a link-key-protected
+    /// frame.
+    pub(crate) fn confirm_ack_with_security(
+        &mut self,
+        src_addr: u16,
+        aps_counter: u8,
+        aps_secured_ack: bool,
+    ) -> bool {
         for entry in self.ack_table.iter_mut() {
             if entry.active
                 && entry.aps_counter == aps_counter
                 && entry.dst_addr == src_addr
                 && !entry.confirmed
             {
+                if entry.security.is_some() && !aps_secured_ack {
+                    log::warn!(
+                        "[APS] ignoring unsecured ACK for APS-secured counter={} from 0x{:04X}",
+                        aps_counter,
+                        src_addr,
+                    );
+                    return false;
+                }
                 entry.confirmed = true;
                 let handle = ApsAckHandle::new(src_addr, aps_counter, entry.generation);
                 if !self.ack_completions.contains(&handle) {
@@ -1112,7 +1319,36 @@ impl<M: MacDriver> ApsLayer<M> {
                 }
             }
         }
+
+        // Fragmented transaction: run its acknowledgement timer and hand out
+        // due blocks in the remaining capacity, so a maintenance loop that
+        // only sends what this returns also drives fragmentation.
+        #[cfg(feature = "fragmentation")]
+        {
+            self.poll_fragment_tx_timeout();
+            while !retransmit.is_full() {
+                let Some((dst_addr, _, _, frame)) = self.next_due_fragment() else {
+                    break;
+                };
+                retransmit
+                    .push(ApsRetransmission { dst_addr, frame })
+                    .expect("capacity checked above");
+            }
+        }
         retransmit
+    }
+
+    /// Local endpoints that are members of `group_address`
+    /// (R22 §2.2.4.1.2), in group-table order; empty when none.
+    ///
+    /// A group-addressed [`apsde::ApsdeDataIndication`] reports destination
+    /// endpoint `0xFF`; the receiver must hand the ASDU to each endpoint
+    /// returned here (and only those).
+    pub fn group_member_endpoints(&self, group_address: u16) -> &[u8] {
+        self.group_table
+            .find(group_address)
+            .map(|group| group.endpoint_list.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Reference to the underlying NWK layer.
