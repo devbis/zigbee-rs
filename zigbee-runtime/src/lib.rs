@@ -8996,22 +8996,32 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     fn rejoin_fallback_policy<S: SecurityStateStore>(
         store: &mut S,
     ) -> Result<RejoinFallback, event_loop::StartError> {
-        let state = store
-            .load()
-            .map_err(event_loop::StartError::PersistenceFailed)?
-            .ok_or(event_loop::StartError::PersistenceFailed(
-                SecurityStoreError::NotFound,
-            ))?;
-        state
-            .validate()
+        let state = Self::load_valid_security_state(store)
             .map_err(event_loop::StartError::PersistenceFailed)?;
-        Ok(if !state.commissioned || state.is_formed_network() {
+        Ok(Self::classify_rejoin_fallback(&state))
+    }
+
+    fn classify_rejoin_fallback(state: &PersistentSecurityState) -> RejoinFallback {
+        if !state.commissioned || state.is_formed_network() {
             RejoinFallback::NotRejoinable
         } else if state.node_join_link_key_type.is_distributed() {
             RejoinFallback::SecureOnly
         } else {
             RejoinFallback::TrustCenterRejoin
-        })
+        }
+    }
+
+    /// Load the persisted record, requiring it to exist and validate.
+    ///
+    /// Shared by every rejoin step so the store read, presence check and
+    /// validation exist once per store type.
+    #[inline(never)]
+    fn load_valid_security_state<S: SecurityStateStore>(
+        store: &mut S,
+    ) -> Result<PersistentSecurityState, SecurityStoreError> {
+        let state = store.load()?.ok_or(SecurityStoreError::NotFound)?;
+        state.validate()?;
+        Ok(state)
     }
 
     async fn secure_then_trust_center_rejoin_with_security_store<S: SecurityStateStore>(
@@ -9039,19 +9049,9 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     ) -> Result<u16, event_loop::StartError> {
         // Reload after the secured attempt: its failure path refreshed the
         // stored counters, and the record is only needed from here on.
-        let state = store
-            .load()
-            .map_err(event_loop::StartError::PersistenceFailed)?
-            .ok_or(event_loop::StartError::PersistenceFailed(
-                SecurityStoreError::NotFound,
-            ))?;
-        state
-            .validate()
+        let state = Self::load_valid_security_state(store)
             .map_err(event_loop::StartError::PersistenceFailed)?;
-        if !state.commissioned
-            || state.is_formed_network()
-            || state.node_join_link_key_type.is_distributed()
-        {
+        if Self::classify_rejoin_fallback(&state) != RejoinFallback::TrustCenterRejoin {
             return Err(event_loop::StartError::PersistenceFailed(
                 SecurityStoreError::Corrupt,
             ));
@@ -9187,42 +9187,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             return Err(event_loop::StartError::CommissioningFailed(status));
         }
         let addr = self.bdb.zdo().nwk().nib().network_address.0;
-        let mut state = store
-            .load()
-            .map_err(event_loop::StartError::PersistenceFailed)?
-            .ok_or(event_loop::StartError::PersistenceFailed(
-                SecurityStoreError::NotFound,
-            ))?;
-        state
-            .validate()
+        let mut state = Self::load_valid_security_state(store)
             .map_err(event_loop::StartError::PersistenceFailed)?;
 
-        let nib = self.bdb.zdo().nwk().nib();
-        state.extended_pan_id = nib.extended_pan_id;
-        state.pan_id = nib.pan_id.0;
-        state.short_address = nib.network_address.0;
-        state.channel = nib.logical_channel;
-        state.depth = nib.depth;
-        state.parent_address = nib.parent_address.0;
-        // Round-trip the NIB's own notion of validity: a rejoin that started
-        // from an unknown update state and has not yet learned one must not be
-        // persisted as an authoritative `0`.
-        match nib.nwk_update_id() {
-            Some(update_id) => {
-                state.update_id = update_id;
-                state.update_id_valid = true;
-            }
-            None => {
-                state.update_id = 0;
-                state.update_id_valid = false;
-            }
-        }
         // A secured rejoin re-selects a parent, so the negotiation the NWK
         // layer just reset (and whatever the new parent has already answered)
         // is committed together with the new parent address.
-        state.parent_information = nib.parent_information;
-        state.parent_information_valid = nib.parent_information_valid;
-        state.end_device_timeout = nib.end_device_timeout;
+        Self::copy_rejoined_location(&mut state, self.bdb.zdo().nwk().nib());
         state.rejoin_pending = false;
         state.device_announce_pending = true;
         state.parent_link_provisional = false;
@@ -9266,33 +9237,26 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         let live_limit = self.bdb.zdo().nwk().nib().outgoing_frame_counter_limit;
         self.set_network_key_persistence_enabled(true);
 
-        if let Err(status) = self.bdb.trust_center_rejoin_previous_network().await {
-            self.abort_network_key_persistence();
-            self.install_restored_network_security(previous_state, live_current, live_limit)
-                .map_err(event_loop::StartError::PersistenceFailed)?;
-            self.schedule_secure_rejoin_retry();
-            return Err(event_loop::StartError::CommissioningFailed(status));
-        }
-
-        let addr = self.bdb.zdo().nwk().nib().network_address.0;
-        let Some(replay) = self.pending_network_key_replay() else {
-            self.abort_network_key_persistence();
-            self.install_restored_network_security(previous_state, live_current, live_limit)
-                .map_err(event_loop::StartError::PersistenceFailed)?;
-            self.bdb.zdo_mut().nwk_mut().set_joined(false);
-            self.schedule_secure_rejoin_retry();
-            return Err(event_loop::StartError::PersistenceFailed(
-                SecurityStoreError::Corrupt,
-            ));
+        let accepted = match self.bdb.trust_center_rejoin_previous_network().await {
+            Err(status) => Err(event_loop::StartError::CommissioningFailed(status)),
+            Ok(()) => match self.pending_network_key_replay() {
+                None => Err(event_loop::StartError::PersistenceFailed(
+                    SecurityStoreError::Corrupt,
+                )),
+                Some(replay) => self
+                    .persist_trust_center_rejoin_network(store, replay)
+                    .map_err(event_loop::StartError::PersistenceFailed),
+            },
         };
-        if let Err(error) = self.persist_trust_center_rejoin_network(store, replay) {
-            self.abort_network_key_persistence();
-            self.install_restored_network_security(previous_state, live_current, live_limit)
-                .map_err(event_loop::StartError::PersistenceFailed)?;
-            self.bdb.zdo_mut().nwk_mut().set_joined(false);
-            self.schedule_secure_rejoin_retry();
-            return Err(event_loop::StartError::PersistenceFailed(error));
+        if let Err(error) = accepted {
+            return Err(self.restore_after_failed_trust_center_rejoin(
+                previous_state,
+                live_current,
+                live_limit,
+                error,
+            ));
         }
+        let addr = self.bdb.zdo().nwk().nib().network_address.0;
         self.complete_network_key_persistence().await;
 
         {
@@ -9323,16 +9287,66 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         Ok(addr)
     }
 
+    /// Roll a failed Trust Center rejoin back to the persisted network
+    /// security and arm the secured-rejoin retry. Returns the error to
+    /// report: `error`, or the restore failure if the persisted record can no
+    /// longer be installed (in which case no retry is scheduled).
+    fn restore_after_failed_trust_center_rejoin(
+        &mut self,
+        previous_state: &PersistentSecurityState,
+        live_current: u32,
+        live_limit: u32,
+        error: event_loop::StartError,
+    ) -> event_loop::StartError {
+        self.abort_network_key_persistence();
+        if let Err(restore) =
+            self.install_restored_network_security(previous_state, live_current, live_limit)
+        {
+            return event_loop::StartError::PersistenceFailed(restore);
+        }
+        // The BDB failure paths already left the NWK off-network; clearing
+        // it again is idempotent and covers the post-accept failures.
+        self.bdb.zdo_mut().nwk_mut().set_joined(false);
+        self.schedule_secure_rejoin_retry();
+        error
+    }
+
+    /// Copy the network position a successful rejoin selected from the NIB.
+    ///
+    /// Shared by the secured and Trust Center rejoin checkpoints. The NIB's
+    /// own notion of `nwkUpdateId` validity is round-tripped: a rejoin that
+    /// started from an unknown update state and has not yet learned one must
+    /// not be persisted as an authoritative `0`.
+    #[inline(never)]
+    fn copy_rejoined_location(state: &mut PersistentSecurityState, nib: &zigbee_nwk::nib::Nib) {
+        state.extended_pan_id = nib.extended_pan_id;
+        state.pan_id = nib.pan_id.0;
+        state.short_address = nib.network_address.0;
+        state.channel = nib.logical_channel;
+        state.depth = nib.depth;
+        state.parent_address = nib.parent_address.0;
+        match nib.nwk_update_id() {
+            Some(update_id) => {
+                state.update_id = update_id;
+                state.update_id_valid = true;
+            }
+            None => {
+                state.update_id = 0;
+                state.update_id_valid = false;
+            }
+        }
+        state.parent_information = nib.parent_information;
+        state.parent_information_valid = nib.parent_information_valid;
+        state.end_device_timeout = nib.end_device_timeout;
+    }
+
     fn persist_trust_center_rejoin_network<S: SecurityStateStore>(
         &mut self,
         store: &mut S,
         replay: zigbee_aps::security::ApsReplayCounter,
     ) -> Result<(), SecurityStoreError> {
-        let mut state = store.load()?.ok_or(SecurityStoreError::NotFound)?;
-        state.validate()?;
-        if !state.commissioned
-            || state.is_formed_network()
-            || state.node_join_link_key_type.is_distributed()
+        let mut state = Self::load_valid_security_state(store)?;
+        if Self::classify_rejoin_fallback(&state) != RejoinFallback::TrustCenterRejoin
             || (!state.tclk_present && !state.legacy_default_tclk)
         {
             return Err(SecurityStoreError::Corrupt);
@@ -9352,23 +9366,8 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             .checked_add(zigbee_bdb::FRAME_COUNTER_RESERVATION_SIZE)
             .ok_or(SecurityStoreError::CounterExhausted)?;
 
-        state.extended_pan_id = nib.extended_pan_id;
-        state.pan_id = nib.pan_id.0;
-        state.short_address = nib.network_address.0;
+        Self::copy_rejoined_location(&mut state, nib);
         state.ieee_address = nib.ieee_address;
-        state.channel = nib.logical_channel;
-        state.depth = nib.depth;
-        state.parent_address = nib.parent_address.0;
-        match nib.nwk_update_id() {
-            Some(update_id) => {
-                state.update_id = update_id;
-                state.update_id_valid = true;
-            }
-            None => {
-                state.update_id = 0;
-                state.update_id_valid = false;
-            }
-        }
         state.network_key = network_key;
         state.key_sequence = key_sequence;
         state.staged_network_key_present = false;
@@ -9377,9 +9376,6 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         state.secondary_network_key_is_previous = false;
         state.network_key_forwarding_pending = false;
         state.global_counter_limit = limit;
-        state.parent_information = nib.parent_information;
-        state.parent_information_valid = nib.parent_information_valid;
-        state.end_device_timeout = nib.end_device_timeout;
         state.rejoin_pending = true;
         state.device_announce_pending = true;
         state.parent_link_provisional = true;
@@ -11638,10 +11634,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         store: &mut S,
         pending: bool,
     ) -> Result<(), SecurityStoreError> {
-        let Some(mut state) = store.load()? else {
-            return Err(SecurityStoreError::NotFound);
-        };
-        state.validate()?;
+        let mut state = Self::load_valid_security_state(store)?;
         if !state.commissioned {
             return Err(SecurityStoreError::Corrupt);
         }

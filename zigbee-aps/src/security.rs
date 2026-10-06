@@ -393,11 +393,7 @@ impl ApsSecurity {
         key_type: ApsKeyType,
         stale: bool,
     ) {
-        let position = self
-            .stale_incoming_floors
-            .iter()
-            .position(|(address, kind)| address == partner && *kind == key_type);
-        match (position, stale) {
+        match (self.stale_floor_index(partner, key_type), stale) {
             (None, true) => {
                 // Capacity equals the key table, so this cannot overflow.
                 let _ = self.stale_incoming_floors.push((*partner, key_type));
@@ -413,9 +409,14 @@ impl ApsSecurity {
     /// established under a previous key value (the key was replaced and no
     /// frame has been verified with the new key since).
     pub fn incoming_floor_predates_key(&self, partner: &IeeeAddress, key_type: ApsKeyType) -> bool {
+        self.stale_floor_index(partner, key_type).is_some()
+    }
+
+    #[inline(never)]
+    fn stale_floor_index(&self, partner: &IeeeAddress, key_type: ApsKeyType) -> Option<usize> {
         self.stale_incoming_floors
             .iter()
-            .any(|(address, kind)| address == partner && *kind == key_type)
+            .position(|(address, kind)| address == partner && *kind == key_type)
     }
 
     /// Reset the incoming replay floor of a key-pair entry only if it belongs
@@ -507,11 +508,7 @@ impl ApsSecurity {
     /// Add a link key to the key table. Returns Err if table is full.
     pub fn add_key(&mut self, entry: ApsLinkKeyEntry) -> Result<(), ApsLinkKeyEntry> {
         // Update existing entry for same partner
-        if let Some(existing) = self
-            .key_table
-            .iter_mut()
-            .find(|e| e.partner_address == entry.partner_address && e.key_type == entry.key_type)
-        {
+        if let Some(existing) = self.find_key_mut(&entry.partner_address, entry.key_type) {
             let key_changed = existing.key != entry.key;
             existing.key = entry.key;
             existing.outgoing_frame_counter = entry.outgoing_frame_counter;
@@ -533,11 +530,7 @@ impl ApsSecurity {
 
     /// Remove a link key by partner address and key type.
     pub fn remove_key(&mut self, partner: &IeeeAddress, key_type: ApsKeyType) -> bool {
-        if let Some(idx) = self
-            .key_table
-            .iter()
-            .position(|e| e.partner_address == *partner && e.key_type == key_type)
-        {
+        if let Some(idx) = self.key_index(partner, key_type) {
             self.wipe_and_remove_key_slot(idx);
             self.set_stale_incoming_floor(partner, key_type, false);
             true
@@ -583,15 +576,23 @@ impl ApsSecurity {
             .retain(|(_, kind)| *kind != ApsKeyType::ApplicationLinkKey);
     }
 
+    /// Index of the key-pair entry for `(partner, key_type)`. Every key-table
+    /// lookup goes through this one out-of-line search.
+    #[inline(never)]
+    fn key_index(&self, partner: &IeeeAddress, key_type: ApsKeyType) -> Option<usize> {
+        self.key_table
+            .iter()
+            .position(|e| e.partner_address == *partner && e.key_type == key_type)
+    }
+
     /// Find a link key for a partner device.
     pub fn find_key(
         &self,
         partner: &IeeeAddress,
         key_type: ApsKeyType,
     ) -> Option<&ApsLinkKeyEntry> {
-        self.key_table
-            .iter()
-            .find(|e| e.partner_address == *partner && e.key_type == key_type)
+        let index = self.key_index(partner, key_type)?;
+        self.key_table.get(index)
     }
 
     /// Find a mutable link-key entry for a partner device.
@@ -600,9 +601,8 @@ impl ApsSecurity {
         partner: &IeeeAddress,
         key_type: ApsKeyType,
     ) -> Option<&mut ApsLinkKeyEntry> {
-        self.key_table
-            .iter_mut()
-            .find(|e| e.partner_address == *partner && e.key_type == key_type)
+        let index = self.key_index(partner, key_type)?;
+        self.key_table.get_mut(index)
     }
 
     /// Find any link key for a partner device (TC link key preferred).
@@ -675,11 +675,7 @@ impl ApsSecurity {
         key_type: ApsKeyType,
         counter: u32,
     ) -> bool {
-        if let Some(entry) = self
-            .key_table
-            .iter()
-            .find(|e| e.partner_address == *partner && e.key_type == key_type)
-        {
+        if let Some(entry) = self.find_key(partner, key_type) {
             !entry.incoming_frame_counter_valid || counter > entry.incoming_frame_counter
         } else {
             // Unknown partner — allow with default TC link key (first contact)
@@ -696,9 +692,7 @@ impl ApsSecurity {
         counter: u32,
     ) {
         if let Some(entry) = self
-            .key_table
-            .iter_mut()
-            .find(|e| e.partner_address == *partner && e.key_type == key_type)
+            .find_key_mut(partner, key_type)
             .filter(|e| !e.incoming_frame_counter_valid || counter > e.incoming_frame_counter)
         {
             entry.incoming_frame_counter = counter;
@@ -806,11 +800,7 @@ impl ApsSecurity {
         partner: &IeeeAddress,
         key_type: ApsKeyType,
     ) -> Option<u32> {
-        if let Some(entry) = self
-            .key_table
-            .iter_mut()
-            .find(|e| e.partner_address == *partner && e.key_type == key_type)
-        {
+        if let Some(entry) = self.find_key_mut(partner, key_type) {
             if entry.outgoing_frame_counter >= entry.outgoing_frame_counter_limit {
                 log::error!("[APS] Link-key frame counter reservation exhausted");
                 return None;

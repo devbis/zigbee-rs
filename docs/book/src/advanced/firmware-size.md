@@ -75,10 +75,10 @@ The TLSR8258 parent-router, always-on nRF52840, EFR32MG21, CC2340 fallback,
 and ESP32-C6/H2 rows were refreshed
 **2026-09-10**. These are named local build snapshots, not the latest remote
 CI results; unrefreshed rows do not describe the current working tree.
-PHY6222 and PHY6252 occupied-XIP measurements were refreshed **2026-09-15**.
+PHY6222 and PHY6252 occupied-XIP measurements were refreshed **2026-10-06**.
 The recorded parent router and all four ESP variants exceeded the regression
 budgets enforced at the time; those former budgets are no longer build
-blockers. The current PHY6252 variant **fails its physical linker limit**.
+blockers. Both PHY62x2 variants fit their physical XIP slot.
 Prior hardware evidence is not an exact-image HIL rerun unless
 explicitly stated.
 
@@ -89,8 +89,8 @@ former-budget rows.
 
 | image | measured | physical limit / former budget | margin vs reference | metric |
 |---|---:|---:|---:|---|
-| PHY6222 sensor | 130,752 | 130,816 | 64 | occupied XIP span |
-| PHY6252 feature-selected sensor | 130,912 | 130,816 | -96 | failed-link occupied XIP span |
+| PHY6222 sensor | 128,640 | 130,816 | 2,176 | occupied XIP span |
+| PHY6252 feature-selected sensor | 128,576 | 130,816 | 2,240 | occupied XIP span |
 | BL702 sensor | 189,442 | 192,512 | 3,070 | raw binary |
 | nRF52840 default / BME280 / SHT31 | 224,472 / 231,792 / 228,216 | 225,280 / 245,760 / 241,664 | 808 / 13,968 / 13,448 | raw binaries |
 | nRF52840 always-on End Device | 231,280 | 253,952 | 22,672 | file-backed flash span |
@@ -115,13 +115,14 @@ These older snapshots use their listed compilers, not the current TC32 pin.
 Compiler comparisons require holding source, features, and build flags constant,
 as in the controlled TLSR8258 rebuild above.
 
-The September 15 PHY62x2 measurements keep `nightly-2026-08-01` and the
-existing product feature sets, with target-local identical-code folding.
-The default PHY6222 build and layout checks pass locally and in Linux CI for
-`b788186`, both at 130,752 bytes. The 64-byte margin remains narrow.
-PHY6252's 130,912-byte span is
-measured from the failed link map: no current executable or package is
-qualified for that variant.
+The October 6 PHY62x2 measurements keep `nightly-2026-08-01` and the
+existing product feature sets, with target-local identical-code folding and
+the `immediate-abort` panic strategy (every panic site is a `udf` trap into
+the halting `HardFault` handler instead of a `panic-halt` call with
+arguments and `Location` records; this alone saves 3,328 B). They include the
+R22/BDB/ZCL conformance and security fixes, which grew the image from
+130,752 B to 135,520 B before size work. Both variants link and pass the
+layout check locally on macOS; Linux CI has not yet run on this source.
 
 Additional artifacts and physical limits:
 
@@ -136,9 +137,8 @@ Additional artifacts and physical limits:
   These combined-fix images have host validation, not hardware execution
   evidence. Exceeding their former regression budgets no longer blocks builds;
   the physical OTA-slot and other validation checks still apply.
-- PHY6252 has the separate failed-link occupied-XIP measurement shown above;
-  the earlier image that fitted the slot is not the current source, and its
-  hardware path remains unverified.
+- PHY6252 links within its physical XIP slot; its hardware path remains
+  unverified.
 - TLSR8258 physical application boundary: 458,752 B (`0x70000`), followed by
   APS/child/security journals at `0x70000`/`0x72000`/`0x74000`.
 

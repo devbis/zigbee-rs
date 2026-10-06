@@ -69,8 +69,7 @@ jobs also upload `*.size.json` measurements with their artifacts (PHY62x2 is
 measured by its layout check instead); those describe the exact commit that
 was built, whereas the book's tables are dated snapshots.
 
-PHY6252 is the one current physical-limit failure: its feature-selected image
-is 96 B over the mandatory 130,816 B XIP slot (see
+Both PHY62x2 variants fit their mandatory 130,816 B XIP slot (see
 [PHY6222 / PHY6252](#phy6222--phy6252)).
 
 ## nRF52840 and nRF52833
@@ -224,16 +223,18 @@ The physical application slot remains 516,096 B.
 cd examples/phy6222-sensor
 cargo +nightly-2026-08-01 build --release --locked
 
-# This PHY6252 feature build currently fails the physical XIP limit.
+# PHY6252 feature build; same physical XIP gate.
 cargo +nightly-2026-08-01 build --release --locked \
   --no-default-features --features phy6252
 ```
 
-The default PHY6222 occupied XIP span is 130,752 B against the hard 130,816 B
-gate, leaving 64 B. The exact PHY6252 feature build has a failed-link span of
-130,912 B, exceeding the same physical gate by 96 B; it produces no validated
-executable/package. These limits remain mandatory after removal of artificial
-regression budgets. Neither measurement is hardware proof.
+The default PHY6222 occupied XIP span is 128,640 B against the hard 130,816 B
+gate, leaving 2,176 B. The PHY6252 feature build occupies 128,576 B, leaving
+2,240 B under the same physical gate. Release builds from
+`examples/phy6222-sensor` use the `immediate-abort` panic strategy (configured
+in its `.cargo/config.toml`): panics trap into the halting `HardFault` handler.
+These limits remain mandatory after removal of artificial regression budgets.
+Neither measurement is hardware proof.
 
 Package the default PHY6222 image exactly as CI does:
 

@@ -491,14 +491,18 @@ impl<M: MacDriver> BdbLayer<M> {
             .await
     }
 
-    async fn rejoin_previous_network_mode<F>(
+    /// Shared secured / Trust Center rejoin body.
+    ///
+    /// The replay-commit hook is taken as a trait object and the body is kept
+    /// out of line so every caller (volatile, persistent and Trust Center
+    /// rejoin) shares one copy of the scan/parent-selection state machine
+    /// instead of monomorphizing it per closure type.
+    #[inline(never)]
+    async fn rejoin_previous_network_mode(
         &mut self,
-        replay_commit: &mut F,
+        mut replay_commit: &mut dyn FnMut(zigbee_nwk::security::NwkReplayCounter) -> bool,
         trust_center_rejoin: bool,
-    ) -> Result<(), BdbStatus>
-    where
-        F: FnMut(zigbee_nwk::security::NwkReplayCounter) -> bool,
-    {
+    ) -> Result<(), BdbStatus> {
         if !self.attributes.node_is_on_a_network {
             return Err(BdbStatus::NotOnNetwork);
         }
@@ -579,11 +583,11 @@ impl<M: MacDriver> BdbLayer<M> {
 
             let rejoin = if trust_center_rejoin {
                 self.zdo
-                    .nlme_trust_center_rejoin_with_replay_commit(network, replay_commit)
+                    .nlme_trust_center_rejoin_with_replay_commit(network, &mut replay_commit)
                     .await
             } else {
                 self.zdo
-                    .nlme_rejoin_with_replay_commit(network, replay_commit)
+                    .nlme_rejoin_with_replay_commit(network, &mut replay_commit)
                     .await
             };
             match rejoin {
