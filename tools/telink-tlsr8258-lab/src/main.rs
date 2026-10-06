@@ -7407,8 +7407,7 @@ impl RetentionLabState {
 #[cfg(feature = "diag-retention")]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".retained.lab")]
-static TELINK_RETENTION_LAB_STATE: RetentionLabCell<RetentionLabState> =
-    RetentionLabCell::new();
+static TELINK_RETENTION_LAB_STATE: RetentionLabCell<RetentionLabState> = RetentionLabCell::new();
 
 #[cfg(feature = "diag-retention")]
 #[unsafe(no_mangle)]
@@ -7496,8 +7495,7 @@ fn diag_retention_main() -> ! {
     use zigbee_mac::telink::TelinkMac;
     use zigbee_mac::{PibAttribute, PibValue};
 
-    let mode = tlsr8258_hal::mmio::analog_read(0x7e)
-        .unwrap_or_else(|_| diag_retention_fail(0x001));
+    let mode = tlsr8258_hal::mmio::analog_read(0x7e).unwrap_or_else(|_| diag_retention_fail(0x001));
     if mode == 0 {
         retention_lab_guard(true);
         TELINK_RETENTION_LAB_STATUS.store(0x5254_0000, Ordering::SeqCst);
@@ -7512,14 +7510,11 @@ fn diag_retention_main() -> ! {
         adc.install_flash_voltage_guard(peripherals.pins.pc5)
             .unwrap_or_else(|_| diag_retention_fail(0x012));
 
-        let mut mac =
-            TelinkMac::with_extended_address([0x02, 0, 0, 0, 0, 0, 0, 0x82]);
+        let mut mac = TelinkMac::with_extended_address([0x02, 0, 0, 0, 0, 0, 0, 0x82]);
         mac.install_aes_engine(peripherals.aes)
             .unwrap_or_else(|_| diag_retention_fail(0x013));
-        if executor::block_on(
-            mac.mlme_set(PibAttribute::PhyCurrentChannel, PibValue::U8(15)),
-        )
-        .is_err()
+        if executor::block_on(mac.mlme_set(PibAttribute::PhyCurrentChannel, PibValue::U8(15)))
+            .is_err()
         {
             diag_retention_fail(0x014);
         }
@@ -7563,8 +7558,7 @@ fn diag_retention_main() -> ! {
         pm::begin_low32k_resume(&state.record).unwrap_or_else(|_| diag_retention_fail(0x023));
     mac.resume_after_retention()
         .unwrap_or_else(|_| diag_retention_fail(0x024));
-    tlsr8258_hal::adc::restore_flash_voltage_guard()
-        .unwrap_or_else(|_| diag_retention_fail(0x025));
+    tlsr8258_hal::adc::restore_flash_voltage_guard().unwrap_or_else(|_| diag_retention_fail(0x025));
     let status = pm::complete_low32k_resume(&mut state.record, token)
         .unwrap_or_else(|_| diag_retention_fail(0x026));
     if !status.entered_low_power() || !status.woke_by_timer() {
