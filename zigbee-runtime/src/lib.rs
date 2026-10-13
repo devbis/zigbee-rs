@@ -11415,6 +11415,26 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             log::error!("[Runtime] Binding transaction must complete before another receive");
             return Err(SecurityStoreError::Full);
         }
+        // While the unique-TCLK exchange is pending the network is not
+        // commissioned and the durable stores refuse every replay counter
+        // (fail closed), yet the exchange itself is made of authenticated
+        // frames: the Node Descriptor response, the Transport-Key and the
+        // Confirm-Key. Take them with volatile replay floors. Nothing is
+        // resumable until `commit_network` marks the network commissioned, so
+        // a reset mid-exchange restarts the join and no floor is lost; the
+        // floors held in RAM keep protecting the exchange meanwhile.
+        #[cfg(feature = "centralized-tclk")]
+        if self.bdb.tclk_exchange_active() {
+            let mut volatile_commit = |_| true;
+            return Ok(self
+                .process_incoming_with_replay_commit(
+                    indication,
+                    clusters,
+                    &mut volatile_commit,
+                    true,
+                )
+                .await);
+        }
         self.refresh_security_state(store)?;
         self.tombstone_retired_security_state_replay_counters(store)?;
         self.set_nwk_lifecycle_persistence_enabled(true);
