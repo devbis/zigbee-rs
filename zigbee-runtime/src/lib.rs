@@ -8689,7 +8689,17 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         // point. The silent persisted resume does *not* call this and uses
         // `resume_end_device_timeout` instead. Dispatched statically so only an
         // `EndDevice` runs (and links) the client negotiation.
-        R::ed_begin_negotiation(self).await;
+        //
+        // While the unique-TCLK exchange is still pending the device is not
+        // yet `commissioned`, and the durable stores refuse the replay counter
+        // of any authenticated frame (fail closed). The parent's End Device
+        // Timeout Response is such a frame and arrives on the first poll,
+        // before the exchange has sent its first command, so the negotiation
+        // starts when the exchange completes instead (see
+        // `advance_commissioning_with_security_store`).
+        if !self.bdb.tclk_exchange_active() {
+            R::ed_begin_negotiation(self).await;
+        }
         Ok(addr)
     }
 
@@ -11975,6 +11985,9 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             zigbee_bdb::TclkProgress::Complete => {
                 self.state_dirty = true;
                 log::info!("[Runtime] Commissioning security complete — network committed");
+                // The network is commissioned, so the parent's authenticated
+                // End Device Timeout Response can now be persisted.
+                R::ed_begin_negotiation(self).await;
                 Ok(Some(event_loop::StackEvent::CommissioningComplete {
                     success: true,
                 }))
