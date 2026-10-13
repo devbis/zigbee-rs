@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, experiment/zephyr-app-model, experiment/r22-bdb-complete]
+    branches: [main, master, experiment/zephyr-app-model, experiment/r22-bdb-complete, nrf-experiment]
   pull_request:
   workflow_dispatch:
 
